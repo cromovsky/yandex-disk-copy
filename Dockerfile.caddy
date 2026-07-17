@@ -1,0 +1,6 @@
+# Caddy reverse-proxy с зашитым Caddyfile (автоматический HTTPS + basic-auth).
+# Конфигурация параметризуется env-переменными на старте контейнера:
+#   SITE_ADDRESS, BASIC_AUTH_USER, BASIC_AUTH_HASH (см. .env.example).
+FROM caddy:2-alpine
+
+COPY Caddyfile /etc/caddy/Caddyfile

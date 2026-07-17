@@ -1,0 +1,17 @@
+# Reverse-proxy с автоматическим HTTPS и basic-auth перед сервисом копирования.
+#
+# SITE_ADDRESS:
+#   - localhost            → Caddy выдаёт self-signed сертификат своим внутренним CA
+#                            (для проверки на своей машине; браузер предупредит — это ок)
+#   - disk.example.com     → Caddy автоматически получит сертификат Let's Encrypt
+#                            (нужен публичный домен, указывающий на этот сервер,
+#                             и доступные снаружи порты 80 и 443)
+#
+# BASIC_AUTH_USER / BASIC_AUTH_HASH — логин и bcrypt-хеш пароля (см. .env.example).
+
+{$SITE_ADDRESS} {
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+	reverse_proxy disk-copy:8000
+}

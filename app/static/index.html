@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Перенос файлов между Дисками сотрудников</title>
+  <link rel="icon" type="image/png" href="/static/logo.png">
+  <script>
+    // ранняя установка темы, чтобы не было вспышки светлого фона
+    (function () {
+      try {
+        var t = localStorage.getItem("ydc_theme");
+        if (!t) t = (window.matchMedia &&
+                     window.matchMedia("(prefers-color-scheme: dark)").matches)
+                     ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --accent: #0f7ff0;       /* rgb(15,127,240) — из логотипа */
+      --accent-dark: #0a5fca;
+      --accent-grad: linear-gradient(135deg, #2f9bff 0%, #0f6ae6 100%);
+      --ink: #34343c;          /* основной текст (палитра Я360) */
+      --ink-soft: #6b6c77;     /* вторичный текст */
+      --line: #e1e2e6;         /* границы */
+      --bg: #f2f3f5;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      margin: 0; padding: 32px 24px 48px; color: var(--ink);
+      background: radial-gradient(1200px 460px at 50% -8%, #ffffff 0%, var(--bg) 62%);
+      -webkit-font-smoothing: antialiased;
+    }
+    button { font: inherit; cursor: pointer; border: 0; }
+    button:disabled { opacity: .55; cursor: default; }
+    .wrap { max-width: 1000px; margin: 0 auto; display: flex;
+            flex-direction: column; gap: 20px; }
+    .forms { display: grid; gap: 20px; grid-template-columns: 1fr 1fr; }
+    @media (max-width: 800px) {
+      .forms { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+    /* вкладки режимов (главная страница) */
+    .mode-tabs { display: flex; gap: 10px; }
+    .mode-tab { flex: 1 1 0; padding: 13px 14px; background: #fff;
+                border: 1px solid #eceef1; border-radius: 14px; color: var(--ink-soft);
+                font-size: 14px; font-weight: 700; box-shadow: 0 2px 10px rgba(52,52,60,.04);
+                transition: color .12s, border-color .12s, background .12s; }
+    .mode-tab:hover:not(.active) { color: var(--ink); }
+    .mode-tab.active { color: #fff; background: var(--accent-grad);
+                       border-color: transparent; box-shadow: 0 8px 18px rgba(15,106,230,.28); }
+    .mode-panel { display: none; flex-direction: column; gap: 20px; }
+    .mode-panel.active { display: flex; }
+    /* шапка-герой с логотипом */
+    .hero { grid-column: 1 / -1; display: flex; align-items: center; gap: 18px;
+            background: #fff; border: 1px solid #eceef1; border-radius: 24px;
+            padding: 22px 26px; box-shadow: 0 4px 20px rgba(52,52,60,.06); }
+    .hero .logo { height: 52px; width: auto; flex: 0 0 auto;
+                  filter: drop-shadow(0 4px 10px rgba(15,106,230,.28)); }
+    .hero .titles { flex: 1 1 auto; min-width: 0; }
+    .hero h1 { font-size: 24px; line-height: 1.2; margin: 0; color: var(--ink);
+               font-weight: 800; letter-spacing: -.02em; }
+    .hero .subtitle { margin: 5px 0 0; font-size: 14px; color: var(--ink-soft); }
+    .help-btn { width: 42px; height: 42px; flex: 0 0 auto; border-radius: 50%;
+                background: #fff; border: 1px solid var(--line);
+                color: var(--accent-dark); font-size: 20px; font-weight: 700;
+                line-height: 1; padding: 0;
+                transition: background .12s, box-shadow .12s; }
+    .help-btn:hover { background: #eef4ff; box-shadow: 0 2px 10px rgba(15,106,230,.20); }
+    .hero-actions { display: flex; gap: 10px; flex: 0 0 auto; }
+    .copy-hint { background: #eef4ff; color: #274a7a; border-radius: 8px;
+                 padding: 8px 12px; }
+    /* модалка справки */
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45);
+               display: none; align-items: flex-start; justify-content: center;
+               padding: 40px 16px; overflow-y: auto; z-index: 10; }
+    .overlay.open { display: flex; }
+    .modal { background: #fff; color: #1a1a1a; max-width: 900px; width: 100%;
+             border-radius: 14px; padding: 24px 28px;
+             box-shadow: 0 12px 48px rgba(0,0,0,.25); }
+    .modal h2 { margin: 0; font-size: 18px; color: #1a1a1a; }
+    .modal h3 { margin: 20px 0 6px; font-size: 14px; color: #1a1a1a; }
+    .modal p, .modal li { font-size: 13px; line-height: 1.55; color: #2b2f36; }
+    .modal ul { margin: 4px 0; padding-left: 20px; }
+    .modal code { background: #f1f2f5; padding: 1px 5px;
+                  border-radius: 4px; font-size: 12px; color: #0a5fca;
+                  font-family: ui-monospace, Menlo, monospace; }
+    .modal a { color: var(--accent-dark); font-weight: 600; }
+    .modal table { width: 100%; border-collapse: collapse; font-size: 12.5px;
+                   margin: 10px 0; }
+    .modal th, .modal td { text-align: left; padding: 6px 8px;
+                           border-bottom: 1px solid #e3e5ea;
+                           vertical-align: top; }
+    .modal th { color: #1a1a1a; }
+    .modal td { color: #2b2f36; }
+    .modal .close { float: right; width: auto; margin: 0; padding: 0 4px;
+                    background: transparent; color: #6b7280; font-size: 24px;
+                    font-weight: 400; line-height: 1; }
+    .modal .role { display: inline-block; font-size: 11px; font-weight: 700;
+                   padding: 2px 8px; border-radius: 10px; margin-left: 6px;
+                   background: #d9e8ff; color: #0a4a9a; vertical-align: middle; }
+    .modal .step { font-weight: 700; color: #1a1a1a; }
+    /* копируемые по клику элементы */
+    .copyable { cursor: pointer; border: 1px dashed #8fbdf5;
+                transition: background .12s, border-color .12s; }
+    .copyable:hover { background: #eef4ff; }
+    .copyable.copied { background: #d9f7e0; border-color: #34a853; color: #15803d; }
+    pre.code-block { background: #f1f2f5; color: #2b2f36; padding: 12px 14px;
+                     border-radius: 8px; overflow-x: auto; font-size: 12px;
+                     line-height: 1.5; margin: 8px 0;
+                     font-family: ui-monospace, Menlo, monospace; }
+    pre.code-block.copyable { border: 1px dashed #8fbdf5; }
+    .doclink a { font-size: 12px; }
+    .copy-toast { position: fixed; left: 50%; bottom: 28px;
+                  transform: translateX(-50%); background: #1a1a1a; color: #fff;
+                  padding: 9px 16px; border-radius: 8px; font-size: 13px; z-index: 50;
+                  opacity: 0; transition: opacity .15s; pointer-events: none;
+                  max-width: 80vw; overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; }
+    .copy-toast.show { opacity: 1; }
+    /* вкладки справки */
+    .tabs { display: flex; gap: 8px; margin: 2px 44px 16px 0;
+            border-bottom: 1px solid #e3e5ea; }
+    .tab { width: auto; margin: 0; padding: 8px 14px; background: transparent;
+           color: #6b7280; font-size: 14px; font-weight: 600;
+           border-radius: 8px 8px 0 0; border-bottom: 2px solid transparent; }
+    .tab:hover:not(.active) { background: #f4f5f7; }
+    .tab.active { color: var(--accent-dark); border-bottom-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    /* отрендеренный markdown инструкции */
+    .md-body { font-size: 13px; line-height: 1.6; color: #2b2f36; }
+    .md-body h1 { font-size: 19px; margin: 0 0 10px; color: #1a1a1a; }
+    .md-body h2 { font-size: 16px; margin: 22px 0 8px; color: #1a1a1a;
+                  border-top: 1px solid #eceef1; padding-top: 16px; }
+    .md-body h3 { font-size: 14px; margin: 16px 0 6px; color: #1a1a1a; }
+    .md-body p { margin: 8px 0; }
+    .md-body ul, .md-body ol { margin: 6px 0; padding-left: 22px; }
+    .md-body li { margin: 3px 0; }
+    .md-body a { color: var(--accent-dark); font-weight: 600; word-break: break-all; }
+    .md-body code { background: #f1f2f5; color: #0a5fca; padding: 1px 5px;
+                    border-radius: 4px; font-size: 12px;
+                    font-family: ui-monospace, Menlo, monospace; }
+    .md-body pre { background: #f1f2f5; padding: 12px 14px; border-radius: 8px;
+                   overflow-x: auto; font-size: 12px; line-height: 1.5; }
+    .md-body pre code { background: none; color: #2b2f36; padding: 0; }
+    .md-body pre, .md-body code { cursor: pointer; }
+    .md-body pre:hover, .md-body code:hover { outline: 1px dashed #8fbdf5; }
+    .md-body blockquote { margin: 10px 0; padding: 8px 14px; background: #eef4ff;
+                          border-left: 3px solid var(--accent);
+                          border-radius: 0 8px 8px 0; color: #274a7a; }
+    .md-body table { width: 100%; border-collapse: collapse; font-size: 12.5px;
+                     margin: 10px 0; }
+    .md-body th, .md-body td { text-align: left; padding: 6px 8px;
+                              border: 1px solid #e3e5ea; vertical-align: top; }
+    .md-body th { background: #f7f8fa; color: #1a1a1a; }
+    .card { background: #fff; border: 1px solid #eceef1; border-radius: 20px;
+            padding: 24px; box-shadow: 0 4px 20px rgba(52,52,60,.05); }
+    .card-title { font-size: 15px; font-weight: 700; color: var(--ink); }
+    label { display: block; font-size: 12px; font-weight: 600; margin: 14px 0 5px;
+            color: var(--ink-soft); }
+    input { width: 100%; padding: 11px 13px; border: 1px solid var(--line);
+            border-radius: 12px; font-size: 14px; background: #fbfbfc; color: var(--ink);
+            transition: border-color .12s, box-shadow .12s, background .12s; }
+    input::placeholder { color: #9a9ba6; }
+    input:focus { outline: none; border-color: var(--accent); background: #fff;
+                  box-shadow: 0 0 0 3px rgba(15,127,240,.18); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .run-row { grid-column: 1 / -1; display: flex; justify-content: center;
+               margin: 4px 0 2px; }
+    .run-btn { width: auto; min-width: 320px; padding: 15px 56px; border-radius: 14px;
+           background: var(--accent-grad); color: #fff; font-size: 16px;
+           font-weight: 700; box-shadow: 0 8px 22px rgba(15,106,230,.32);
+           transition: filter .12s, box-shadow .12s, transform .08s; }
+    .run-btn:hover:not(:disabled) { filter: brightness(1.04);
+           box-shadow: 0 12px 28px rgba(15,106,230,.40); }
+    .run-btn:active:not(:disabled) { transform: translateY(1px); }
+    .run-btn:disabled { box-shadow: none; }
+    .log-head { grid-column: 1 / -1; display: flex; align-items: baseline;
+                gap: 10px; flex-wrap: wrap; margin: 6px 4px -8px; }
+    .log-title { font-size: 15px; font-weight: 700; color: var(--ink); }
+    .log-sub { font-size: 12.5px; color: var(--ink-soft); }
+    .status { grid-column: 1 / -1; font-size: 14px; min-height: 20px; font-weight: 600;
+              margin: 0 4px; }
+    .status.running { color: #c2410c; }
+    .status.done { color: #15803d; }
+    .status.error { color: #dc2626; }
+    #log {
+      grid-column: 1 / -1; background: #fff; color: #2b2f36;
+      border: 1px solid #eceef1;
+      border-radius: 20px; padding: 18px 20px; height: 380px; overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+      white-space: pre-wrap; line-height: 1.55; box-shadow: 0 4px 20px rgba(52,52,60,.05);
+    }
+    #log:empty::before { content: attr(data-empty); color: #9a9ba6;
+                         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                         font-size: 13px; line-height: 1.6; }
+    .hint { grid-column: 1 / -1; font-size: 12.5px; color: var(--ink-soft);
+            margin: -4px 4px 0; line-height: 1.5; }
+    /* обязательный дисклеймер-гейт */
+    .consent { z-index: 100; background: rgba(20,22,26,.62); }
+    .consent-modal { max-width: 620px; border-top: 5px solid var(--accent); }
+    .consent-modal h2 { font-size: 18px; line-height: 1.3; }
+    .consent-modal p, .consent-modal li { font-size: 13.5px; line-height: 1.6;
+                                          color: #2b2f36; }
+    .consent-modal p { margin: 10px 0; }
+    .consent-modal ul { margin: 6px 0; padding-left: 20px; }
+    .consent-check { display: flex; gap: 10px; align-items: flex-start;
+                     margin: 18px 0 4px; padding: 12px 14px; border-radius: 12px;
+                     background: #eef4ff; border: 1px solid #d9e8ff; cursor: pointer;
+                     font-size: 13.5px; color: var(--ink); font-weight: 600; }
+    .consent-check input { width: 18px; height: 18px; margin: 1px 0 0; flex: 0 0 auto;
+                           accent-color: var(--accent); cursor: pointer; }
+    #consent-accept { margin-top: 16px; width: 100%; padding: 13px; border-radius: 14px;
+                      background: var(--accent-grad); color: #fff; font-size: 15px;
+                      font-weight: 700; box-shadow: 0 8px 20px rgba(15,106,230,.28); }
+    #consent-accept:disabled { box-shadow: none; }
+    /* ── тёмная тема ─────────────────────────────────────────────── */
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --accent: #3b9bff;
+      --accent-dark: #7cc0ff;   /* ссылки/иконки на тёмном — светлее */
+      --accent-grad: linear-gradient(135deg, #3b9bff 0%, #1f7fe6 100%);
+      --ink: #e6e7ea;
+      --ink-soft: #9a9ca6;
+      --line: #2b303a;
+      --bg: #14161a;
+    }
+    [data-theme="dark"] body {
+      background: radial-gradient(1200px 460px at 50% -8%, #1c2027 0%, var(--bg) 62%);
+    }
+    /* поверхности */
+    [data-theme="dark"] .hero,
+    [data-theme="dark"] .card,
+    [data-theme="dark"] .modal,
+    [data-theme="dark"] #log { background: #1c1f26; border-color: #2b303a; }
+    [data-theme="dark"] .modal { color: var(--ink); }
+    [data-theme="dark"] #log { color: #cfd2d8; }
+    /* заголовки и текст */
+    [data-theme="dark"] .modal h2,
+    [data-theme="dark"] .modal h3,
+    [data-theme="dark"] .modal th,
+    [data-theme="dark"] .md-body h1,
+    [data-theme="dark"] .md-body h2,
+    [data-theme="dark"] .md-body h3,
+    [data-theme="dark"] .md-body th,
+    [data-theme="dark"] .consent-modal h2,
+    [data-theme="dark"] .log-title,
+    [data-theme="dark"] .card-title,
+    [data-theme="dark"] .modal .step { color: #f0f1f3; }
+    [data-theme="dark"] .modal p,
+    [data-theme="dark"] .modal li,
+    [data-theme="dark"] .modal td,
+    [data-theme="dark"] .md-body,
+    [data-theme="dark"] .md-body td,
+    [data-theme="dark"] .consent-modal p,
+    [data-theme="dark"] .consent-modal li { color: #cfd2d8; }
+    /* поля ввода */
+    [data-theme="dark"] input { background: #23272f; border-color: #2b303a; color: var(--ink); }
+    [data-theme="dark"] input::placeholder { color: #6b6e78; }
+    /* код и блоки кода */
+    [data-theme="dark"] .modal code,
+    [data-theme="dark"] .md-body code { background: #262b34; color: #86c4ff; }
+    [data-theme="dark"] pre.code-block,
+    [data-theme="dark"] .md-body pre { background: #262b34; color: #cfd2d8; }
+    [data-theme="dark"] .md-body pre code { color: #cfd2d8; }
+    /* таблицы */
+    [data-theme="dark"] .modal th,
+    [data-theme="dark"] .modal td { border-bottom-color: #2b303a; }
+    [data-theme="dark"] .md-body th,
+    [data-theme="dark"] .md-body td { border-color: #2b303a; }
+    [data-theme="dark"] .md-body th { background: #23272f; }
+    /* вкладки */
+    [data-theme="dark"] .tabs { border-bottom-color: #2b303a; }
+    [data-theme="dark"] .tab { color: #9a9ca6; }
+    [data-theme="dark"] .tab:hover:not(.active) { background: #23272f; }
+    /* копируемые элементы */
+    [data-theme="dark"] .copyable,
+    [data-theme="dark"] pre.code-block.copyable { border-color: #3a5f8a; }
+    [data-theme="dark"] .copyable:hover { background: #1e2b3d; }
+    [data-theme="dark"] .md-body pre:hover,
+    [data-theme="dark"] .md-body code:hover { outline-color: #3a5f8a; }
+    /* прочее */
+    [data-theme="dark"] .help-btn { background: #23272f; border-color: #2b303a; color: #86c4ff; }
+    [data-theme="dark"] .help-btn:hover { background: #2a3340; }
+    [data-theme="dark"] .modal .role { background: #12395f; color: #9fc9ff; }
+    [data-theme="dark"] .md-body blockquote { background: #17263a; color: #a9c6ea; }
+    [data-theme="dark"] .consent-check { background: #17263a; border-color: #24405f; }
+    [data-theme="dark"] #log:empty::before { color: #6b6e78; }
+    [data-theme="dark"] .modal .close { color: #9a9ca6; }
+    /* вкладки режимов на тёмном */
+    [data-theme="dark"] .mode-tab { background: #1c1f26; border-color: #2b303a; }
+    /* подсказка про copy-by-click — читаемая на тёмном */
+    [data-theme="dark"] .copy-hint { background: #17263a; color: #a9c6ea; }
+    /* логотип: плитка под белую окантовку, чтобы не торчала на тёмном фоне */
+    [data-theme="dark"] .hero .logo { background: #eef2f7; border-radius: 12px;
+                                      padding: 5px; box-sizing: content-box; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <img class="logo" src="/static/logo-mark.png" alt="Логотип">
+      <div class="titles">
+        <h1>Перенос файлов между Дисками сотрудников</h1>
+        <p class="subtitle">Копирование файлов между Дисками сотрудников Яндекс&nbsp;360</p>
+      </div>
+      <div class="hero-actions">
+        <button id="theme-btn" class="help-btn"
+                title="Тёмная / светлая тема" aria-label="Переключить тему">🌙</button>
+        <button id="help-btn" class="help-btn"
+                title="Где взять токены и какие нужны права?">?</button>
+      </div>
+    </div>
+
+    <div class="mode-tabs">
+      <button class="mode-tab active" data-mode="single">Одна организация</button>
+      <button class="mode-tab" data-mode="cross">Между организациями</button>
+    </div>
+
+    <div id="mode-single" class="mode-panel active">
+      <div class="forms">
+        <div class="card">
+          <div class="card-title">Сервисное приложение и организация</div>
+          <label>CLIENT_ID</label>
+          <input id="client_id" autocomplete="off" placeholder="id сервисного приложения">
+          <label>CLIENT_SECRET</label>
+          <input id="client_secret" type="password" autocomplete="off">
+          <label>ORGID</label>
+          <input id="orgid" autocomplete="off" placeholder="ID организации">
+          <label>ADMIN_TOKEN</label>
+          <input id="admin_token" type="password" autocomplete="off"
+                 placeholder="токен с правами на сотрудников">
+        </div>
+
+        <div class="card">
+          <div class="card-title">Источник, назначение и параметры</div>
+          <label>SOURCE (email — откуда копируем)</label>
+          <input id="source_disk_id" autocomplete="off" placeholder="user@company.ru">
+          <label>DESTINATION (email — куда копируем)</label>
+          <input id="destination_disk_id" autocomplete="off" placeholder="user@company.ru">
+          <label>PATH</label>
+          <input id="path" value="/">
+          <label title="Размер страницы при обходе папки: сколько элементов инструмент запрашивает у API Диска за один запрос. НЕ ограничивает число копируемых файлов — обрабатываются все, порциями. По умолчанию 1000 (максимум API).">PAGE_LIMIT&nbsp;ⓘ</label>
+          <input id="page_limit" type="number" value="1000"
+                 title="Размер страницы при обходе папки: сколько элементов запрашивается у API за один запрос. НЕ ограничивает число копируемых файлов — обрабатываются все, порциями. По умолчанию 1000.">
+        </div>
+      </div>
+      <div class="run-row">
+        <button id="run" class="run-btn">Запустить копирование</button>
+      </div>
+    </div>
+
+    <div id="mode-cross" class="mode-panel">
+      <div class="forms">
+        <div class="card">
+          <div class="card-title">Источник — организация 1</div>
+          <label>CLIENT_ID</label>
+          <input id="x_src_client_id" autocomplete="off"
+                 placeholder="сервисное приложение орг-источника">
+          <label>CLIENT_SECRET</label>
+          <input id="x_src_client_secret" type="password" autocomplete="off">
+          <label>ORGID</label>
+          <input id="x_src_orgid" autocomplete="off" placeholder="ID организации-источника">
+          <label>ADMIN_TOKEN</label>
+          <input id="x_src_admin_token" type="password" autocomplete="off"
+                 placeholder="токен с правами на сотрудников (орг-источник)">
+        </div>
+
+        <div class="card">
+          <div class="card-title">Получатель — организация 2</div>
+          <label>CLIENT_ID</label>
+          <input id="x_dst_client_id" autocomplete="off"
+                 placeholder="сервисное приложение орг-получателя">
+          <label>CLIENT_SECRET</label>
+          <input id="x_dst_client_secret" type="password" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Пользователи</div>
+        <div class="row">
+          <div>
+            <label>SOURCE (email — откуда копируем)</label>
+            <input id="x_source_disk_id" autocomplete="off" placeholder="user@company1.ru">
+          </div>
+          <div>
+            <label>DESTINATION (email — куда копируем)</label>
+            <input id="x_destination_disk_id" autocomplete="off" placeholder="user@company2.ru">
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Параметры источника</div>
+        <div class="row">
+          <div>
+            <label>PATH (папка на Диске источника)</label>
+            <input id="x_path" value="/">
+          </div>
+          <div>
+            <label title="Размер страницы при обходе папки: сколько элементов инструмент запрашивает у API Диска за один запрос. НЕ ограничивает число копируемых файлов — обрабатываются все, порциями. По умолчанию 1000 (максимум API).">PAGE_LIMIT&nbsp;ⓘ</label>
+            <input id="x_page_limit" type="number" value="1000"
+                   title="Размер страницы при обходе папки: сколько элементов запрашивается у API за один запрос. НЕ ограничивает число копируемых файлов — обрабатываются все, порциями. По умолчанию 1000.">
+          </div>
+        </div>
+      </div>
+
+      <div class="run-row">
+        <button id="run-cross" class="run-btn">Запустить перенос между организациями</button>
+      </div>
+    </div>
+
+    <p class="hint">
+      Файлы будут опубликованы на диске-источнике и сохранены в отдельную папку
+      на Диске получателя (названа по email источника) с оригинальными именами.
+      Если сотрудник-источник заблокирован, он временно разблокируется на время
+      копирования и блокируется обратно.
+    </p>
+
+    <div class="log-head">
+      <span class="log-title">Журнал выполнения</span>
+      <span class="log-sub">пошаговый лог появится здесь после запуска</span>
+    </div>
+    <div id="status" class="status"></div>
+    <div id="log" data-empty="Здесь появится лог: получение токенов → проверка статуса сотрудника → сверка свободного места → публикация и сохранение файлов. Запустите копирование, чтобы начать."></div>
+  </div>
+
+  <div id="help-overlay" class="overlay">
+    <div class="modal">
+      <button id="help-close" class="close" title="Закрыть">&times;</button>
+      <div class="tabs">
+        <button class="tab active" data-tab="tokens">Токены и права</button>
+        <button class="tab" data-tab="guide">Инструкция</button>
+      </div>
+
+      <div id="tab-tokens" class="tab-panel active">
+      <h2>Токены, права и доступы</h2>
+      <p>Для работы нужны два независимых набора данных:
+         <strong>сервисное приложение</strong> (доступ к Дискам сотрудников) и
+         <strong>админ-токен API&nbsp;360</strong> (временная разблокировка
+         сотрудника-источника). Их получают разные роли.</p>
+      <p>Инструмент работает в двух режимах: <strong>«Одна организация»</strong> —
+         источник и получатель в одной орге, один сервис-аккаунт на обоих; и
+         <strong>«Между организациями»</strong> — источник и получатель в разных
+         оргах, тогда нужен <strong>свой сервис-аккаунт в каждой</strong>
+         (см. раздел «Режим „Между организациями“» ниже).</p>
+      <p class="copy-hint">
+         💡 Текст, выделенный <span class="copyable">пунктиром</span>, копируется
+         по клику — ссылки, права (scopes), эндпоинты и тела запросов.</p>
+
+      <table>
+        <tr><th>Поле формы</th><th>Что это</th><th>Кто получает</th></tr>
+        <tr><td><code>CLIENT_ID</code> / <code>CLIENT_SECRET</code></td>
+            <td>Сервисное приложение с правами на Диск</td>
+            <td>Владелец организации</td></tr>
+        <tr><td><code>ADMIN_TOKEN</code></td>
+            <td>OAuth-токен для API&nbsp;360</td>
+            <td>Администратор организации</td></tr>
+        <tr><td><code>ORGID</code></td>
+            <td>Идентификатор организации</td>
+            <td>Админка Яндекс&nbsp;360 / API&nbsp;360</td></tr>
+        <tr><td><code>SOURCE</code> / <code>DESTINATION</code></td>
+            <td>email сотрудников (режим 1 — одна орга, режим 2 — разные)</td>
+            <td>—</td></tr>
+      </table>
+
+      <h3>Набор 1. Сервисное приложение — доступ к Дискам
+        <span class="role">владелец организации</span></h3>
+      <p>Сервисное приложение позволяет выпускать временный токен от имени любого
+         сотрудника организации по его email (механизм token-exchange). Токен живёт
+         один час — инструмент обновляет его автоматически. Все шаги ниже
+         выполняются под учётной записью владельца организации.</p>
+
+      <p><span class="step">Шаг 1.</span> Войдите в аккаунт владельца организации
+         (именно владельца, не администратора).</p>
+
+      <p><span class="step">Шаг 2.</span> Убедитесь, что в организации настроен
+         почтовый домен — без него сервисные приложения не работают.</p>
+
+      <p><span class="step">Шаг 3.</span> Создайте основное OAuth-приложение для
+         управления списком сервисных приложений на сайте
+         <code class="copyable">https://oauth.yandex.ru</code> и выдайте ему права:</p>
+      <ul>
+        <li><code class="copyable">ya360_security:service_applications_read</code>
+            — чтение списка сервисных приложений;</li>
+        <li><code class="copyable">ya360_security:service_applications_write</code>
+            — управление списком (чтение и запись).</li>
+      </ul>
+      <p>Получите OAuth-токен владельца для этого приложения — им авторизуются
+         запросы из шагов 5–7.</p>
+
+      <p><span class="step">Шаг 4.</span> Создайте <strong>отдельное</strong>
+         OAuth-приложение для доступа к Дискам и выдайте ему права:</p>
+      <ul>
+        <li><code class="copyable">cloud_api:disk.read</code> — чтение Диска;</li>
+        <li><code class="copyable">cloud_api:disk.write</code> — запись на Диск
+            назначения;</li>
+        <li><code class="copyable">cloud_api:disk.info</code> — информация о
+            свободном месте.</li>
+      </ul>
+      <p>После создания скопируйте его <strong>ClientID</strong> и
+         <strong>Client secret</strong> — это значения <code>CLIENT_ID</code> и
+         <code>CLIENT_SECRET</code> в форме.</p>
+
+      <p><span class="step">Шаг 5.</span> Включите функцию сервисных приложений
+         (если ещё не включена). Запрос с заголовком
+         <code class="copyable">Authorization: OAuth &lt;токен владельца&gt;</code>:</p>
+      <p>POST <code class="copyable">https://api360.yandex.net/security/v1/org/&lt;ORGID&gt;/service_applications/activate</code></p>
+
+      <p><span class="step">Шаг 6.</span> Зарегистрируйте приложение из шага 4 как
+         сервисное для организации:</p>
+      <p>POST <code class="copyable">https://api360.yandex.net/security/v1/org/&lt;ORGID&gt;/service_applications</code></p>
+      <p>Тело запроса (поле <code>id</code> — это ClientID из шага 4):</p>
+      <pre class="code-block copyable">{
+  "applications": [
+    {
+      "id": "&lt;CLIENT_ID&gt;",
+      "scopes": [
+        "cloud_api:disk.read",
+        "cloud_api:disk.write",
+        "cloud_api:disk.info"
+      ]
+    }
+  ]
+}</pre>
+
+      <p><span class="step">Шаг 7.</span> Проверьте, что приложение в списке — тем же
+         токеном владельца:</p>
+      <p>GET <code class="copyable">https://api360.yandex.net/security/v1/org/&lt;ORGID&gt;/service_applications</code></p>
+      <p>Без шагов 5–7 token-exchange возвращает
+         <code>400 invalid_request / Unauthorized</code>.</p>
+      <p class="doclink">📄 Официальная инструкция:
+        <code class="copyable">https://yandex.ru/support/yandex-360/business/admin/ru/security-service-applications</code>
+        <a href="https://yandex.ru/support/yandex-360/business/admin/ru/security-service-applications"
+           target="_blank" rel="noopener">открыть&nbsp;↗</a></p>
+
+      <h3>Набор 2. Админ-токен API&nbsp;360 — блокировка / разблокировка
+        <span class="role">администратор организации</span></h3>
+      <p>У заблокированного сотрудника нельзя выпустить токен Диска. Поэтому если
+         источник заблокирован, инструмент через API&nbsp;360 временно разблокирует
+         его на время копирования и вернёт блокировку в конце (даже при ошибке).
+         Для этого нужен отдельный OAuth-токен с правом управления сотрудниками.</p>
+
+      <p><span class="step">Шаг 1.</span> Зарегистрируйте <strong>отдельное</strong>
+         OAuth-приложение на <code class="copyable">https://oauth.yandex.ru</code> и
+         выдайте ему права:</p>
+      <ul>
+        <li><code class="copyable">directory:read_users</code> — чтение данных и
+            проверка статуса сотрудника;</li>
+        <li><code class="copyable">directory:write_users</code> — блокировка и
+            разблокировка сотрудника.</li>
+      </ul>
+
+      <p><span class="step">Шаг 2.</span> Под учётной записью администратора
+         организации откройте в браузере ссылку (подставьте ClientID этого
+         приложения):</p>
+      <p><code class="copyable">https://oauth.yandex.ru/authorize?response_type=token&amp;client_id=&lt;ClientID&gt;</code></p>
+
+      <p><span class="step">Шаг 3.</span> Скопируйте выданный токен из адресной
+         строки — это значение <code>ADMIN_TOKEN</code> в форме. При изменении прав
+         приложения токен нужно выпустить заново (старый сохраняет прежний набор
+         прав).</p>
+      <p class="doclink">📄 Документация API&nbsp;360:
+        <code class="copyable">https://yandex.ru/dev/api360/doc/ru/access</code>
+        <a href="https://yandex.ru/dev/api360/doc/ru/access"
+           target="_blank" rel="noopener">открыть&nbsp;↗</a></p>
+
+      <h3>ORGID, SOURCE и DESTINATION</h3>
+      <ul>
+        <li><code>ORGID</code> — числовой идентификатор организации. Виден в админке
+            Яндекс&nbsp;360 или через API&nbsp;360:
+            GET <code class="copyable">https://api360.yandex.net/directory/v1/orgs</code></li>
+        <li><code>SOURCE</code> — email сотрудника, с Диска которого копируем.</li>
+        <li><code>DESTINATION</code> — email сотрудника, на Диск которого копируем.</li>
+      </ul>
+
+      <h3>Режим «Между организациями»
+        <span class="role">сервис-аккаунт в каждой орге</span></h3>
+      <p>Сервисное приложение выпускает токены только для сотрудников своей
+         организации, поэтому для переноса между разными оргами <strong>«Набор 1»
+         настраивается дважды</strong> — отдельно в орге-источнике и в
+         орге-получателе (у каждой свои <code>CLIENT_ID</code>/<code>CLIENT_SECRET</code>,
+         зарегистрированные как сервисные по шагам выше). На вкладке «Между
+         организациями» поля разложены по двум блокам:</p>
+      <ul>
+        <li><strong>Источник (организация 1):</strong> <code>CLIENT_ID</code>,
+            <code>CLIENT_SECRET</code>, <code>ORGID</code>, <code>ADMIN_TOKEN</code>,
+            <code>SOURCE</code>.</li>
+        <li><strong>Получатель (организация 2):</strong> <code>CLIENT_ID</code>,
+            <code>CLIENT_SECRET</code>, <code>DESTINATION</code>. Здесь
+            <code>ADMIN_TOKEN</code> и <code>ORGID</code> не нужны — блокировкой
+            управляем только на стороне источника, получатель считается активным.</li>
+      </ul>
+
+      <h3>Важное</h3>
+      <ul>
+        <li><strong>Одна или разные организации.</strong> В режиме «Одна
+            организация» источник и получатель обязаны быть в одной орге (один
+            сервис-аккаунт на обоих). Для разных орг — режим «Между организациями»:
+            token-exchange не пересекает границы организации, поэтому в каждой
+            орге нужен свой сервис-аккаунт (в орге-источнике ещё и
+            <code>ADMIN_TOKEN</code> для разблокировки).</li>
+        <li>Временный токен сотрудника действует один час; инструмент обновляет его
+            автоматически, если копирование идёт дольше.</li>
+        <li>Файлы попадут в <strong>отдельную папку</strong> на Диске получателя
+            (названа по email источника, напр. <code>disk:/user@company1.ru</code>)
+            с <strong>оригинальными</strong> именами.</li>
+        <li>Принцип наименьших привилегий: не используйте персональный токен
+            владельца с полным доступом — только перечисленные выше права.</li>
+      </ul>
+      </div><!-- /tab-tokens -->
+
+      <div id="tab-guide" class="tab-panel">
+        <div id="guide-body" class="md-body">Загрузка инструкции…</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="consent-overlay" class="overlay consent open">
+    <div class="modal consent-modal">
+      <h2>⚠️ Важно: статус инструмента и ответственность</h2>
+      <p>Это <strong>не готовое продуктовое решение Яндекса</strong> и не часть
+         официальной поставки Яндекс&nbsp;360. Инструмент предоставляется «как есть»
+         (<em>as is</em>) — вспомогательный материал для администраторов, которые
+         самостоятельно решают задачу переноса файлов между Дисками сотрудников.</p>
+      <p>Использование — <strong>на свой страх и риск</strong>. Все риски, связанные
+         с запуском, настройкой и эксплуатацией (в том числе потеря или дублирование
+         файлов, простой Диска, нарушение внутренних политик безопасности,
+         некорректная работа при изменении API или лимитов) <strong>несёт
+         организация, выполняющая перенос</strong>.</p>
+      <p>Перед боевым запуском:</p>
+      <ul>
+        <li>протестируйте на одной паре сотрудников и небольшой папке;</li>
+        <li>согласуйте использование сервисных приложений с политиками ИБ и
+            юридической службой;</li>
+        <li>убедитесь, что получено необходимое согласие пользователей на доступ к
+            их Диску.</li>
+      </ul>
+      <p>Официальная поддержка Яндекс&nbsp;360 <strong>не распространяется</strong> на
+         этот инструмент.</p>
+      <label class="consent-check">
+        <input type="checkbox" id="consent-cb">
+        <span>Я прочитал(а) и согласен(на): использую инструмент на свой страх и
+              риск; ответственность за перенос несёт моя организация.</span>
+      </label>
+      <button id="consent-accept" disabled>Продолжить</button>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log"), statusEl = $("status");
+
+    // переключатель темы (начальная тема уже выставлена inline-скриптом в <head>)
+    const themeBtn = $("theme-btn");
+    function setThemeIcon() {
+      themeBtn.textContent =
+        document.documentElement.getAttribute("data-theme") === "dark" ? "☀️" : "🌙";
+    }
+    setThemeIcon();
+    themeBtn.addEventListener("click", () => {
+      const t = document.documentElement.getAttribute("data-theme") === "dark"
+        ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", t);
+      try { localStorage.setItem("ydc_theme", t); } catch (e) {}
+      setThemeIcon();
+    });
+
+    // справка по токенам
+    const overlay = $("help-overlay");
+    const closeHelp = () => overlay.classList.remove("open");
+    $("help-btn").addEventListener("click", () => overlay.classList.add("open"));
+    $("help-close").addEventListener("click", closeHelp);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) closeHelp(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeHelp(); });
+
+    // обязательный дисклеймер-гейт (согласие до использования)
+    const CONSENT_KEY = "ydc_disclaimer_accepted_v1";
+    const consentOverlay = $("consent-overlay");
+    const consentCb = $("consent-cb");
+    const consentBtn = $("consent-accept");
+    function consentAccepted() {
+      try { return localStorage.getItem(CONSENT_KEY) === "1"; } catch (e) { return false; }
+    }
+    function showConsent() {
+      consentOverlay.classList.add("open");
+      document.body.style.overflow = "hidden";
+    }
+    function hideConsent() {
+      consentOverlay.classList.remove("open");
+      document.body.style.overflow = "";
+    }
+    if (consentAccepted()) hideConsent(); else showConsent();
+    consentCb.addEventListener("change", () => { consentBtn.disabled = !consentCb.checked; });
+    consentBtn.addEventListener("click", () => {
+      if (!consentCb.checked) return;
+      try { localStorage.setItem(CONSENT_KEY, "1"); } catch (e) {}
+      hideConsent();
+    });
+
+    // копирование по клику на .copyable
+    const toast = document.createElement("div");
+    toast.className = "copy-toast";
+    document.body.appendChild(toast);
+    let toastTimer = null;
+    function showToast(text) {
+      const short = text.length > 60 ? text.slice(0, 57) + "…" : text;
+      toast.textContent = "Скопировано: " + short;
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove("show"), 1400);
+    }
+    async function copyText(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (e) { /* упадём в фолбэк ниже */ }
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e) { return false; }
+    }
+    overlay.addEventListener("click", async (e) => {
+      const el = e.target.closest(".copyable, .md-body pre, .md-body code");
+      if (!el) return;
+      const text = el.textContent.trim();
+      if (await copyText(text)) {
+        el.classList.add("copied");
+        setTimeout(() => el.classList.remove("copied"), 800);
+        showToast(text);
+      }
+    });
+
+    // вкладки справки + ленивая загрузка инструкции
+    let guideLoaded = false;
+    async function loadGuide() {
+      if (guideLoaded) return;
+      guideLoaded = true;
+      const body = $("guide-body");
+      try {
+        const res = await fetch("/api/instruction");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        body.innerHTML = await res.text();
+        // внешние ссылки открываем в новой вкладке
+        body.querySelectorAll("a").forEach((a) => {
+          a.target = "_blank";
+          a.rel = "noopener";
+        });
+      } catch (err) {
+        guideLoaded = false;
+        body.textContent = "Не удалось загрузить инструкцию: " + err;
+      }
+    }
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const name = tab.dataset.tab;
+        document.querySelectorAll(".tab").forEach((t) =>
+          t.classList.toggle("active", t === tab));
+        document.querySelectorAll(".tab-panel").forEach((p) =>
+          p.classList.toggle("active", p.id === "tab-" + name));
+        overlay.scrollTop = 0;
+        if (name === "guide") loadGuide();
+      });
+    });
+
+    function addLine(text) {
+      logEl.textContent += text + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = "status " + (cls || "");
+    }
+
+    // режим 2 может быть отключён на уровне образа (v1): скрываем вкладки
+    fetch("/api/config").then((r) => r.json()).then((cfg) => {
+      if (!cfg.cross_org) {
+        const tabs = document.querySelector(".mode-tabs");
+        if (tabs) tabs.remove();
+        const cross = $("mode-cross");
+        if (cross) cross.remove();
+        $("mode-single").classList.add("active");
+      }
+    }).catch(() => {});
+
+    // переключение вкладок режимов на главной
+    document.querySelectorAll(".mode-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const m = tab.dataset.mode;
+        document.querySelectorAll(".mode-tab").forEach((t) =>
+          t.classList.toggle("active", t === tab));
+        document.querySelectorAll(".mode-panel").forEach((p) =>
+          p.classList.toggle("active", p.id === "mode-" + m));
+      });
+    });
+
+    // общий запуск: собираем body по карте {ключ_API: id_поля}, шлём и стримим лог
+    async function startCopy(endpoint, fieldMap, button) {
+      if (!consentAccepted()) { showConsent(); return; }
+      const body = {};
+      for (const [key, id] of Object.entries(fieldMap)) body[key] = $(id).value.trim();
+      body.page_limit = parseInt(body.page_limit || "1000", 10);
+      for (const [key, id] of Object.entries(fieldMap)) {
+        if (key === "path" || key === "page_limit") continue;
+        if (!body[key]) { setStatus("Заполните поле: " + key, "error"); return; }
+      }
+
+      logEl.textContent = "";
+      button.disabled = true;
+      setStatus("Запуск…", "running");
+
+      let res;
+      try {
+        res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (e) {
+        setStatus("Сеть недоступна: " + e, "error");
+        button.disabled = false; return;
+      }
+      if (!res.ok) {
+        setStatus("Ошибка запуска: " + res.status, "error");
+        button.disabled = false; return;
+      }
+      const { job_id } = await res.json();
+      setStatus("Выполняется…", "running");
+
+      const es = new EventSource(`/api/run/${job_id}/stream`);
+      es.onmessage = (e) => addLine(e.data);
+      es.addEventListener("done", () => {
+        setStatus("Готово ✓", "done");
+        es.close(); button.disabled = false;
+      });
+      es.addEventListener("error", (e) => {
+        if (e && e.data) { setStatus("Ошибка: " + e.data, "error"); es.close(); }
+        button.disabled = false;
+      });
+    }
+
+    // режим 1 — одна организация
+    $("run").addEventListener("click", () => startCopy("/api/run", {
+      client_id: "client_id", client_secret: "client_secret", orgid: "orgid",
+      admin_token: "admin_token", source_disk_id: "source_disk_id",
+      destination_disk_id: "destination_disk_id", path: "path", page_limit: "page_limit",
+    }, $("run")));
+
+    // режим 2 — между организациями
+    $("run-cross").addEventListener("click", () => startCopy("/api/run-cross", {
+      src_client_id: "x_src_client_id", src_client_secret: "x_src_client_secret",
+      src_orgid: "x_src_orgid", src_admin_token: "x_src_admin_token",
+      source_disk_id: "x_source_disk_id",
+      dst_client_id: "x_dst_client_id", dst_client_secret: "x_dst_client_secret",
+      destination_disk_id: "x_destination_disk_id",
+      path: "x_path", page_limit: "x_page_limit",
+    }, $("run-cross")));
+  </script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+# Production-вариант (pull-only из Docker Hub): сервис не публикуется наружу
+# напрямую, перед ним стоит Caddy с автоматическим HTTPS и basic-auth.
+# Оба образа готовые — локальная сборка не нужна.
+#
+# Запуск:
+#   1) cp .env.example .env  и заполни SITE_ADDRESS / BASIC_AUTH_USER / BASIC_AUTH_HASH
+#   2) docker compose -f docker-compose.caddy.yml pull
+#   3) docker compose -f docker-compose.caddy.yml up -d
+#
+# Не запускай одновременно с обычным docker-compose.yml — конфликт имени контейнера.
+
+services:
+  disk-copy:
+    image: cromovsky/yandex-disk-copy:latest
+    container_name: yandex-disk-copy
+    restart: unless-stopped
+    expose:
+      - "8000"          # доступен только внутри docker-сети, не на хост
+
+  caddy:
+    image: cromovsky/yandex-disk-copy-caddy:latest
+    container_name: yandex-disk-copy-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    env_file: .env
+    volumes:
+      - caddy_data:/data       # сертификаты сохраняются между перезапусками
+      - caddy_config:/config
+    depends_on:
+      - disk-copy
+
+volumes:
+  caddy_data:
+  caddy_config:
