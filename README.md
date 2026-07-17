@@ -1,14 +1,24 @@
 # Yandex Disk Copy — web-интерфейс
 
+[![Docker v2](https://img.shields.io/docker/v/cromovsky/yandex-disk-copy-v2?logo=docker&label=docker%20v2&color=0f7ff0)](https://hub.docker.com/r/cromovsky/yandex-disk-copy-v2)
+[![Docker v1](https://img.shields.io/docker/v/cromovsky/yandex-disk-copy?logo=docker&label=docker%20v1)](https://hub.docker.com/r/cromovsky/yandex-disk-copy)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-blue)
+
 Веб-обёртка вокруг скрипта копирования файлов с одного Яндекс.Диска на другой.
 Использует сервисные приложения Яндекс 360, API Диска и API360 для блокировки /
 разблокировки сотрудника.
 
+**Образы в Docker Hub:**
+- [`cromovsky/yandex-disk-copy-v2`](https://hub.docker.com/r/cromovsky/yandex-disk-copy-v2) — оба режима (одна организация + между организациями);
+- [`cromovsky/yandex-disk-copy`](https://hub.docker.com/r/cromovsky/yandex-disk-copy) (v1) — только режим «одна организация».
+
 📄 **Инструкция для администраторов** (настройка сервисного приложения + запуск
 из Docker Hub) — [docs/INSTRUCTION.md](docs/INSTRUCTION.md).
 
-После запуска процессы скачивания идут на бэкенде Диска — файлы окажутся в папке
-«Загрузки» аккаунта назначения с префиксом `<source_email>_`.
+После запуска процессы копирования идут на бэкенде Диска — файлы окажутся в
+отдельной папке на Диске получателя (названа по email источника) с оригинальными
+именами.
 
 ## Что внутри
 
