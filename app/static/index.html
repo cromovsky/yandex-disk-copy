@@ -170,6 +170,21 @@
     input:focus { outline: none; border-color: var(--accent); background: #fff;
                   box-shadow: 0 0 0 3px rgba(15,127,240,.18); }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .dest-type { display: flex; gap: 8px; margin-top: 4px; }
+    .dest-type label.chip {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      gap: 6px; margin: 0; padding: 10px 12px; border: 1px solid var(--line);
+      border-radius: 12px; background: #fbfbfc; color: var(--ink-soft);
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      transition: border-color .12s, background .12s, color .12s;
+    }
+    .dest-type label.chip:has(input:checked) {
+      border-color: var(--accent); background: #eef4ff; color: var(--accent-dark);
+    }
+    .dest-type input { position: absolute; opacity: 0; pointer-events: none; }
+    .dest-shared-fields { display: none; }
+    .dest-shared-fields.show { display: block; }
+    .field-note { margin: 6px 0 0; font-size: 12px; color: var(--ink-soft); line-height: 1.4; }
     .run-row { grid-column: 1 / -1; display: flex; justify-content: center;
                margin: 4px 0 2px; }
     .run-btn { width: auto; min-width: 320px; padding: 15px 56px; border-radius: 14px;
@@ -262,6 +277,13 @@
     /* поля ввода */
     [data-theme="dark"] input { background: #23272f; border-color: #2b303a; color: var(--ink); }
     [data-theme="dark"] input::placeholder { color: #6b6e78; }
+    [data-theme="dark"] .dest-type label.chip {
+      background: #23272f; border-color: #2b303a; color: var(--ink-soft);
+    }
+    [data-theme="dark"] .dest-type label.chip:has(input:checked) {
+      border-color: var(--accent); background: #1a2740; color: #86c4ff;
+    }
+    [data-theme="dark"] .field-note { color: #8b8e99; }
     /* код и блоки кода */
     [data-theme="dark"] .modal code,
     [data-theme="dark"] .md-body code { background: #262b34; color: #86c4ff; }
@@ -341,8 +363,36 @@
           <div class="card-title">Источник, назначение и параметры</div>
           <label>SOURCE (email — откуда копируем)</label>
           <input id="source_disk_id" autocomplete="off" placeholder="user@company.ru">
-          <label>DESTINATION (email — куда копируем)</label>
+
+          <label>Куда переносим</label>
+          <div class="dest-type" role="radiogroup" aria-label="Тип назначения">
+            <label class="chip">
+              <input type="radio" name="dest_type" value="personal" checked>
+              Личный Диск
+            </label>
+            <label class="chip">
+              <input type="radio" name="dest_type" value="shared">
+              Общий диск
+            </label>
+          </div>
+
+          <label id="destination_label">DESTINATION (email — куда копируем)</label>
           <input id="destination_disk_id" autocomplete="off" placeholder="user@company.ru">
+          <p id="destination_note" class="field-note" hidden>
+            Email сотрудника с правом <strong>записи</strong> на общий диск —
+            от его имени выполняется перенос.
+          </p>
+
+          <div id="shared_fields" class="dest-shared-fields">
+            <label>VD_HASH (метка общего диска)</label>
+            <input id="destination_vd_hash" autocomplete="off"
+                   placeholder="из адресной строки после vd/ или целиком URL">
+            <p class="field-note">
+              Откройте общий диск в браузере — в URL будет
+              <code>.../vd/&lt;метка&gt;/...</code>. Можно вставить метку или весь URL.
+            </p>
+          </div>
+
           <label>PATH</label>
           <input id="path" value="/">
           <label title="Размер страницы при обходе папки: сколько элементов инструмент запрашивает у API Диска за один запрос. НЕ ограничивает число копируемых файлов — обрабатываются все, порциями. По умолчанию 1000 (максимум API).">PAGE_LIMIT&nbsp;ⓘ</label>
@@ -351,7 +401,7 @@
         </div>
       </div>
       <div class="run-row">
-        <button id="run" class="run-btn">Запустить копирование</button>
+        <button id="run" class="run-btn">Запустить перенос</button>
       </div>
     </div>
 
@@ -382,16 +432,35 @@
       </div>
 
       <div class="card">
-        <div class="card-title">Пользователи</div>
+        <div class="card-title">Пользователи и назначение</div>
         <div class="row">
           <div>
             <label>SOURCE (email — откуда копируем)</label>
             <input id="x_source_disk_id" autocomplete="off" placeholder="user@company1.ru">
           </div>
           <div>
-            <label>DESTINATION (email — куда копируем)</label>
-            <input id="x_destination_disk_id" autocomplete="off" placeholder="user@company2.ru">
+            <label>Куда переносим</label>
+            <div class="dest-type" role="radiogroup" aria-label="Тип назначения">
+              <label class="chip">
+                <input type="radio" name="x_dest_type" value="personal" checked>
+                Личный Диск
+              </label>
+              <label class="chip">
+                <input type="radio" name="x_dest_type" value="shared">
+                Общий диск
+              </label>
+            </div>
           </div>
+        </div>
+        <label id="x_destination_label">DESTINATION (email — куда копируем)</label>
+        <input id="x_destination_disk_id" autocomplete="off" placeholder="user@company2.ru">
+        <p id="x_destination_note" class="field-note" hidden>
+          Email сотрудника орг-получателя с правом <strong>записи</strong> на общий диск.
+        </p>
+        <div id="x_shared_fields" class="dest-shared-fields">
+          <label>VD_HASH (метка общего диска)</label>
+          <input id="x_destination_vd_hash" autocomplete="off"
+                 placeholder="из адресной строки после vd/ или целиком URL">
         </div>
       </div>
 
@@ -416,10 +485,11 @@
     </div>
 
     <p class="hint">
-      Файлы будут опубликованы на диске-источнике и сохранены в отдельную папку
-      на Диске получателя (названа по email источника) с оригинальными именами.
-      Если сотрудник-источник заблокирован, он временно разблокируется на время
-      копирования и блокируется обратно.
+      На <strong>личный Диск</strong> файлы сохраняются в папку по email источника
+      с оригинальными именами. На <strong>общий диск</strong> — в папку с тем же
+      именем на выбранном общем диске (нужна метка <code>vd_hash</code> и сотрудник
+      с правом записи). Если сотрудник-источник заблокирован, он временно
+      разблокируется на время переноса и блокируется обратно.
     </p>
 
     <div class="log-head">
@@ -808,15 +878,51 @@
       });
     });
 
+    // переключение личного / общего диска назначения
+    function wireDestType(prefix) {
+      const isCross = prefix === "x_";
+      const name = isCross ? "x_dest_type" : "dest_type";
+      const sharedFields = $(isCross ? "x_shared_fields" : "shared_fields");
+      const destLabel = $(isCross ? "x_destination_label" : "destination_label");
+      const destNote = $(isCross ? "x_destination_note" : "destination_note");
+      const destInput = $(isCross ? "x_destination_disk_id" : "destination_disk_id");
+
+      function apply() {
+        const shared = document.querySelector(`input[name="${name}"]:checked`)?.value === "shared";
+        sharedFields.classList.toggle("show", shared);
+        destNote.hidden = !shared;
+        if (shared) {
+          destLabel.textContent = "DESTINATION (email сотрудника с правом записи)";
+          destInput.placeholder = isCross ? "writer@company2.ru" : "writer@company.ru";
+        } else {
+          destLabel.textContent = "DESTINATION (email — куда копируем)";
+          destInput.placeholder = isCross ? "user@company2.ru" : "user@company.ru";
+        }
+      }
+      document.querySelectorAll(`input[name="${name}"]`).forEach((el) =>
+        el.addEventListener("change", apply));
+      apply();
+      return () => document.querySelector(`input[name="${name}"]:checked`)?.value || "personal";
+    }
+    const getDestType = wireDestType("");
+    const getCrossDestType = wireDestType("x_");
+
     // общий запуск: собираем body по карте {ключ_API: id_поля}, шлём и стримим лог
-    async function startCopy(endpoint, fieldMap, button) {
+    async function startCopy(endpoint, fieldMap, button, extras) {
       if (!consentAccepted()) { showConsent(); return; }
       const body = {};
       for (const [key, id] of Object.entries(fieldMap)) body[key] = $(id).value.trim();
+      Object.assign(body, extras || {});
       body.page_limit = parseInt(body.page_limit || "1000", 10);
+      const optional = new Set(["path", "page_limit", "destination_vd_hash"]);
+      if (body.destination_type !== "shared") optional.add("destination_vd_hash");
       for (const [key, id] of Object.entries(fieldMap)) {
-        if (key === "path" || key === "page_limit") continue;
+        if (optional.has(key)) continue;
         if (!body[key]) { setStatus("Заполните поле: " + key, "error"); return; }
+      }
+      if (body.destination_type === "shared" && !body.destination_vd_hash) {
+        setStatus("Для общего диска укажите VD_HASH", "error");
+        return;
       }
 
       logEl.textContent = "";
@@ -835,7 +941,13 @@
         button.disabled = false; return;
       }
       if (!res.ok) {
-        setStatus("Ошибка запуска: " + res.status, "error");
+        let detail = res.status;
+        try {
+          const err = await res.json();
+          if (err && err.detail) detail = typeof err.detail === "string"
+            ? err.detail : JSON.stringify(err.detail);
+        } catch (e) {}
+        setStatus("Ошибка запуска: " + detail, "error");
         button.disabled = false; return;
       }
       const { job_id } = await res.json();
@@ -857,8 +969,10 @@
     $("run").addEventListener("click", () => startCopy("/api/run", {
       client_id: "client_id", client_secret: "client_secret", orgid: "orgid",
       admin_token: "admin_token", source_disk_id: "source_disk_id",
-      destination_disk_id: "destination_disk_id", path: "path", page_limit: "page_limit",
-    }, $("run")));
+      destination_disk_id: "destination_disk_id",
+      destination_vd_hash: "destination_vd_hash",
+      path: "path", page_limit: "page_limit",
+    }, $("run"), { destination_type: getDestType() }));
 
     // режим 2 — между организациями
     $("run-cross").addEventListener("click", () => startCopy("/api/run-cross", {
@@ -867,8 +981,9 @@
       source_disk_id: "x_source_disk_id",
       dst_client_id: "x_dst_client_id", dst_client_secret: "x_dst_client_secret",
       destination_disk_id: "x_destination_disk_id",
+      destination_vd_hash: "x_destination_vd_hash",
       path: "x_path", page_limit: "x_page_limit",
-    }, $("run-cross")));
+    }, $("run-cross"), { destination_type: getCrossDestType() }));
   </script>
 </body>
 </html>

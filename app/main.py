@@ -50,6 +50,10 @@ class RunRequest(BaseModel):
     destination_disk_id: str = Field(..., min_length=1)
     path: str = "/"
     page_limit: int = 1000
+    # personal — личный Диск; shared — общий диск (нужен destination_vd_hash;
+    # destination_disk_id тогда — email сотрудника с правом записи).
+    destination_type: str = "personal"
+    destination_vd_hash: str = ""
 
 
 class RunCrossRequest(BaseModel):
@@ -69,6 +73,8 @@ class RunCrossRequest(BaseModel):
     destination_disk_id: str = Field(..., min_length=1)
     path: str = "/"
     page_limit: int = 1000
+    destination_type: str = "personal"
+    destination_vd_hash: str = ""
 
 
 _DONE = object()  # сентинел конца лога в очереди
@@ -130,9 +136,41 @@ def _start_job(cfg: CopyConfig) -> dict:
     return {"job_id": job.id}
 
 
+def _normalize_dest_type(value: str) -> str:
+    v = (value or "personal").strip().lower()
+    if v not in ("personal", "shared"):
+        raise HTTPException(
+            status_code=400,
+            detail="destination_type должен быть 'personal' или 'shared'",
+        )
+    return v
+
+
+def _normalize_vd_hash(value: str) -> str:
+    """Принимает сырой hash или URL/путь вида .../vd/<hash>/..."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    # вырезаем метку после vd/ если вставили ссылку из браузера
+    marker = "/vd/"
+    if marker in raw:
+        raw = raw.split(marker, 1)[1]
+    raw = raw.strip("/").split("/", 1)[0]
+    if raw.startswith("vd:"):
+        raw = raw[3:].split(":", 1)[0]
+    return raw.strip()
+
+
 @app.post("/api/run")
 def run(req: RunRequest) -> dict:
     # Режим 1: один и тот же сервис-аккаунт для источника и получателя.
+    dest_type = _normalize_dest_type(req.destination_type)
+    vd_hash = _normalize_vd_hash(req.destination_vd_hash)
+    if dest_type == "shared" and not vd_hash:
+        raise HTTPException(
+            status_code=400,
+            detail="Для общего диска укажите destination_vd_hash",
+        )
     creds = OrgCreds(
         client_id=req.client_id,
         client_secret=req.client_secret,
@@ -146,6 +184,8 @@ def run(req: RunRequest) -> dict:
         destination_disk_id=req.destination_disk_id,
         path=req.path or "/",
         page_limit=req.page_limit,
+        destination_type=dest_type,
+        destination_vd_hash=vd_hash,
     )
     return _start_job(cfg)
 
@@ -153,6 +193,13 @@ def run(req: RunRequest) -> dict:
 @app.post("/api/run-cross")
 def run_cross(req: RunCrossRequest) -> dict:
     # Режим 2: раздельные сервис-аккаунты; admin/orgid только у источника.
+    dest_type = _normalize_dest_type(req.destination_type)
+    vd_hash = _normalize_vd_hash(req.destination_vd_hash)
+    if dest_type == "shared" and not vd_hash:
+        raise HTTPException(
+            status_code=400,
+            detail="Для общего диска укажите destination_vd_hash",
+        )
     cfg = CopyConfig(
         source=OrgCreds(
             client_id=req.src_client_id,
@@ -168,6 +215,8 @@ def run_cross(req: RunCrossRequest) -> dict:
         destination_disk_id=req.destination_disk_id,
         path=req.path or "/",
         page_limit=req.page_limit,
+        destination_type=dest_type,
+        destination_vd_hash=vd_hash,
     )
     return _start_job(cfg)
 
