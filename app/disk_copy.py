@@ -346,9 +346,10 @@ class DiskCopier:
         raise CopyError(f"Таймаут ожидания операции Диска: {href}")
 
     # ── API общих дисков (virtual-disks) ───────────────────────────────
-    def _vd_ensure_folder(self, token: str, path: str) -> None:
+    def _vd_ensure_folder(self, path: str) -> None:
+        # свежий токен на каждый запрос — перенос может длиться дольше TTL токена
+        headers = {"Authorization": f"OAuth {self._destination_token()}"}
         url = "https://cloud-api.yandex.net/v1/disk/virtual-disks/resources"
-        headers = {"Authorization": f"OAuth {token}"}
         response = self.session.put(url, params={"path": path}, headers=headers)
         if response.status_code in (201, 409):
             state = "создана" if response.status_code == 201 else "уже существует"
@@ -359,13 +360,13 @@ class DiskCopier:
                 f"{response.status_code} {response.text[:300]}"
             )
 
-    def _vd_ensure_folder_tree(self, token: str, inner: str) -> None:
+    def _vd_ensure_folder_tree(self, inner: str) -> None:
         """Создаёт цепочку папок внутри общего диска (inner без vd: префикса)."""
         parts = [p for p in _strip_disk_schema(inner).strip("/").split("/") if p]
         acc: list[str] = []
         for part in parts:
             acc.append(part)
-            self._vd_ensure_folder(token, self._vd_path("/".join(acc)))
+            self._vd_ensure_folder(self._vd_path("/".join(acc)))
 
     def _vd_upload_from_url(self, file_url: str, dest_path: str) -> None:
         """Загрузка файла из интернета на общий диск (async → ждём операцию)."""
@@ -476,8 +477,7 @@ class DiskCopier:
             f"save_to_shared | start | vd_hash: {self.cfg.destination_vd_hash} | "
             f"папка: {root_vd}"
         )
-        token_dst = self._destination_token()
-        self._vd_ensure_folder_tree(token_dst, root_inner)
+        self._vd_ensure_folder_tree(root_inner)
 
         files = self._collect_files_recursive(self.cfg.path)
         self.log(f"save_to_shared | файлов к переносу: {len(files)}")
@@ -495,7 +495,7 @@ class DiskCopier:
             # родители файла на общем диске
             parent_inner = dest_inner.rsplit("/", 1)[0]
             if parent_inner and parent_inner != root_inner:
-                self._vd_ensure_folder_tree(token_dst, parent_inner)
+                self._vd_ensure_folder_tree(parent_inner)
 
             self._disk_publish_resource(self._source_token(), src_path)
             meta = self._disk_resource(self._source_token(), src_path)
