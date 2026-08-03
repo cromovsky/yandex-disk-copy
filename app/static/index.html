@@ -185,6 +185,61 @@
     .dest-shared-fields { display: none; }
     .dest-shared-fields.show { display: block; }
     .field-note { margin: 6px 0 0; font-size: 12px; color: var(--ink-soft); line-height: 1.4; }
+    .pair-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: stretch;
+                    margin: 12px 0 4px; }
+    .pair-actions .secondary-btn { height: 42px; min-height: 42px; margin: 0; }
+    .secondary-btn {
+      flex: 1 1 0; min-width: 140px; min-height: 42px; box-sizing: border-box;
+      display: inline-flex; align-items: center; justify-content: center;
+      width: auto; padding: 0 14px; border-radius: 10px;
+      background: #fff; color: var(--accent-dark); font-size: 13px; font-weight: 600;
+      border: 1px solid #cfe0f8; box-shadow: 0 1px 4px rgba(15,106,230,.08);
+      transition: background .12s, border-color .12s; text-align: center;
+      text-decoration: none; cursor: pointer;
+    }
+    .secondary-btn:hover:not(:disabled) { background: #eef4ff; border-color: var(--accent); }
+    a.secondary-btn { line-height: 1.2; }
+    .batch-panel { display: none; margin-top: 8px; }
+    .batch-panel.show { display: block; }
+    .batch-panel textarea {
+      width: 100%; min-height: 120px; padding: 11px 13px; border: 1px solid var(--line);
+      border-radius: 12px; font-size: 13px; background: #fbfbfc; color: var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.45;
+      resize: vertical; transition: border-color .12s, box-shadow .12s, background .12s;
+    }
+    .batch-panel textarea:focus { outline: none; border-color: var(--accent); background: #fff;
+      box-shadow: 0 0 0 3px rgba(15,127,240,.18); }
+    .batch-preview {
+      margin-top: 10px; font-size: 12.5px; color: var(--ink-soft);
+      background: #f7f8fa; border: 1px solid #eceef1; border-radius: 10px;
+      padding: 10px 12px; max-height: 160px; overflow: auto;
+      font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap;
+    }
+    .batch-preview.empty { color: #9a9ba6; }
+    .batch-preview .err { color: #dc2626; }
+    .file-btn { position: relative; overflow: hidden; }
+    .file-btn input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .file-btn.icon-btn { flex: 0 0 auto; min-width: 42px; width: 42px; padding: 0; }
+    .file-btn.icon-btn svg { width: 18px; height: 18px; display: block; }
+    /* вкладки режимов внутри карточки — в стиле браузера */
+    .subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line);
+               margin: 2px 0 16px; }
+    .subtab {
+      appearance: none; background: transparent; cursor: pointer;
+      padding: 9px 16px; font-size: 13px; font-weight: 600; color: var(--ink-soft);
+      border: 1px solid transparent; border-bottom: none;
+      border-radius: 10px 10px 0 0; margin-bottom: -1px;
+      transition: color .12s, background .12s, border-color .12s;
+    }
+    .subtab:hover { color: var(--accent-dark); background: #f2f6fd; }
+    .subtab.active {
+      color: var(--accent-dark); background: #fff;
+      border-color: var(--line); border-bottom-color: #fff;
+    }
+    .subtab-panel { display: none; }
+    .subtab-panel.active { display: block; }
     .run-row { grid-column: 1 / -1; display: flex; justify-content: center;
                margin: 4px 0 2px; }
     .run-btn { width: auto; min-width: 320px; padding: 15px 56px; border-radius: 14px;
@@ -284,6 +339,18 @@
       border-color: var(--accent); background: #1a2740; color: #86c4ff;
     }
     [data-theme="dark"] .field-note { color: #8b8e99; }
+    [data-theme="dark"] .secondary-btn {
+      background: #23272f; color: #86c4ff; border-color: #2b303a;
+    }
+    [data-theme="dark"] .secondary-btn:hover:not(:disabled) {
+      background: #1a2740; border-color: var(--accent);
+    }
+    [data-theme="dark"] .batch-panel textarea {
+      background: #23272f; border-color: #2b303a; color: var(--ink);
+    }
+    [data-theme="dark"] .batch-preview {
+      background: #23272f; border-color: #2b303a; color: #8b8e99;
+    }
     /* код и блоки кода */
     [data-theme="dark"] .modal code,
     [data-theme="dark"] .md-body code { background: #262b34; color: #86c4ff; }
@@ -361,8 +428,54 @@
 
         <div class="card">
           <div class="card-title">Источник, назначение и параметры</div>
-          <label>SOURCE (email — откуда копируем)</label>
-          <input id="source_disk_id" autocomplete="off" placeholder="user@company.ru">
+
+          <div class="subtabs" role="tablist" data-subtabs="single">
+            <button type="button" class="subtab active" role="tab"
+                    data-subtab-target="one">Один диск</button>
+            <button type="button" class="subtab" role="tab"
+                    data-subtab-target="many">Несколько дисков</button>
+          </div>
+
+          <div id="single_pair_fields" class="subtab-panel active" data-subtab-panel="one">
+            <label>SOURCE (email — откуда копируем)</label>
+            <input id="source_disk_id" autocomplete="off" placeholder="user@company.ru">
+
+            <label id="destination_label">DESTINATION (email — куда копируем)</label>
+            <input id="destination_disk_id" autocomplete="off" placeholder="user@company.ru">
+            <p id="destination_note" class="field-note" hidden>
+              Email сотрудника с правом <strong>записи</strong> на общий диск —
+              от его имени выполняется перенос.
+            </p>
+          </div>
+
+          <div class="subtab-panel" data-subtab-panel="many">
+            <div class="pair-actions">
+              <a class="secondary-btn" id="batch_template"
+                 href="/static/pairs-template.csv" download="pairs-template.csv">
+                Скачать шаблон
+              </a>
+              <label class="secondary-btn file-btn icon-btn" id="batch_file_label"
+                     title="Загрузить список пар">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a1.5 1.5 0 0 1-2.12-2.12l8.49-8.49"/>
+                </svg>
+                <input type="file" id="batch_file" accept=".csv,.txt,text/csv,text/plain">
+              </label>
+            </div>
+
+            <div id="batch_panel" class="batch-panel">
+              <label data-batch-max-label>Список пар SOURCE → DESTINATION (макс. 25)</label>
+              <textarea id="batch_pairs" spellcheck="false"
+                placeholder="SOURCE;DESTINATION&#10;source@company.ru;dest@company.ru"></textarea>
+              <p class="field-note" data-batch-help>
+                Заполните скачанный шаблон и загрузите его кнопкой-скрепкой.
+                Формат: <code>SOURCE;DESTINATION</code>, одна пара на строку.
+                Не больше 25 пар; одновременно идут 5 переносов.
+              </p>
+              <div id="batch_preview" class="batch-preview empty">Список пока пуст</div>
+            </div>
+          </div>
 
           <label>Куда переносим</label>
           <div class="dest-type" role="radiogroup" aria-label="Тип назначения">
@@ -376,14 +489,16 @@
             </label>
           </div>
 
-          <label id="destination_label">DESTINATION (email — куда копируем)</label>
-          <input id="destination_disk_id" autocomplete="off" placeholder="user@company.ru">
-          <p id="destination_note" class="field-note" hidden>
-            Email сотрудника с правом <strong>записи</strong> на общий диск —
-            от его имени выполняется перенос.
-          </p>
-
           <div id="shared_fields" class="dest-shared-fields">
+            <div id="batch_shared_writer" hidden>
+              <label>DESTINATION (email сотрудника с правом записи)</label>
+              <input id="batch_destination_disk_id" autocomplete="off"
+                     placeholder="writer@company.ru">
+              <p class="field-note">
+                Все источники из списка переносятся на этот общий диск
+                от имени указанного сотрудника.
+              </p>
+            </div>
             <label>VD_HASH (метка общего диска)</label>
             <input id="destination_vd_hash" autocomplete="off"
                    placeholder="из адресной строки после vd/ или целиком URL">
@@ -433,31 +548,79 @@
 
       <div class="card">
         <div class="card-title">Пользователи и назначение</div>
-        <div class="row">
-          <div>
-            <label>SOURCE (email — откуда копируем)</label>
-            <input id="x_source_disk_id" autocomplete="off" placeholder="user@company1.ru">
-          </div>
-          <div>
-            <label>Куда переносим</label>
-            <div class="dest-type" role="radiogroup" aria-label="Тип назначения">
-              <label class="chip">
-                <input type="radio" name="x_dest_type" value="personal" checked>
-                Личный Диск
-              </label>
-              <label class="chip">
-                <input type="radio" name="x_dest_type" value="shared">
-                Общий диск
-              </label>
+
+        <div class="subtabs" role="tablist" data-subtabs="cross">
+          <button type="button" class="subtab active" role="tab"
+                  data-subtab-target="one">Один диск</button>
+          <button type="button" class="subtab" role="tab"
+                  data-subtab-target="many">Несколько дисков</button>
+        </div>
+
+        <div id="x_single_pair_fields" class="subtab-panel active" data-subtab-panel="one">
+          <div class="row">
+            <div>
+              <label>SOURCE (email — откуда копируем)</label>
+              <input id="x_source_disk_id" autocomplete="off" placeholder="user@company1.ru">
+            </div>
+            <div>
+              <label id="x_destination_label">DESTINATION (email — куда копируем)</label>
+              <input id="x_destination_disk_id" autocomplete="off" placeholder="user@company2.ru">
             </div>
           </div>
+          <p id="x_destination_note" class="field-note" hidden>
+            Email сотрудника орг-получателя с правом <strong>записи</strong> на общий диск.
+          </p>
         </div>
-        <label id="x_destination_label">DESTINATION (email — куда копируем)</label>
-        <input id="x_destination_disk_id" autocomplete="off" placeholder="user@company2.ru">
-        <p id="x_destination_note" class="field-note" hidden>
-          Email сотрудника орг-получателя с правом <strong>записи</strong> на общий диск.
-        </p>
+
+        <div class="subtab-panel" data-subtab-panel="many">
+          <div class="pair-actions">
+            <a class="secondary-btn" id="x_batch_template"
+               href="/static/pairs-template.csv" download="pairs-template.csv">
+              Скачать шаблон
+            </a>
+            <label class="secondary-btn file-btn icon-btn" id="x_batch_file_label"
+                   title="Загрузить список пар">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a1.5 1.5 0 0 1-2.12-2.12l8.49-8.49"/>
+              </svg>
+              <input type="file" id="x_batch_file" accept=".csv,.txt,text/csv,text/plain">
+            </label>
+          </div>
+
+          <div id="x_batch_panel" class="batch-panel">
+            <label data-batch-max-label>Список пар SOURCE → DESTINATION (макс. 25)</label>
+            <textarea id="x_batch_pairs" spellcheck="false"
+              placeholder="SOURCE;DESTINATION&#10;source@company1.ru;dest@company2.ru"></textarea>
+            <p class="field-note" data-batch-help>
+              Заполните скачанный шаблон и загрузите его кнопкой-скрепкой.
+              Не больше 25 пар; одновременно идут 5 переносов.
+            </p>
+            <div id="x_batch_preview" class="batch-preview empty">Список пока пуст</div>
+          </div>
+        </div>
+
+        <label>Куда переносим</label>
+        <div class="dest-type" role="radiogroup" aria-label="Тип назначения">
+          <label class="chip">
+            <input type="radio" name="x_dest_type" value="personal" checked>
+            Личный Диск
+          </label>
+          <label class="chip">
+            <input type="radio" name="x_dest_type" value="shared">
+            Общий диск
+          </label>
+        </div>
         <div id="x_shared_fields" class="dest-shared-fields">
+          <div id="x_batch_shared_writer" hidden>
+            <label>DESTINATION (email сотрудника с правом записи)</label>
+            <input id="x_batch_destination_disk_id" autocomplete="off"
+                   placeholder="writer@company2.ru">
+            <p class="field-note">
+              Все источники из списка переносятся на этот общий диск
+              от имени указанного сотрудника орг-получателя.
+            </p>
+          </div>
           <label>VD_HASH (метка общего диска)</label>
           <input id="x_destination_vd_hash" autocomplete="off"
                  placeholder="из адресной строки после vd/ или целиком URL">
@@ -488,8 +651,12 @@
       На <strong>личный Диск</strong> файлы сохраняются в папку по email источника
       с оригинальными именами. На <strong>общий диск</strong> — в папку с тем же
       именем на выбранном общем диске (нужна метка <code>vd_hash</code> и сотрудник
-      с правом записи). Если сотрудник-источник заблокирован, он временно
-      разблокируется на время переноса и блокируется обратно.
+      с правом записи). Для пакетного переноса откройте вкладку
+      <strong>«Несколько дисков»</strong>. На <strong>личные Диски</strong> —
+      шаблон пар <code>SOURCE;DESTINATION</code>; на <strong>общий диск</strong> —
+      список источников и один сотрудник с правом записи + <code>vd_hash</code>
+      (до 25, по 5 переносов одновременно). Если сотрудник-источник
+      заблокирован, он временно разблокируется на время переноса и блокируется обратно.
     </p>
 
     <div class="log-head">
@@ -856,7 +1023,9 @@
       statusEl.className = "status " + (cls || "");
     }
 
-    // режим 2 может быть отключён на уровне образа (v1): скрываем вкладки
+    // режим 2 может быть отключён на уровне образа (v1); лимиты пакета с бэкенда
+    let BATCH_MAX = 25;
+    let BATCH_CONCURRENCY = 5;
     fetch("/api/config").then((r) => r.json()).then((cfg) => {
       if (!cfg.cross_org) {
         const tabs = document.querySelector(".mode-tabs");
@@ -865,6 +1034,15 @@
         if (cross) cross.remove();
         $("mode-single").classList.add("active");
       }
+      if (cfg.batch_max_pairs) BATCH_MAX = cfg.batch_max_pairs;
+      if (cfg.batch_concurrency) BATCH_CONCURRENCY = cfg.batch_concurrency;
+      document.querySelectorAll("[data-batch-max-label]").forEach((el) => {
+        if (!el.dataset.fixed) {
+          el.textContent = `Список пар SOURCE → DESTINATION (макс. ${BATCH_MAX})`;
+        }
+      });
+      // обновить подсказки пакетного режима после загрузки лимитов
+      document.dispatchEvent(new Event("batch-limits-ready"));
     }).catch(() => {});
 
     // переключение вкладок режимов на главной
@@ -879,6 +1057,8 @@
     });
 
     // переключение личного / общего диска назначения
+    const destTypeListeners = [];
+    function onDestTypeChange(fn) { destTypeListeners.push(fn); }
     function wireDestType(prefix) {
       const isCross = prefix === "x_";
       const name = isCross ? "x_dest_type" : "dest_type";
@@ -890,14 +1070,15 @@
       function apply() {
         const shared = document.querySelector(`input[name="${name}"]:checked`)?.value === "shared";
         sharedFields.classList.toggle("show", shared);
-        destNote.hidden = !shared;
+        if (destNote) destNote.hidden = !shared;
         if (shared) {
-          destLabel.textContent = "DESTINATION (email сотрудника с правом записи)";
-          destInput.placeholder = isCross ? "writer@company2.ru" : "writer@company.ru";
+          if (destLabel) destLabel.textContent = "DESTINATION (email сотрудника с правом записи)";
+          if (destInput) destInput.placeholder = isCross ? "writer@company2.ru" : "writer@company.ru";
         } else {
-          destLabel.textContent = "DESTINATION (email — куда копируем)";
-          destInput.placeholder = isCross ? "user@company2.ru" : "user@company.ru";
+          if (destLabel) destLabel.textContent = "DESTINATION (email — куда копируем)";
+          if (destInput) destInput.placeholder = isCross ? "user@company2.ru" : "user@company.ru";
         }
+        destTypeListeners.forEach((fn) => fn());
       }
       document.querySelectorAll(`input[name="${name}"]`).forEach((el) =>
         el.addEventListener("change", apply));
@@ -907,17 +1088,299 @@
     const getDestType = wireDestType("");
     const getCrossDestType = wireDestType("x_");
 
+    // ── пакетный режим: список пар / источников ──────────────────────
+    function parsePairsText(text, { shared = false } = {}) {
+      const pairs = [];
+      const errors = [];
+      const seen = new Set();
+      const lines = String(text || "").split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        if (!line || line.startsWith("#")) continue;
+        // заголовок CSV: SOURCE / SOURCE;DESTINATION
+        if (/^(source|источник)\b/i.test(line) &&
+            (!/;|,|\t/.test(line) || /destination|назначение/i.test(line))) {
+          continue;
+        }
+
+        let source = "";
+        let destination = "";
+        if (line.includes(";") || line.includes("\t") || line.includes(",")) {
+          let parts;
+          if (line.includes(";")) parts = line.split(";");
+          else if (line.includes("\t")) parts = line.split("\t");
+          else parts = line.split(",");
+          parts = parts.map((p) => p.trim().replace(/^["']|["']$/g, ""));
+          source = parts[0] || "";
+          destination = parts[1] || "";
+        } else if (shared) {
+          // на общий диск достаточно одной колонки — email источника
+          source = line.replace(/^["']|["']$/g, "");
+        } else {
+          errors.push(`Строка ${i + 1}: нет разделителя (; , или таб)`);
+          continue;
+        }
+
+        if (shared) {
+          if (!source) {
+            errors.push(`Строка ${i + 1}: пустой source`);
+            continue;
+          }
+          const key = source.toLowerCase();
+          if (seen.has(key)) {
+            errors.push(`Строка ${i + 1}: дубликат источника ${source}`);
+            continue;
+          }
+          seen.add(key);
+          pairs.push({ source_disk_id: source, destination_disk_id: "" });
+        } else {
+          if (!source || !destination) {
+            errors.push(`Строка ${i + 1}: нужны source и destination`);
+            continue;
+          }
+          const key = source.toLowerCase() + "→" + destination.toLowerCase();
+          if (seen.has(key)) {
+            errors.push(`Строка ${i + 1}: дубликат ${source} → ${destination}`);
+            continue;
+          }
+          seen.add(key);
+          pairs.push({ source_disk_id: source, destination_disk_id: destination });
+        }
+      }
+      if (pairs.length > BATCH_MAX) {
+        errors.push(`Слишком много записей: ${pairs.length}. Максимум ${BATCH_MAX}.`);
+      }
+      return { pairs, errors };
+    }
+
+    function wireBatchMode(ids, runBtn, defaultRunLabel, getDestTypeFn) {
+      const state = { active: false, pairs: [], errors: [] };
+      const panel = $(ids.panel);
+      const fileInput = $(ids.file);
+      const textarea = $(ids.textarea);
+      const preview = $(ids.preview);
+      const templateLink = $(ids.template);
+      const writerBlock = $(ids.writerBlock);
+      const maxLabel = panel.querySelector("[data-batch-max-label]");
+      const helpNote = panel.querySelector("[data-batch-help]");
+      const subtabs = document.querySelector(`[data-subtabs="${ids.subtabs}"]`);
+      const card = subtabs.closest(".card");
+      const tabBtns = Array.from(subtabs.querySelectorAll(".subtab"));
+      const tabPanels = Array.from(card.querySelectorAll(".subtab-panel"));
+
+      function isShared() {
+        return getDestTypeFn() === "shared";
+      }
+
+      function syncSharedUi() {
+        const shared = isShared();
+        if (writerBlock) writerBlock.hidden = !(state.active && shared);
+        if (templateLink) {
+          if (shared) {
+            templateLink.href = "/static/sources-template.csv";
+            templateLink.setAttribute("download", "sources-template.csv");
+          } else {
+            templateLink.href = "/static/pairs-template.csv";
+            templateLink.setAttribute("download", "pairs-template.csv");
+          }
+        }
+        if (maxLabel) {
+          maxLabel.textContent = shared
+            ? `Список источников SOURCE (макс. ${BATCH_MAX})`
+            : `Список пар SOURCE → DESTINATION (макс. ${BATCH_MAX})`;
+        }
+        if (helpNote) {
+          helpNote.innerHTML = shared
+            ? "Заполните шаблон списком email источников (по одному на строку) " +
+              "и загрузите кнопкой-скрепкой. Все источники переносятся на выбранный " +
+              `общий диск. Не больше ${BATCH_MAX}; одновременно идут ${BATCH_CONCURRENCY} переносов.`
+            : "Заполните скачанный шаблон и загрузите его кнопкой-скрепкой. " +
+              "Формат: <code>SOURCE;DESTINATION</code>, одна пара на строку. " +
+              `Не больше ${BATCH_MAX} пар; одновременно идут ${BATCH_CONCURRENCY} переносов.`;
+        }
+        if (textarea) {
+          textarea.placeholder = shared
+            ? "SOURCE\nsource@company.ru"
+            : "SOURCE;DESTINATION\nsource@company.ru;dest@company.ru";
+        }
+        if (state.active) refreshPreview();
+      }
+
+      function refreshPreview() {
+        const parsed = parsePairsText(textarea.value, { shared: isShared() });
+        state.pairs = parsed.pairs;
+        state.errors = parsed.errors;
+        if (!parsed.pairs.length && !parsed.errors.length) {
+          preview.className = "batch-preview empty";
+          preview.textContent = "Список пока пуст";
+        } else if (parsed.errors.length) {
+          preview.className = "batch-preview";
+          preview.innerHTML = '<span class="err">' +
+            parsed.errors.map((e) => escapeHtml(e)).join("<br>") +
+            "</span>" +
+            (parsed.pairs.length
+              ? "<br><br>Распознано до ошибки/лимита: " +
+                parsed.pairs.slice(0, BATCH_MAX).map((p, i) =>
+                  isShared()
+                    ? `${i + 1}. ${escapeHtml(p.source_disk_id)}`
+                    : `${i + 1}. ${escapeHtml(p.source_disk_id)} → ${escapeHtml(p.destination_disk_id)}`
+                ).join("<br>")
+              : "");
+        } else if (isShared()) {
+          preview.className = "batch-preview";
+          preview.textContent = `Источников: ${parsed.pairs.length} (лимит ${BATCH_MAX})\n` +
+            parsed.pairs.map((p, i) => `${i + 1}. ${p.source_disk_id}`).join("\n");
+        } else {
+          preview.className = "batch-preview";
+          preview.textContent = `Пар: ${parsed.pairs.length} (лимит ${BATCH_MAX})\n` +
+            parsed.pairs.map((p, i) =>
+              `${i + 1}. ${p.source_disk_id} → ${p.destination_disk_id}`
+            ).join("\n");
+        }
+        updateRunLabel();
+      }
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      }
+
+      function updateRunLabel() {
+        if (!state.active) {
+          runBtn.textContent = defaultRunLabel;
+          return;
+        }
+        const n = state.pairs.length;
+        const ok = n > 0 && state.errors.length === 0 && n <= BATCH_MAX;
+        runBtn.textContent = ok
+          ? `Запустить пакетный перенос (${n})`
+          : "Запустить пакетный перенос";
+      }
+
+      function selectTab(target) {
+        tabBtns.forEach((b) =>
+          b.classList.toggle("active", b.dataset.subtabTarget === target));
+        tabPanels.forEach((p) =>
+          p.classList.toggle("active", p.dataset.subtabPanel === target));
+        setActive(target === "many");
+      }
+
+      function setActive(on) {
+        state.active = on;
+        panel.classList.toggle("show", on);
+        if (!on) {
+          state.pairs = [];
+          state.errors = [];
+          textarea.value = "";
+          preview.className = "batch-preview empty";
+          preview.textContent = "Список пока пуст";
+        } else {
+          refreshPreview();
+        }
+        syncSharedUi();
+        updateRunLabel();
+      }
+
+      tabBtns.forEach((b) =>
+        b.addEventListener("click", () => selectTab(b.dataset.subtabTarget)));
+      textarea.addEventListener("input", refreshPreview);
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+        try {
+          let text = await file.text();
+          // Excel иногда сохраняет UTF-8 BOM
+          if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+          textarea.value = text;
+          selectTab("many");
+          refreshPreview();
+        } catch (e) {
+          setStatus("Не удалось прочитать файл: " + e, "error");
+        }
+        fileInput.value = "";
+      });
+
+      onDestTypeChange(syncSharedUi);
+      document.addEventListener("batch-limits-ready", syncSharedUi);
+      syncSharedUi();
+
+      return {
+        isActive: () => state.active,
+        isShared: () => isShared(),
+        getPairs: () => {
+          refreshPreview();
+          if (!state.pairs.length) {
+            return {
+              error: isShared()
+                ? "Загрузите список источников (шаблон SOURCE)"
+                : "Загрузите заполненный шаблон со списком пар",
+            };
+          }
+          if (state.errors.length) return { error: state.errors[0] };
+          if (state.pairs.length > BATCH_MAX) {
+            return { error: `Слишком много записей: максимум ${BATCH_MAX}` };
+          }
+          return { pairs: state.pairs.slice(), shared: isShared() };
+        },
+      };
+    }
+
+    const batchSingle = wireBatchMode({
+      subtabs: "single", panel: "batch_panel", file: "batch_file",
+      textarea: "batch_pairs", preview: "batch_preview",
+      template: "batch_template", writerBlock: "batch_shared_writer",
+    }, $("run"), "Запустить перенос", getDestType);
+
+    const batchCross = wireBatchMode({
+      subtabs: "cross", panel: "x_batch_panel", file: "x_batch_file",
+      textarea: "x_batch_pairs", preview: "x_batch_preview",
+      template: "x_batch_template", writerBlock: "x_batch_shared_writer",
+    }, $("run-cross"), "Запустить перенос между организациями", getCrossDestType);
+
     // общий запуск: собираем body по карте {ключ_API: id_поля}, шлём и стримим лог
-    async function startCopy(endpoint, fieldMap, button, extras) {
+    async function startCopy(endpoint, fieldMap, button, extras, batchCtrl) {
       if (!consentAccepted()) { showConsent(); return; }
       const body = {};
-      for (const [key, id] of Object.entries(fieldMap)) body[key] = $(id).value.trim();
+      for (const [key, id] of Object.entries(fieldMap)) {
+        if (!$(id)) continue;
+        body[key] = $(id).value.trim();
+      }
       Object.assign(body, extras || {});
       body.page_limit = parseInt(body.page_limit || "1000", 10);
-      const optional = new Set(["path", "page_limit", "destination_vd_hash"]);
+
+      const useBatch = batchCtrl && batchCtrl.isActive();
+      let url = endpoint;
+      if (useBatch) {
+        const got = batchCtrl.getPairs();
+        if (got.error) { setStatus(got.error, "error"); return; }
+        body.pairs = got.pairs;
+        delete body.source_disk_id;
+        // для общего диска — один DESTINATION (сотрудник с правом записи) на весь пакет
+        if (body.destination_type === "shared") {
+          const writerId = endpoint === "/api/run-cross"
+            ? "x_batch_destination_disk_id" : "batch_destination_disk_id";
+          body.destination_disk_id = ($(writerId)?.value || "").trim();
+          if (!body.destination_disk_id) {
+            setStatus("Укажите DESTINATION — email сотрудника с правом записи", "error");
+            return;
+          }
+        } else {
+          delete body.destination_disk_id;
+        }
+        url = endpoint === "/api/run-cross" ? "/api/run-batch-cross" : "/api/run-batch";
+      }
+
+      const optional = new Set(["path", "page_limit", "destination_vd_hash", "pairs"]);
       if (body.destination_type !== "shared") optional.add("destination_vd_hash");
+      if (useBatch) {
+        optional.add("source_disk_id");
+        if (body.destination_type !== "shared") optional.add("destination_disk_id");
+      }
       for (const [key, id] of Object.entries(fieldMap)) {
         if (optional.has(key)) continue;
+        if (useBatch && key === "source_disk_id") continue;
+        if (useBatch && key === "destination_disk_id") continue;
         if (!body[key]) { setStatus("Заполните поле: " + key, "error"); return; }
       }
       if (body.destination_type === "shared" && !body.destination_vd_hash) {
@@ -927,11 +1390,11 @@
 
       logEl.textContent = "";
       button.disabled = true;
-      setStatus("Запуск…", "running");
+      setStatus(useBatch ? `Запуск пакета (${body.pairs.length})…` : "Запуск…", "running");
 
       let res;
       try {
-        res = await fetch(endpoint, {
+        res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -951,12 +1414,17 @@
         button.disabled = false; return;
       }
       const { job_id } = await res.json();
-      setStatus("Выполняется…", "running");
+      setStatus(useBatch ? "Пакет выполняется…" : "Выполняется…", "running");
 
       const es = new EventSource(`/api/run/${job_id}/stream`);
       es.onmessage = (e) => addLine(e.data);
-      es.addEventListener("done", () => {
-        setStatus("Готово ✓", "done");
+      es.addEventListener("done", (e) => {
+        if (e && e.data && e.data !== "ok") {
+          setStatus(e.data, "done");
+          addLine("SUMMARY | " + e.data);
+        } else {
+          setStatus("Готово ✓", "done");
+        }
         es.close(); button.disabled = false;
       });
       es.addEventListener("error", (e) => {
@@ -972,7 +1440,7 @@
       destination_disk_id: "destination_disk_id",
       destination_vd_hash: "destination_vd_hash",
       path: "path", page_limit: "page_limit",
-    }, $("run"), { destination_type: getDestType() }));
+    }, $("run"), { destination_type: getDestType() }, batchSingle));
 
     // режим 2 — между организациями
     $("run-cross").addEventListener("click", () => startCopy("/api/run-cross", {
@@ -983,7 +1451,7 @@
       destination_disk_id: "x_destination_disk_id",
       destination_vd_hash: "x_destination_vd_hash",
       path: "x_path", page_limit: "x_page_limit",
-    }, $("run-cross"), { destination_type: getCrossDestType() }));
+    }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross));
   </script>
 </body>
 </html>
