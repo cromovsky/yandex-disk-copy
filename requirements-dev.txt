@@ -1,0 +1,6 @@
+# Зависимости для разработки и тестов (в Docker-образ не попадают —
+# Dockerfile копирует только app/ и docs/).
+-r requirements.txt
+pytest==8.3.4
+flake8==7.1.1
+httpx==0.28.1        # нужен fastapi.testclient.TestClient

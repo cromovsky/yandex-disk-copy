@@ -1026,6 +1026,7 @@
     // режим 2 может быть отключён на уровне образа (v1); лимиты пакета с бэкенда
     let BATCH_MAX = 25;
     let BATCH_CONCURRENCY = 5;
+    let TARGET_RPS = 20;
     fetch("/api/config").then((r) => r.json()).then((cfg) => {
       if (!cfg.cross_org) {
         const tabs = document.querySelector(".mode-tabs");
@@ -1036,6 +1037,7 @@
       }
       if (cfg.batch_max_pairs) BATCH_MAX = cfg.batch_max_pairs;
       if (cfg.batch_concurrency) BATCH_CONCURRENCY = cfg.batch_concurrency;
+      if (cfg.target_rps) TARGET_RPS = cfg.target_rps;
       document.querySelectorAll("[data-batch-max-label]").forEach((el) => {
         if (!el.dataset.fixed) {
           el.textContent = `Список пар SOURCE → DESTINATION (макс. ${BATCH_MAX})`;
@@ -1190,13 +1192,16 @@
             : `Список пар SOURCE → DESTINATION (макс. ${BATCH_MAX})`;
         }
         if (helpNote) {
-          helpNote.innerHTML = shared
+          // темп указан намеренно: иначе плавный пакетный перенос читается как «зависло»
+          const pace = ` Запросы к API Диска идут суммарно не быстрее ~${TARGET_RPS} в секунду, поэтому большой пакет переносится постепенно.`;
+          helpNote.innerHTML = (shared
             ? "Заполните шаблон списком email источников (по одному на строку) " +
               "и загрузите кнопкой-скрепкой. Все источники переносятся на выбранный " +
               `общий диск. Не больше ${BATCH_MAX}; одновременно идут ${BATCH_CONCURRENCY} переносов.`
             : "Заполните скачанный шаблон и загрузите его кнопкой-скрепкой. " +
               "Формат: <code>SOURCE;DESTINATION</code>, одна пара на строку. " +
-              `Не больше ${BATCH_MAX} пар; одновременно идут ${BATCH_CONCURRENCY} переносов.`;
+              `Не больше ${BATCH_MAX} пар; одновременно идут ${BATCH_CONCURRENCY} переносов.`
+          ) + pace;
         }
         if (textarea) {
           textarea.placeholder = shared

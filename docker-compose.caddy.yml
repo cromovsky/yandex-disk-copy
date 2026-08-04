@@ -16,6 +16,12 @@ services:
     restart: unless-stopped
     expose:
       - "8000"          # доступен только внутри docker-сети, не на хост
+    environment:
+      # темп запросов к API Диска; значения берутся из .env, дефолты — как в образе.
+      # Пробрасываем поимённо, а не env_file, чтобы basic-auth хеш не утекал в
+      # окружение приложения.
+      DISK_API_RPS: ${DISK_API_RPS:-20}
+      HTTP_TIMEOUT_SEC: ${HTTP_TIMEOUT_SEC:-120}
 
   caddy:
     image: cromovsky/yandex-disk-copy-caddy:latest

@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .disk_copy import CopyConfig, CopyError, DiskCopier, OrgCreds
+from .throttle import TARGET_RPS
 
 STATIC_DIR = Path(__file__).parent / "static"
 INSTRUCTION_MD = Path(__file__).parent.parent / "docs" / "INSTRUCTION.md"
@@ -55,7 +56,7 @@ class RunRequest(BaseModel):
     source_disk_id: str = Field(..., min_length=1)
     destination_disk_id: str = Field(..., min_length=1)
     path: str = "/"
-    page_limit: int = 1000
+    page_limit: int = Field(1000, ge=1)
     # personal — личный Диск; shared — общий диск (нужен destination_vd_hash;
     # destination_disk_id тогда — email сотрудника с правом записи).
     destination_type: str = "personal"
@@ -78,7 +79,7 @@ class RunCrossRequest(BaseModel):
     dst_client_secret: str = Field(..., min_length=1)
     destination_disk_id: str = Field(..., min_length=1)
     path: str = "/"
-    page_limit: int = 1000
+    page_limit: int = Field(1000, ge=1)
     destination_type: str = "personal"
     destination_vd_hash: str = ""
 
@@ -99,7 +100,7 @@ class RunBatchRequest(BaseModel):
     admin_token: str = Field(..., min_length=1)
     pairs: list[TransferPair] = Field(..., min_length=1)
     path: str = "/"
-    page_limit: int = 1000
+    page_limit: int = Field(1000, ge=1)
     destination_type: str = "personal"
     destination_vd_hash: str = ""
     # Общий email с правом записи — для пакета на общий диск
@@ -118,13 +119,21 @@ class RunBatchCrossRequest(BaseModel):
     dst_client_secret: str = Field(..., min_length=1)
     pairs: list[TransferPair] = Field(..., min_length=1)
     path: str = "/"
-    page_limit: int = 1000
+    page_limit: int = Field(1000, ge=1)
     destination_type: str = "personal"
     destination_vd_hash: str = ""
     destination_disk_id: str = ""
 
 
 _DONE = object()  # сентинел конца лога в очереди
+
+
+def _rate_limit_note() -> str:
+    """Строка в лог: с каким темпом работали — видно в присланном логе."""
+    return (
+        f"RATE LIMIT | целевой темп: {TARGET_RPS:g} запросов/с "
+        f"(общий на процесс, документированный потолок API Диска — 40)"
+    )
 
 
 @dataclass
@@ -155,10 +164,18 @@ def _run_job(job: Job, cfg: CopyConfig) -> None:
     def log(message: str) -> None:
         job.queue.put(message)
 
+    log(_rate_limit_note())
     try:
-        copier = DiskCopier(cfg, log=log)
-        job.result = copier.run()
+        with DiskCopier(cfg, log=log) as copier:
+            job.result = copier.run()
         job.status = "done"
+        # Частичный успех: файлы, которые не доехали, не должны прятаться за
+        # «Готово ✓» — отдаём сводку тем же способом, что и пакетный режим.
+        failed = len((job.result or {}).get("fails") or [])
+        if failed:
+            saved = len((job.result or {}).get("saved") or [])
+            job.error = f"Частично: перенесено {saved}, ошибок {failed}"
+            log(f"SUMMARY | {job.error}")
     except CopyError as exc:
         job.error = str(exc)
         job.status = "error"
@@ -192,8 +209,8 @@ def _run_batch(job: Job, base_cfgs: list[CopyConfig]) -> None:
             job.queue.put(f"{prefix} {message}")
 
         try:
-            copier = DiskCopier(cfg, log=pair_log)
-            pair.result = copier.run()
+            with DiskCopier(cfg, log=pair_log) as copier:
+                pair.result = copier.run()
             with lock:
                 pair.status = "done"
             log(f"{prefix} DONE")
@@ -209,6 +226,7 @@ def _run_batch(job: Job, base_cfgs: list[CopyConfig]) -> None:
                 pair.error = err
             log(f"{prefix} ERROR | {err}")
 
+    log(_rate_limit_note())
     log(
         f"BATCH START | pairs: {total}, concurrency: {BATCH_CONCURRENCY}, "
         f"max: {BATCH_MAX_PAIRS}"
@@ -273,6 +291,7 @@ def config() -> dict:
         "cross_org": val not in ("0", "false", "no", "off"),
         "batch_max_pairs": BATCH_MAX_PAIRS,
         "batch_concurrency": BATCH_CONCURRENCY,
+        "target_rps": TARGET_RPS,
     }
 
 
