@@ -274,13 +274,33 @@ class DiskCopier:
             rel = full.lstrip("/")
         return rel
 
+    def _response_payload(self, response) -> dict:
+        """JSON-тело ответа или {} — чтобы не падать KeyError/ValueError на ошибках API."""
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError:
+            payload = {}
+        return payload if isinstance(payload, dict) else {"raw": payload}
+
     # ── API Диска (личный) ─────────────────────────────────────────────
-    def _disk_space_info(self, token: str) -> tuple[int, int]:
+    def _disk_space_info(self, token: str, *, disk_id: str = "") -> tuple[int, int]:
         """Возвращает (used_space, free_space) в байтах для личного Диска."""
         url = "https://cloud-api.yandex.net/v1/disk/"
         headers = {"Authorization": f"OAuth {token}"}
         response = self.session.get(url, headers=headers)
-        payload = response.json()
+        payload = self._response_payload(response)
+        who = disk_id or "личный Диск"
+        self.log(f"disk_space_info | {who} | status: {response.status_code}")
+        if (
+            response.status_code != 200
+            or "used_space" not in payload
+            or "total_space" not in payload
+        ):
+            body = payload or (response.text[:300] if response.text else "")
+            raise CopyError(
+                f"Не удалось получить информацию о Диске {who}: "
+                f"{response.status_code} {body}"
+            )
         used = int(payload["used_space"])
         total = int(payload["total_space"])
         return used, total - used
@@ -295,7 +315,7 @@ class DiskCopier:
             f"shared_space_info | status: {response.status_code} | "
             f"vd_hash: {self.cfg.destination_vd_hash}"
         )
-        payload = response.json()
+        payload = self._response_payload(response)
         if response.status_code != 200 or "used_space" not in payload:
             raise CopyError(
                 f"Не удалось получить информацию об общем диске "
@@ -690,11 +710,15 @@ class DiskCopier:
         transfer_ok = False
         try:
             # 3. Проверка места на диске назначения.
-            needed_space, _ = self._disk_space_info(self._source_token())
+            needed_space, _ = self._disk_space_info(
+                self._source_token(), disk_id=cfg.source_disk_id
+            )
             if self._is_shared_dest:
                 _, free_space = self._shared_space_info(self._destination_token())
             else:
-                _, free_space = self._disk_space_info(self._destination_token())
+                _, free_space = self._disk_space_info(
+                    self._destination_token(), disk_id=cfg.destination_disk_id
+                )
             self.log(
                 f"space check | need: {needed_space} bytes, free: {free_space} bytes"
             )

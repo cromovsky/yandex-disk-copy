@@ -251,6 +251,21 @@ def test_run_restores_ban_after_successful_transfer():
     assert len(session.calls_to(API360_USER_URL, "PATCH")) == 2
 
 
+def test_disk_space_info_raises_when_api_omits_used_space():
+    """Раньше это был сырой KeyError: 'used_space' — лог без тела ответа API."""
+    session = FakeSession(
+        {
+            ("GET", SPACE_URL): FakeResponse(
+                403, payload={"error": "ForbiddenError", "message": "Forbidden"}
+            )
+        }
+    )
+    copier = make_copier(session)
+
+    with pytest.raises(CopyError, match="Не удалось получить информацию о Диске"):
+        copier._disk_space_info("tok", disk_id="src@company.ru")
+
+
 def test_run_skips_ban_handling_without_admin_token():
     routes = _routes_for_empty_personal_run([FakeResponse(200)])
     session = FakeSession(routes)
