@@ -237,6 +237,7 @@ https://oauth.yandex.ru/authorize?response_type=token&client_id=<ClientID>
 |---|---|---|
 | `DISK_API_RPS` | `20` | Целевой темп, запросов/с (половина потолка) |
 | `HTTP_TIMEOUT_SEC` | `120` | Таймаут чтения ответа, с (таймаут соединения — 10 с) |
+| `SPACE_CHECK` | выкл. | `1` — сверка свободного места до переноса (`cloud_api:disk.info`) |
 
 Задаются без пересборки образа:
 

@@ -223,8 +223,9 @@ def test_run_raises_when_ban_restore_fails_after_successful_transfer():
     assert [c.json_body for c in patches] == [{"isEnabled": True}, {"isEnabled": False}]
 
 
-def test_run_keeps_transfer_error_when_restore_also_fails():
+def test_run_keeps_transfer_error_when_restore_also_fails(monkeypatch):
     """Ошибка переноса важнее ошибки откатa — она и должна всплыть."""
+    monkeypatch.setattr("app.disk_copy.SKIP_SPACE_CHECK", False)
     routes = _routes_for_empty_personal_run(
         [FakeResponse(200), FakeResponse(403, text="denied")]
     )
@@ -264,6 +265,28 @@ def test_disk_space_info_raises_when_api_omits_used_space():
 
     with pytest.raises(CopyError, match="Не удалось получить информацию о Диске"):
         copier._disk_space_info("tok", disk_id="src@company.ru")
+
+
+def test_disk_space_info_403_hints_at_missing_scope():
+    session = FakeSession(
+        {("GET", SPACE_URL): FakeResponse(403, payload={"error": "ForbiddenError"})}
+    )
+    copier = make_copier(session)
+
+    with pytest.raises(CopyError, match="cloud_api:disk.info"):
+        copier._disk_space_info("tok", disk_id="src@company.ru")
+
+
+def test_run_skips_space_check_by_default():
+    """По умолчанию 403 на /v1/disk не останавливает перенос."""
+    routes = _routes_for_empty_personal_run([FakeResponse(200), FakeResponse(200)])
+    routes[("GET", SPACE_URL)] = FakeResponse(403, payload={"error": "ForbiddenError"})
+    session = FakeSession(routes)
+    copier = make_copier(session)
+
+    assert copier.run() == {"saved": [], "fails": []}
+    # SPACE_URL — подстрока и для /v1/disk/resources, поэтому сверяем точный эндпоинт
+    assert [c for c in session.calls if c.url.endswith("/v1/disk/")] == []
 
 
 def test_run_skips_ban_handling_without_admin_token():

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -21,6 +22,28 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from .throttle import ThrottledSession, get_limiter
+
+
+def _parse_bool(raw: str | None) -> Optional[bool]:
+    v = (raw or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+# Сверка места (GET /v1/disk) требует scope cloud_api:disk.info. По умолчанию
+# пропускаем: копирование идёт через disk.read/disk.write, и 403 на info
+# не должен останавливать перенос. Включить сверку: SPACE_CHECK=1.
+_space = _parse_bool(os.environ.get("SPACE_CHECK"))
+_skip = _parse_bool(os.environ.get("SKIP_SPACE_CHECK"))
+if _space is not None:
+    SKIP_SPACE_CHECK = not _space
+elif _skip is not None:
+    SKIP_SPACE_CHECK = _skip
+else:
+    SKIP_SPACE_CHECK = True
 
 
 def _build_session() -> requests.Session:
@@ -161,8 +184,14 @@ class DiskCopier:
             "subject_token_type": "urn:yandex:params:oauth:token-type:email",
         }
         response = self.session.post(url, data=data, headers=headers)
-        self.log(f"get_token | user: {disk_id}, status: {response.status_code}")
-        payload = response.json()
+        payload = self._response_payload(response)
+        # scope выданного токена может быть уже, чем scopes приложения в OAuth:
+        # при регистрации сервисного приложения набор фиксируется отдельно
+        scope = payload.get("scope", "")
+        self.log(
+            f"get_token | user: {disk_id}, status: {response.status_code}"
+            + (f", scope: {scope}" if scope else "")
+        )
         if "access_token" not in payload:
             desc = str(payload.get("error_description", "")).lower()
             hint = ""
@@ -275,7 +304,7 @@ class DiskCopier:
         return rel
 
     def _response_payload(self, response) -> dict:
-        """JSON-тело ответа или {} — чтобы не падать KeyError/ValueError на ошибках API."""
+        """JSON-тело ответа или {}: на ошибках API не должно быть KeyError."""
         try:
             payload = response.json() if response.content else {}
         except ValueError:
@@ -297,9 +326,19 @@ class DiskCopier:
             or "total_space" not in payload
         ):
             body = payload or (response.text[:300] if response.text else "")
+            hint = ""
+            if response.status_code == 403:
+                hint = (
+                    " | Токену сотрудника не хватает scope cloud_api:disk.info. "
+                    "Сверьте scope в строке get_token выше: набор фиксируется при "
+                    "регистрации сервисного приложения, добавления прав в "
+                    "oauth.yandex.ru недостаточно — перерегистрируйте приложение "
+                    "(POST /security/v1/org/<ORGID>/service_applications). "
+                    "По умолчанию сверка места пропускается; включить: SPACE_CHECK=1"
+                )
             raise CopyError(
                 f"Не удалось получить информацию о Диске {who}: "
-                f"{response.status_code} {body}"
+                f"{response.status_code} {body}{hint}"
             )
         used = int(payload["used_space"])
         total = int(payload["total_space"])
@@ -710,20 +749,29 @@ class DiskCopier:
         transfer_ok = False
         try:
             # 3. Проверка места на диске назначения.
-            needed_space, _ = self._disk_space_info(
-                self._source_token(), disk_id=cfg.source_disk_id
-            )
-            if self._is_shared_dest:
-                _, free_space = self._shared_space_info(self._destination_token())
-            else:
-                _, free_space = self._disk_space_info(
-                    self._destination_token(), disk_id=cfg.destination_disk_id
+            if SKIP_SPACE_CHECK:
+                self.log(
+                    "space check | пропущена (по умолчанию) — если места не "
+                    "хватит, файлы начнут падать в fails уже в процессе переноса. "
+                    "Включить сверку: SPACE_CHECK=1"
                 )
-            self.log(
-                f"space check | need: {needed_space} bytes, free: {free_space} bytes"
-            )
+                needed_space = free_space = 0
+            else:
+                needed_space, _ = self._disk_space_info(
+                    self._source_token(), disk_id=cfg.source_disk_id
+                )
+                if self._is_shared_dest:
+                    _, free_space = self._shared_space_info(self._destination_token())
+                else:
+                    _, free_space = self._disk_space_info(
+                        self._destination_token(), disk_id=cfg.destination_disk_id
+                    )
+                self.log(
+                    f"space check | need: {needed_space} bytes, "
+                    f"free: {free_space} bytes"
+                )
 
-            if free_space <= needed_space:
+            if not SKIP_SPACE_CHECK and free_space <= needed_space:
                 raise CopyError(
                     f"Недостаточно места на диске назначения ({dest_label}): "
                     f"нужно {needed_space}, свободно {free_space}"
