@@ -71,6 +71,10 @@ def _build_session() -> requests.Session:
     return session
 
 
+# Сколько непереносённых файлов перечислять в логе поимённо: список нужен
+# для разбора, но при тысячах ошибок он вытеснит остальной лог из окна.
+FAILS_LOG_LIMIT = 50
+
 # Опрос статуса асинхронной операции: интервал растёт 0.5→1→2→4→8→10→10…
 POLL_FIRST_DELAY = 0.5
 POLL_MAX_DELAY = 10.0
@@ -303,6 +307,19 @@ class DiskCopier:
             rel = full.lstrip("/")
         return rel
 
+    def _access_hint(self, status_code: int, scope: str) -> str:
+        """Подсказка для 401/403: у токена сотрудника нет доступа к Диску."""
+        if status_code not in (401, 403):
+            return ""
+        return (
+            f" | Токену сотрудника отказано в доступе (нужен scope {scope}). "
+            "Если 403 приходит на все операции Диска — сервисное приложение "
+            "фактически не получило доступ к Дискам: сверьте scope в строке "
+            "get_token, перерегистрируйте приложение "
+            "(POST /security/v1/org/<ORGID>/service_applications) и проверьте, "
+            "что тариф организации допускает работу с API Диска."
+        )
+
     def _response_payload(self, response) -> dict:
         """JSON-тело ответа или {}: на ошибках API не должно быть KeyError."""
         try:
@@ -395,7 +412,16 @@ class DiskCopier:
             f"disk_get_meta | status: {response.status_code} | "
             f"path: {path}, limit: {limit}, offset: {offset}"
         )
-        return response.json()
+        # 404 — «нет такой папки», это не ошибка доступа: обработает _walk.
+        # Остальные не-200 (401/403/5xx) молча превращать в «папка пуста» нельзя:
+        # иначе перенос отрапортует COMPLETED, не скопировав ничего.
+        if response.status_code not in (200, 404):
+            raise CopyError(
+                f"Не удалось прочитать {path} на Диске {self.cfg.source_disk_id}: "
+                f"{response.status_code} {self._response_payload(response)}"
+                f"{self._access_hint(response.status_code, 'cloud_api:disk.read')}"
+            )
+        return self._response_payload(response)
 
     def _disk_resource(self, token: str, path: str) -> dict:
         """Метаинформация одного ресурса (файл или папка)."""
@@ -406,7 +432,19 @@ class DiskCopier:
             "fields": "path,type,name,public_key,public_url",
         }
         response = self.session.get(url, params=params, headers=headers)
-        return response.json()
+        return self._response_payload(response)
+
+    def _refresh_public_key(self, path: str) -> Optional[str]:
+        """Переиздаёт публичную ссылку и возвращает актуальный public_key.
+
+        Ключ из листинга может оказаться нерабочим (ресурс перепубликовали,
+        ссылку отозвали) — тогда save-to-disk отвечает 404 DiskNotFoundError.
+        """
+        token = self._source_token()
+        self._disk_publish_resource(token, path)
+        meta = self._disk_resource(token, path)
+        public_key = meta.get("public_key")
+        return public_key if isinstance(public_key, str) else None
 
     def _disk_publish_resource(self, token: str, path: str) -> None:
         url = "https://cloud-api.yandex.net/v1/disk/resources/publish"
@@ -415,6 +453,13 @@ class DiskCopier:
         self.log(
             f"disk_publish_resource | status: {response.status_code} | path: {path}"
         )
+        # отказ доступа — системная проблема, а не «этот файл не вышло»
+        if response.status_code in (401, 403):
+            raise CopyError(
+                f"Не удалось опубликовать {path}: {response.status_code} "
+                f"{response.text[:200]}"
+                f"{self._access_hint(response.status_code, 'cloud_api:disk.write')}"
+            )
 
     def _disk_ensure_folder(self, token: str, path: str) -> None:
         """Создать папку на личном Диске (идемпотентно: 409 = уже существует)."""
@@ -424,11 +469,14 @@ class DiskCopier:
         if response.status_code in (201, 409):
             state = "создана" if response.status_code == 201 else "уже существует"
             self.log(f"ensure_folder | {path} — {state}")
-        else:
-            self.log(
-                f"ensure_folder | {path} — статус {response.status_code}: "
-                f"{response.text[:200]}"
-            )
+            return
+        # без папки назначения сохранять некуда — молчать нельзя
+        raise CopyError(
+            f"Не удалось создать папку {path} на Диске "
+            f"{self.cfg.destination_disk_id}: {response.status_code} "
+            f"{response.text[:200]}"
+            f"{self._access_hint(response.status_code, 'cloud_api:disk.write')}"
+        )
 
     def _disk_save_public_resource(self, public_key: str, name: str) -> None:
         url = "https://cloud-api.yandex.net/v1/disk/public/resources/save-to-disk"
@@ -619,7 +667,10 @@ class DiskCopier:
             if isinstance(public_key, str):
                 self.links.append({**record, "public_key": public_key})
             else:
-                self.fails.append(record)
+                # без public_key сохранять нечего; раньше терялось в счётчике
+                reason = "публикация не дала public_key"
+                self.log(f"get_links | пропуск {record['path']}: {reason}")
+                self.fails.append({**record, "error": reason})
 
         self._walk(self.cfg.path, collect)
         self.log(
@@ -639,7 +690,7 @@ class DiskCopier:
         self._disk_ensure_folder(self._destination_token(), folder)
         for i, link in enumerate(pending, 1):
             try:
-                self._disk_save_public_resource(link["public_key"], link["name"])
+                self._save_one_link(link)
                 self.links.append(link)
             except CopyError as exc:
                 self.log(f"save_links | ошибка {link.get('path')}: {exc}")
@@ -648,6 +699,29 @@ class DiskCopier:
         self.log(
             f"save_links | done | saved: {len(self.links)}, fails: {len(self.fails)}"
         )
+
+    def _save_one_link(self, link: dict) -> None:
+        """Сохраняет один ресурс; на 404 переиздаёт ссылку и пробует ещё раз."""
+        try:
+            self._disk_save_public_resource(link["public_key"], link["name"])
+            return
+        except CopyError as exc:
+            path = link.get("path")
+            if "404" not in str(exc) or not path:
+                raise
+            self.log(
+                f"save_links | 404 по публичной ссылке {path} — "
+                f"переиздаю и повторяю"
+            )
+
+        fresh_key = self._refresh_public_key(path)
+        if not fresh_key:
+            raise CopyError(
+                f"Повторная публикация {path} не дала public_key — "
+                f"ресурс не сохранён"
+            )
+        link["public_key"] = fresh_key
+        self._disk_save_public_resource(fresh_key, link["name"])
 
     def save_to_shared(self) -> None:
         """Публикует файлы источника и заливает их на общий диск (с сохранением дерева)."""
@@ -801,7 +875,24 @@ class DiskCopier:
                     if transfer_ok:
                         raise
 
+        self._log_fails()
         self.log(
             f"COMPLETED | saved: {len(self.links)}, fails: {len(self.fails)}"
         )
         return {"saved": self.links, "fails": self.fails}
+
+    def _log_fails(self) -> None:
+        """Перечисляет непереносённые файлы: по счётчику их не найти."""
+        if not self.fails:
+            return
+        self.log(f"NOT COPIED | файлов не перенесено: {len(self.fails)}")
+        for i, item in enumerate(self.fails[:FAILS_LOG_LIMIT], 1):
+            path = item.get("path") or item.get("name") or "?"
+            reason = item.get("error") or "причина не указана"
+            self.log(f"NOT COPIED | {i}. {path} — {reason}")
+        hidden = len(self.fails) - FAILS_LOG_LIMIT
+        if hidden > 0:
+            self.log(
+                f"NOT COPIED | ещё {hidden} — полный список: "
+                f"GET /api/run/<job_id>, поле fails"
+            )

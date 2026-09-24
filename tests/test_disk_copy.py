@@ -277,6 +277,168 @@ def test_disk_space_info_403_hints_at_missing_scope():
         copier._disk_space_info("tok", disk_id="src@company.ru")
 
 
+# ── 404 по публичной ссылке лечится переизданием ────────────────────────
+def test_save_links_retries_with_fresh_public_key_on_404():
+    """Боевой случай: save-to-disk отдал 404 DiskNotFoundError по stale-ключу."""
+    session = FakeSession(
+        {
+            ("PUT", PUBLISH_URL): FakeResponse(200),
+            ("PUT", RESOURCES_URL): FakeResponse(201),  # ensure_folder
+            ("GET", RESOURCES_URL): FakeResponse(
+                200, payload={"path": "disk:/HR.xlsx", "public_key": "pk-fresh"}
+            ),
+            ("POST", SAVE_TO_DISK_URL): [
+                FakeResponse(404, text='{"error":"DiskNotFoundError"}'),
+                FakeResponse(201),
+            ],
+        }
+    )
+    copier = make_copier(session)
+    copier.links = [
+        {"path": "disk:/HR.xlsx", "name": "HR.xlsx", "public_key": "pk-stale"}
+    ]
+
+    copier.save_links()
+
+    assert copier.fails == []
+    assert [link["public_key"] for link in copier.links] == ["pk-fresh"]
+    saves = session.calls_to(SAVE_TO_DISK_URL, "POST")
+    assert [c.params["public_key"] for c in saves] == ["pk-stale", "pk-fresh"]
+
+
+def test_save_links_reports_fail_when_republish_gives_no_key():
+    session = FakeSession(
+        {
+            ("PUT", PUBLISH_URL): FakeResponse(200),
+            ("PUT", RESOURCES_URL): FakeResponse(201),
+            ("GET", RESOURCES_URL): FakeResponse(200, payload={"path": "disk:/a.txt"}),
+            ("POST", SAVE_TO_DISK_URL): FakeResponse(
+                404, text='{"error":"DiskNotFoundError"}'
+            ),
+        }
+    )
+    copier = make_copier(session)
+    copier.links = [{"path": "disk:/a.txt", "name": "a.txt", "public_key": "pk"}]
+
+    copier.save_links()
+
+    assert copier.links == []
+    assert len(copier.fails) == 1
+    assert "public_key" in copier.fails[0]["error"]
+
+
+def test_save_links_does_not_retry_non_404():
+    session = FakeSession(
+        {
+            ("PUT", RESOURCES_URL): FakeResponse(201),
+            ("POST", SAVE_TO_DISK_URL): FakeResponse(503, text="upstream"),
+        }
+    )
+    copier = make_copier(session)
+    copier.links = [{"path": "disk:/a.txt", "name": "a.txt", "public_key": "pk"}]
+
+    copier.save_links()
+
+    assert len(copier.fails) == 1
+    assert len(session.calls_to(SAVE_TO_DISK_URL, "POST")) == 1
+
+
+# ── непереносённые файлы должны быть видны поимённо ─────────────────────
+def test_get_links_records_reason_for_file_without_public_key():
+    items = [{**file_item("ok.txt"), "public_key": "pk-1"}, file_item("bad.txt")]
+    session = FakeSession(
+        {("GET", RESOURCES_URL): FakeResponse(200, payload=embedded(items))}
+    )
+    lines: list[str] = []
+    copier = make_copier(session)
+    copier._log = lines.append
+
+    copier.get_links()
+
+    assert [link["name"] for link in copier.links] == ["ok.txt"]
+    assert len(copier.fails) == 1
+    assert copier.fails[0]["error"]
+    assert any("пропуск" in line and "bad.txt" in line for line in lines)
+
+
+def test_log_fails_lists_each_failed_file():
+    copier = make_copier(FakeSession({}))
+    lines: list[str] = []
+    copier._log = lines.append
+    copier.fails = [
+        {"path": "disk:/a.txt", "error": "boom"},
+        {"path": "disk:/b.txt", "error": "bang"},
+    ]
+
+    copier._log_fails()
+
+    joined = "\n".join(lines)
+    assert "NOT COPIED" in joined
+    assert "disk:/a.txt — boom" in joined
+    assert "disk:/b.txt — bang" in joined
+
+
+def test_log_fails_caps_long_list():
+    copier = make_copier(FakeSession({}))
+    lines: list[str] = []
+    copier._log = lines.append
+    copier.fails = [{"path": f"disk:/{i}.txt", "error": "e"} for i in range(70)]
+
+    copier._log_fails()
+
+    listed = [ln for ln in lines if ".txt — e" in ln]
+    assert len(listed) == 50
+    assert any("ещё 20" in ln for ln in lines)
+
+
+# ── 403 не должен выглядеть как успешный перенос ────────────────────────
+def test_walk_raises_on_forbidden_instead_of_reporting_empty_folder():
+    """403 на чтении раньше логировался как «No such resource» → COMPLETED 0/0."""
+    session = FakeSession(
+        {("GET", RESOURCES_URL): FakeResponse(403, payload={"error": "ForbiddenError"})}
+    )
+    copier = make_copier(session)
+
+    with pytest.raises(CopyError, match="Не удалось прочитать"):
+        copier._walk("/", lambda _item: None)
+
+
+def test_walk_treats_404_as_missing_folder():
+    """404 — это «нет такой папки», перенос не падает."""
+    session = FakeSession(
+        {("GET", RESOURCES_URL): FakeResponse(404, payload={"error": "NotFound"})}
+    )
+    copier = make_copier(session)
+    seen: list[dict] = []
+
+    copier._walk("/nope", seen.append)
+
+    assert seen == []
+
+
+def test_ensure_folder_raises_on_forbidden():
+    session = FakeSession(
+        {("PUT", RESOURCES_URL): FakeResponse(403, text='{"error":"ForbiddenError"}')}
+    )
+    copier = make_copier(session)
+
+    with pytest.raises(CopyError, match="Не удалось создать папку"):
+        copier._disk_ensure_folder("tok", "disk:/src@company.ru")
+
+
+def test_run_fails_loudly_when_disk_access_is_denied():
+    """Сквозной сценарий из боевого лога: 403 на всём — статус обязан быть ошибкой."""
+    routes = _routes_for_empty_personal_run([FakeResponse(200), FakeResponse(200)])
+    routes[("GET", RESOURCES_URL)] = FakeResponse(
+        403, payload={"error": "ForbiddenError"}
+    )
+    session = FakeSession(routes)
+    copier = make_copier(session)
+
+    with pytest.raises(CopyError, match="Не удалось прочитать"):
+        copier.run()
+
+
 def test_run_skips_space_check_by_default():
     """По умолчанию 403 на /v1/disk не останавливает перенос."""
     routes = _routes_for_empty_personal_run([FakeResponse(200), FakeResponse(200)])
