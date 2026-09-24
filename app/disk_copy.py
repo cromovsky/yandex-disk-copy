@@ -434,17 +434,33 @@ class DiskCopier:
         response = self.session.get(url, params=params, headers=headers)
         return self._response_payload(response)
 
-    def _refresh_public_key(self, path: str) -> Optional[str]:
-        """Переиздаёт публичную ссылку и возвращает актуальный public_key.
-
-        Ключ из листинга может оказаться нерабочим (ресурс перепубликовали,
-        ссылку отозвали) — тогда save-to-disk отвечает 404 DiskNotFoundError.
-        """
-        token = self._source_token()
-        self._disk_publish_resource(token, path)
-        meta = self._disk_resource(token, path)
-        public_key = meta.get("public_key")
-        return public_key if isinstance(public_key, str) else None
+    def _disk_upload_from_url(self, file_url: str, dest_path: str) -> None:
+        """Загрузка файла по прямой ссылке на личный Диск (async → ждём)."""
+        url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+        headers = {"Authorization": f"OAuth {self._destination_token()}"}
+        params = {"url": file_url, "path": dest_path}
+        response = self.session.post(url, params=params, headers=headers)
+        self.log(
+            f"disk_upload_from_url | status: {response.status_code} | "
+            f"path: {dest_path}"
+        )
+        if response.status_code == 202:
+            href = self._response_payload(response).get("href")
+            if not href:
+                raise CopyError(
+                    f"Нет ссылки на операцию при загрузке {dest_path}: "
+                    f"{response.text[:300]}"
+                )
+            self._wait_operation(href, self._destination_token())
+        elif response.status_code == 201:
+            return
+        elif response.status_code == 409:
+            self.log(f"disk_upload_from_url | уже существует, пропускаю: {dest_path}")
+        else:
+            raise CopyError(
+                f"Не удалось загрузить {dest_path} по прямой ссылке: "
+                f"{response.status_code} {response.text[:300]}"
+            )
 
     def _disk_publish_resource(self, token: str, path: str) -> None:
         url = "https://cloud-api.yandex.net/v1/disk/resources/publish"
@@ -663,7 +679,11 @@ class DiskCopier:
 
         def collect(item: dict) -> None:
             public_key = item.get("public_key")
-            record = {"path": item.get("path"), "name": item.get("name")}
+            record = {
+                "path": item.get("path"),
+                "name": item.get("name"),
+                "type": item.get("type"),
+            }
             if isinstance(public_key, str):
                 self.links.append({**record, "public_key": public_key})
             else:
@@ -701,27 +721,33 @@ class DiskCopier:
         )
 
     def _save_one_link(self, link: dict) -> None:
-        """Сохраняет один ресурс; на 404 переиздаёт ссылку и пробует ещё раз."""
+        """Сохраняет ресурс; на 404 обходит save-to-disk через прямую ссылку.
+
+        save-to-disk иногда отвечает DiskNotFoundError на живой публичный
+        ресурс. Переиздание не помогает: publish идемпотентен и возвращает
+        тот же public_key. Рабочий обход — скачать файл по публичной ссылке
+        и залить получателю по URL. Для папок обхода нет: публичная ссылка
+        отдаёт zip, а не дерево.
+        """
         try:
             self._disk_save_public_resource(link["public_key"], link["name"])
             return
         except CopyError as exc:
-            path = link.get("path")
-            if "404" not in str(exc) or not path:
+            if "404" not in str(exc):
                 raise
+            if link.get("type") != "file":
+                raise CopyError(
+                    f"{exc}. Папку через прямую ссылку не перенести — "
+                    f"скопируйте {link.get('path')} вручную"
+                )
             self.log(
-                f"save_links | 404 по публичной ссылке {path} — "
-                f"переиздаю и повторяю"
+                f"save_links | 404 по save-to-disk {link.get('path')} — "
+                f"пробую через прямую ссылку"
             )
 
-        fresh_key = self._refresh_public_key(path)
-        if not fresh_key:
-            raise CopyError(
-                f"Повторная публикация {path} не дала public_key — "
-                f"ресурс не сохранён"
-            )
-        link["public_key"] = fresh_key
-        self._disk_save_public_resource(fresh_key, link["name"])
+        href = self._public_download_href(link["public_key"])
+        dest_path = f"{self._target_folder_personal()}/{link['name']}"
+        self._disk_upload_from_url(href, dest_path)
 
     def save_to_shared(self) -> None:
         """Публикует файлы источника и заливает их на общий диск (с сохранением дерева)."""

@@ -32,6 +32,7 @@ RESOURCES_URL = "/v1/disk/resources"
 PUBLISH_URL = "/v1/disk/resources/publish"
 SAVE_TO_DISK_URL = "/v1/disk/public/resources/save-to-disk"
 PUBLIC_DOWNLOAD_URL = "/v1/disk/public/resources/download"
+UPLOAD_URL = "/v1/disk/resources/upload"
 VD_RESOURCES_URL = "/v1/disk/virtual-disks/resources"
 API360_USER_URL = "api360.yandex.net/directory/v1/org"
 
@@ -278,56 +279,61 @@ def test_disk_space_info_403_hints_at_missing_scope():
 
 
 # ── 404 по публичной ссылке лечится переизданием ────────────────────────
-def test_save_links_retries_with_fresh_public_key_on_404():
-    """Боевой случай: save-to-disk отдал 404 DiskNotFoundError по stale-ключу."""
+def test_save_links_falls_back_to_direct_upload_on_404():
+    """Боевой случай: save-to-disk отдал 404 на живой публичный ресурс."""
     session = FakeSession(
         {
-            ("PUT", PUBLISH_URL): FakeResponse(200),
             ("PUT", RESOURCES_URL): FakeResponse(201),  # ensure_folder
-            ("GET", RESOURCES_URL): FakeResponse(
-                200, payload={"path": "disk:/HR.xlsx", "public_key": "pk-fresh"}
+            ("POST", SAVE_TO_DISK_URL): FakeResponse(
+                404, text='{"error":"DiskNotFoundError"}'
             ),
-            ("POST", SAVE_TO_DISK_URL): [
-                FakeResponse(404, text='{"error":"DiskNotFoundError"}'),
-                FakeResponse(201),
-            ],
+            ("GET", PUBLIC_DOWNLOAD_URL): FakeResponse(
+                200, payload={"href": "https://downloader/HR.xlsx"}
+            ),
+            ("POST", UPLOAD_URL): FakeResponse(201),
         }
     )
     copier = make_copier(session)
     copier.links = [
-        {"path": "disk:/HR.xlsx", "name": "HR.xlsx", "public_key": "pk-stale"}
+        {
+            "path": "disk:/HR.xlsx",
+            "name": "HR.xlsx",
+            "type": "file",
+            "public_key": "pk",
+        }
     ]
 
     copier.save_links()
 
     assert copier.fails == []
-    assert [link["public_key"] for link in copier.links] == ["pk-fresh"]
-    saves = session.calls_to(SAVE_TO_DISK_URL, "POST")
-    assert [c.params["public_key"] for c in saves] == ["pk-stale", "pk-fresh"]
+    assert len(copier.links) == 1
+    upload = session.calls_to(UPLOAD_URL, "POST")[0]
+    assert upload.params["url"] == "https://downloader/HR.xlsx"
+    assert upload.params["path"] == "disk:/src@company.ru/HR.xlsx"
 
 
-def test_save_links_reports_fail_when_republish_gives_no_key():
+def test_save_links_does_not_use_direct_upload_for_folders():
     session = FakeSession(
         {
-            ("PUT", PUBLISH_URL): FakeResponse(200),
             ("PUT", RESOURCES_URL): FakeResponse(201),
-            ("GET", RESOURCES_URL): FakeResponse(200, payload={"path": "disk:/a.txt"}),
             ("POST", SAVE_TO_DISK_URL): FakeResponse(
                 404, text='{"error":"DiskNotFoundError"}'
             ),
         }
     )
     copier = make_copier(session)
-    copier.links = [{"path": "disk:/a.txt", "name": "a.txt", "public_key": "pk"}]
+    copier.links = [
+        {"path": "disk:/Док", "name": "Док", "type": "dir", "public_key": "pk"}
+    ]
 
     copier.save_links()
 
     assert copier.links == []
-    assert len(copier.fails) == 1
-    assert "public_key" in copier.fails[0]["error"]
+    assert "вручную" in copier.fails[0]["error"]
+    assert session.calls_to(UPLOAD_URL, "POST") == []
 
 
-def test_save_links_does_not_retry_non_404():
+def test_save_links_does_not_fall_back_on_non_404():
     session = FakeSession(
         {
             ("PUT", RESOURCES_URL): FakeResponse(201),
@@ -335,12 +341,14 @@ def test_save_links_does_not_retry_non_404():
         }
     )
     copier = make_copier(session)
-    copier.links = [{"path": "disk:/a.txt", "name": "a.txt", "public_key": "pk"}]
+    copier.links = [
+        {"path": "disk:/a.txt", "name": "a.txt", "type": "file", "public_key": "pk"}
+    ]
 
     copier.save_links()
 
     assert len(copier.fails) == 1
-    assert len(session.calls_to(SAVE_TO_DISK_URL, "POST")) == 1
+    assert session.calls_to(UPLOAD_URL, "POST") == []
 
 
 # ── непереносённые файлы должны быть видны поимённо ─────────────────────
