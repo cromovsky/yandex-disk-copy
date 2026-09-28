@@ -32,7 +32,8 @@ RESOURCES_URL = "/v1/disk/resources"
 PUBLISH_URL = "/v1/disk/resources/publish"
 SAVE_TO_DISK_URL = "/v1/disk/public/resources/save-to-disk"
 PUBLIC_DOWNLOAD_URL = "/v1/disk/public/resources/download"
-UPLOAD_URL = "/v1/disk/resources/upload"
+DOWNLOAD_HREF_URL = "/v1/disk/resources/download"
+UPLOAD_HREF_URL = "/v1/disk/resources/upload"
 VD_RESOURCES_URL = "/v1/disk/virtual-disks/resources"
 API360_USER_URL = "api360.yandex.net/directory/v1/org"
 
@@ -279,18 +280,22 @@ def test_disk_space_info_403_hints_at_missing_scope():
 
 
 # ── 404 по публичной ссылке лечится переизданием ────────────────────────
-def test_save_links_falls_back_to_direct_upload_on_404():
-    """Боевой случай: save-to-disk отдал 404 на живой публичный ресурс."""
+def test_save_links_copies_bytes_when_public_link_is_dead():
+    """Боевой случай: public_key отвечает 404 и на save-to-disk, и на скачивание."""
     session = FakeSession(
         {
             ("PUT", RESOURCES_URL): FakeResponse(201),  # ensure_folder
             ("POST", SAVE_TO_DISK_URL): FakeResponse(
                 404, text='{"error":"DiskNotFoundError"}'
             ),
-            ("GET", PUBLIC_DOWNLOAD_URL): FakeResponse(
+            ("GET", DOWNLOAD_HREF_URL): FakeResponse(
                 200, payload={"href": "https://downloader/HR.xlsx"}
             ),
-            ("POST", UPLOAD_URL): FakeResponse(201),
+            ("GET", "https://downloader/HR.xlsx"): FakeResponse(200, text="xlsx"),
+            ("GET", UPLOAD_HREF_URL): FakeResponse(
+                200, payload={"href": "https://uploader/put", "method": "PUT"}
+            ),
+            ("PUT", "https://uploader/put"): FakeResponse(201),
         }
     )
     copier = make_copier(session)
@@ -307,9 +312,12 @@ def test_save_links_falls_back_to_direct_upload_on_404():
 
     assert copier.fails == []
     assert len(copier.links) == 1
-    upload = session.calls_to(UPLOAD_URL, "POST")[0]
-    assert upload.params["url"] == "https://downloader/HR.xlsx"
-    assert upload.params["path"] == "disk:/src@company.ru/HR.xlsx"
+    download = session.calls_to(DOWNLOAD_HREF_URL, "GET")[0]
+    assert download.params["path"] == "disk:/HR.xlsx"
+    upload_href = session.calls_to(UPLOAD_HREF_URL, "GET")[0]
+    assert upload_href.params["path"] == "disk:/src@company.ru/HR.xlsx"
+    put = session.calls_to("https://uploader/put", "PUT")[0]
+    assert put.data == b"xlsx"
 
 
 def test_save_links_does_not_use_direct_upload_for_folders():
@@ -330,7 +338,7 @@ def test_save_links_does_not_use_direct_upload_for_folders():
 
     assert copier.links == []
     assert "вручную" in copier.fails[0]["error"]
-    assert session.calls_to(UPLOAD_URL, "POST") == []
+    assert session.calls_to(DOWNLOAD_HREF_URL, "GET") == []
 
 
 def test_save_links_does_not_fall_back_on_non_404():
@@ -348,7 +356,7 @@ def test_save_links_does_not_fall_back_on_non_404():
     copier.save_links()
 
     assert len(copier.fails) == 1
-    assert session.calls_to(UPLOAD_URL, "POST") == []
+    assert session.calls_to(DOWNLOAD_HREF_URL, "GET") == []
 
 
 # ── непереносённые файлы должны быть видны поимённо ─────────────────────

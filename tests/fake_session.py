@@ -29,6 +29,12 @@ class FakeResponse:
             self.text = ""
         self.content = self.text.encode("utf-8")
 
+    def iter_content(self, chunk_size: int = 1024 * 1024, decode_unicode: bool = False):
+        data = self.content
+        step = chunk_size or len(data) or 1
+        for offset in range(0, len(data), step):
+            yield data[offset : offset + step]
+
     def json(self) -> Any:
         if self._payload is None:
             raise ValueError("ответ без JSON-тела")

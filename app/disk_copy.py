@@ -74,6 +74,9 @@ def _build_session() -> requests.Session:
 # Сколько непереносённых файлов перечислять в логе поимённо: список нужен
 # для разбора, но при тысячах ошибок он вытеснит остальной лог из окна.
 FAILS_LOG_LIMIT = 50
+# Прямое копирование тащит файл через процесс. Выше этого порога отказываемся,
+# чтобы один большой файл не съел память контейнера.
+DIRECT_COPY_MAX_BYTES = 512 * 1024 * 1024
 
 # Опрос статуса асинхронной операции: интервал растёт 0.5→1→2→4→8→10→10…
 POLL_FIRST_DELAY = 0.5
@@ -434,34 +437,6 @@ class DiskCopier:
         response = self.session.get(url, params=params, headers=headers)
         return self._response_payload(response)
 
-    def _disk_upload_from_url(self, file_url: str, dest_path: str) -> None:
-        """Загрузка файла по прямой ссылке на личный Диск (async → ждём)."""
-        url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
-        headers = {"Authorization": f"OAuth {self._destination_token()}"}
-        params = {"url": file_url, "path": dest_path}
-        response = self.session.post(url, params=params, headers=headers)
-        self.log(
-            f"disk_upload_from_url | status: {response.status_code} | "
-            f"path: {dest_path}"
-        )
-        if response.status_code == 202:
-            href = self._response_payload(response).get("href")
-            if not href:
-                raise CopyError(
-                    f"Нет ссылки на операцию при загрузке {dest_path}: "
-                    f"{response.text[:300]}"
-                )
-            self._wait_operation(href, self._destination_token())
-        elif response.status_code == 201:
-            return
-        elif response.status_code == 409:
-            self.log(f"disk_upload_from_url | уже существует, пропускаю: {dest_path}")
-        else:
-            raise CopyError(
-                f"Не удалось загрузить {dest_path} по прямой ссылке: "
-                f"{response.status_code} {response.text[:300]}"
-            )
-
     def _disk_publish_resource(self, token: str, path: str) -> None:
         url = "https://cloud-api.yandex.net/v1/disk/resources/publish"
         headers = {"Authorization": f"OAuth {token}"}
@@ -720,14 +695,97 @@ class DiskCopier:
             f"save_links | done | saved: {len(self.links)}, fails: {len(self.fails)}"
         )
 
-    def _save_one_link(self, link: dict) -> None:
-        """Сохраняет ресурс; на 404 обходит save-to-disk через прямую ссылку.
+    def _owner_download_href(self, path: str) -> str:
+        """Временная ссылка на скачивание файла токеном владельца.
 
-        save-to-disk иногда отвечает DiskNotFoundError на живой публичный
-        ресурс. Переиздание не помогает: publish идемпотентен и возвращает
-        тот же public_key. Рабочий обход — скачать файл по публичной ссылке
-        и залить получателю по URL. Для папок обхода нет: публичная ссылка
-        отдаёт zip, а не дерево.
+        Не путать с публичной: та для некоторых файлов отвечает 404, хотя
+        сам файл на Диске есть (типично — метка антивируса).
+        """
+        url = "https://cloud-api.yandex.net/v1/disk/resources/download"
+        headers = {"Authorization": f"OAuth {self._source_token()}"}
+        response = self.session.get(url, params={"path": path}, headers=headers)
+        payload = self._response_payload(response)
+        href = payload.get("href") if response.status_code == 200 else None
+        self.log(
+            f"disk_download_href | status: {response.status_code} | path: {path}"
+        )
+        if not isinstance(href, str) or not href:
+            raise CopyError(
+                f"Не удалось получить ссылку скачивания {path}: "
+                f"{response.status_code} {response.text[:300]}"
+            )
+        return href
+
+    def _owner_upload_href(self, dest_path: str) -> Optional[str]:
+        """Куда PUT-ить байты. None — файл у получателя уже есть."""
+        url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+        headers = {"Authorization": f"OAuth {self._destination_token()}"}
+        response = self.session.get(
+            url,
+            params={"path": dest_path, "overwrite": "false"},
+            headers=headers,
+        )
+        self.log(
+            f"disk_upload_href | status: {response.status_code} | path: {dest_path}"
+        )
+        if response.status_code == 409:
+            self.log(f"disk_upload_href | уже существует, пропускаю: {dest_path}")
+            return None
+        href = self._response_payload(response).get("href")
+        if response.status_code != 200 or not isinstance(href, str) or not href:
+            raise CopyError(
+                f"Не удалось получить ссылку загрузки {dest_path}: "
+                f"{response.status_code} {response.text[:300]}"
+            )
+        return href
+
+    def _copy_file_bytes(self, src_path: str, name: str) -> None:
+        """Скачивает файл у источника и заливает байты получателю."""
+        dest_path = f"{self._target_folder_personal()}/{name}"
+        download_href = self._owner_download_href(src_path)
+        upload_href = self._owner_upload_href(dest_path)
+        if upload_href is None:
+            return
+
+        downloaded = self.session.get(download_href, stream=True)
+        if downloaded.status_code != 200:
+            raise CopyError(
+                f"Не удалось скачать {src_path}: {downloaded.status_code} "
+                f"{downloaded.text[:200]}"
+            )
+        body = bytearray()
+        for chunk in downloaded.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            body.extend(chunk)
+            if len(body) > DIRECT_COPY_MAX_BYTES:
+                raise CopyError(
+                    f"{src_path} больше "
+                    f"{DIRECT_COPY_MAX_BYTES // (1024 * 1024)} МБ — "
+                    f"прямое копирование через сервис не выполняется"
+                )
+        uploaded = self.session.put(
+            upload_href,
+            data=bytes(body),
+            headers={"Content-Length": str(len(body))},
+        )
+        self.log(
+            f"direct_copy | {len(body)} байт | upload status: "
+            f"{uploaded.status_code} | {dest_path}"
+        )
+        if uploaded.status_code not in (200, 201, 202):
+            raise CopyError(
+                f"Не удалось залить {dest_path}: {uploaded.status_code} "
+                f"{uploaded.text[:300]}"
+            )
+
+    def _save_one_link(self, link: dict) -> None:
+        """Сохраняет ресурс. Если публичная ссылка мертва — копирует файл байтами.
+
+        save-to-disk и публичное скачивание отвечают 404 DiskNotFoundError на
+        один и тот же public_key, хотя publish вернул 200. Повторная публикация
+        ключ не меняет. Для файла остаётся скачать его токеном владельца и
+        залить получателю. Папку так не перенести.
         """
         try:
             self._disk_save_public_resource(link["public_key"], link["name"])
@@ -737,17 +795,14 @@ class DiskCopier:
                 raise
             if link.get("type") != "file":
                 raise CopyError(
-                    f"{exc}. Папку через прямую ссылку не перенести — "
+                    f"{exc}. Папку без рабочей публичной ссылки не перенести — "
                     f"скопируйте {link.get('path')} вручную"
                 )
             self.log(
-                f"save_links | 404 по save-to-disk {link.get('path')} — "
-                f"пробую через прямую ссылку"
+                f"save_links | публичная ссылка {link.get('path')} недоступна — "
+                f"копирую файл напрямую"
             )
-
-        href = self._public_download_href(link["public_key"])
-        dest_path = f"{self._target_folder_personal()}/{link['name']}"
-        self._disk_upload_from_url(href, dest_path)
+        self._copy_file_bytes(link["path"], link["name"])
 
     def save_to_shared(self) -> None:
         """Публикует файлы источника и заливает их на общий диск (с сохранением дерева)."""
