@@ -887,7 +887,11 @@ class DiskCopier:
         return resolved
 
     def _download_to_path(self, src_path: str, dest: Path) -> None:
-        """Скачивает файл токеном владельца и атомарно кладёт его в dest."""
+        """Скачивает файл токеном владельца и атомарно кладёт его в dest.
+
+        Ссылка на скачивание и само тело файла — GET, то есть читающие запросы:
+        они идут в полосу 40 rps, а не в полосу изменения (5 rps).
+        """
         href = self._owner_download_href(src_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + ".part")

@@ -18,9 +18,11 @@ from requests.adapters import HTTPAdapter
 from app.throttle import (
     MAX_COOLDOWN,
     RateLimiter,
+    SplitRateLimiter,
     ThrottledSession,
     backoff_delay,
     get_limiter,
+    request_lane,
     retry_after_seconds,
     set_limiter,
 )
@@ -173,6 +175,75 @@ def test_rps_property_roundtrips():
     limiter, _ = make_limiter(rps=25.0)
 
     assert limiter.rps == pytest.approx(25.0)
+
+
+# ── две полосы: чтение 40 rps, изменение 5 rps ─────────────────────────
+def test_request_lane_splits_read_and_write():
+    for method in ("GET", "get", "HEAD", "OPTIONS"):
+        assert request_lane(method) == "read"
+    for method in ("POST", "PUT", "PATCH", "DELETE", "FOO"):
+        assert request_lane(method) == "write"
+
+
+def test_read_lane_does_not_consume_write_budget():
+    clock = FakeClock()
+    limiter = SplitRateLimiter(
+        40.0, 5.0, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+
+    limiter.acquire("GET")
+    limiter.acquire("GET")  # интервал чтения 25 мс
+    limiter.acquire("PUT")  # первая запись не ждёт чтения
+
+    assert clock.sleeps == [pytest.approx(0.025)]
+
+
+def test_write_lane_is_paced_at_five_rps():
+    clock = FakeClock()
+    limiter = SplitRateLimiter(
+        40.0, 5.0, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+
+    limiter.acquire("PUT")
+    limiter.acquire("POST")
+    limiter.acquire("PATCH")
+
+    assert clock.sleeps == [pytest.approx(0.2), pytest.approx(0.2)]
+
+
+def test_download_get_uses_read_lane_not_write():
+    """Скачивание файла — GET: полоса чтения, не изменения."""
+    clock = FakeClock()
+    limiter = SplitRateLimiter(
+        40.0, 5.0, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    session = ThrottledSession(limiter)
+    adapter = RecordingAdapter([(200, {})])
+    session.mount("https://", adapter)
+
+    session.get("https://downloader.disk.yandex.net/disk/file")
+    session.get("https://downloader.disk.yandex.net/disk/file")
+    session.put("https://cloud-api.yandex.net/v1/disk/resources/publish")
+    session.put("https://cloud-api.yandex.net/v1/disk/resources/publish")
+
+    assert clock.sleeps == [pytest.approx(0.025), pytest.approx(0.2)]
+
+
+def test_429_blocks_both_lanes():
+    clock = FakeClock()
+    limiter = SplitRateLimiter(
+        40.0, 5.0, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+
+    before = clock.monotonic()
+    assert limiter.penalize(7.0) == pytest.approx(7.0)
+    assert limiter.read._blocked_until == pytest.approx(before + 7.0)
+    assert limiter.write._blocked_until == pytest.approx(before + 7.0)
+
+    limiter.acquire("PUT")
+
+    assert clock.sleeps == [pytest.approx(7.0)]
+    assert limiter.cooldowns == 1
 
 
 # ── синглтон ────────────────────────────────────────────────────────────

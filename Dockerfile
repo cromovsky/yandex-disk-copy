@@ -15,11 +15,13 @@ COPY docs ./docs
 ARG CROSS_ORG_ENABLED=1
 ENV CROSS_ORG_ENABLED=${CROSS_ORG_ENABLED}
 
-# Целевой темп запросов к API Диска, запросов/с. Документированный потолок — 40
-# (Условия использования API Диска, п. 2.2), по умолчанию берём половину.
-# Ловите 429 в логе — снизьте; можно задать и на запуске: -e DISK_API_RPS=10
-ARG DISK_API_RPS=20
-ENV DISK_API_RPS=${DISK_API_RPS}
+# Лимит API Диска на один IP и клиент: 40 rps чтение, 5 rps изменение.
+# Ловите 429 в логе — снизьте; можно задать на запуске:
+#   -e DISK_API_READ_RPS=20 -e DISK_API_WRITE_RPS=2
+ARG DISK_API_READ_RPS=40
+ARG DISK_API_WRITE_RPS=5
+ENV DISK_API_READ_RPS=${DISK_API_READ_RPS} \
+    DISK_API_WRITE_RPS=${DISK_API_WRITE_RPS}
 
 # Таймаут чтения ответа, с (таймаут соединения фиксирован — 10 с).
 ARG HTTP_TIMEOUT_SEC=120

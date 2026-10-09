@@ -199,18 +199,20 @@ def test_batch_pairs_reject_duplicates():
         _validate_batch_pairs(pairs)
 
 
-def test_config_exposes_target_rps():
+def test_config_exposes_read_and_write_rps():
     cfg = client.get("/api/config").json()
 
-    assert cfg["target_rps"] > 0
-    assert cfg["target_rps"] <= 40, "не должны по умолчанию упираться в потолок API"
+    assert cfg["read_rps"] == 40
+    assert cfg["write_rps"] == 5
+    assert cfg["target_rps"] == cfg["read_rps"]
 
 
 def test_rate_limit_note_mentions_pace_and_ceiling():
     note = _rate_limit_note()
 
     assert "RATE LIMIT" in note
-    assert "40" in note, "потолок должен быть виден в логе"
+    assert "40" in note
+    assert "5" in note
 
 
 def test_run_job_logs_rate_limit_first(monkeypatch):

@@ -1035,7 +1035,8 @@
     // режим 2 может быть отключён на уровне образа (v1); лимиты пакета с бэкенда
     let BATCH_MAX = 25;
     let BATCH_CONCURRENCY = 5;
-    let TARGET_RPS = 20;
+    let READ_RPS = 40;
+    let WRITE_RPS = 5;
     fetch("/api/config").then((r) => r.json()).then((cfg) => {
       if (!cfg.cross_org) {
         const tabs = document.querySelector(".mode-tabs");
@@ -1046,7 +1047,9 @@
       }
       if (cfg.batch_max_pairs) BATCH_MAX = cfg.batch_max_pairs;
       if (cfg.batch_concurrency) BATCH_CONCURRENCY = cfg.batch_concurrency;
-      if (cfg.target_rps) TARGET_RPS = cfg.target_rps;
+      if (cfg.read_rps) READ_RPS = cfg.read_rps;
+      else if (cfg.target_rps) READ_RPS = cfg.target_rps;
+      if (cfg.write_rps) WRITE_RPS = cfg.write_rps;
       if (cfg.local_save_host_dir) {
         document.querySelectorAll("[data-local-hint]").forEach((el) => {
           el.textContent = cfg.local_save_host_dir;
@@ -1207,7 +1210,7 @@
         }
         if (helpNote) {
           // темп указан намеренно: иначе плавный пакетный перенос читается как «зависло»
-          const pace = ` Запросы к API Диска идут суммарно не быстрее ~${TARGET_RPS} в секунду, поэтому большой пакет переносится постепенно.`;
+          const pace = ` Чтение Диска — не быстрее ~${READ_RPS} запросов/с, изменение — не быстрее ~${WRITE_RPS}. Большой пакет из-за этого идёт постепенно.`;
           helpNote.innerHTML = (shared
             ? "Заполните шаблон списком email источников (по одному на строку) " +
               "и загрузите кнопкой-скрепкой. Все источники переносятся на выбранный " +

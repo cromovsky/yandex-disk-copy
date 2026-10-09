@@ -1,13 +1,12 @@
 """Процесс-глобальный троттлинг исходящих HTTP-запросов.
 
-Зачем: Условия использования API Диска (п. 2.2) декларируют максимум
-40 запросов/с на сервис, причём при превышении «предоставление Сервиса может быть
-ограничено или прекращено». Заголовков X-RateLimit-* API Диска не отдаёт, поэтому
-упреждающий контур может быть только разомкнутым: темп задаём сами (RateLimiter),
+Лимит API Диска — на один IP и один клиент: 40 запросов/с на чтение и 5 на
+изменение. Заголовков X-RateLimit-* API не отдаёт, поэтому темп задаём сами,
 а по факту 429 тормозим все потоки сразу (общий барьер + Retry-After).
 
-Лимитер один на процесс: в пакетном режиме работает до BATCH_CONCURRENCY копиров,
-у каждого своя Session, но client_id один — значит и бюджет общий.
+Бюджет один на процесс: пакетные переносы и локальное скачивание ходят с одного
+IP под одним client_id. Второй контейнер на том же IP получит свой бюджет и
+может превысить лимит.
 """
 
 from __future__ import annotations
@@ -24,18 +23,60 @@ import requests
 
 def _env_float(name: str, default: float) -> float:
     """Положительное число из окружения; мусор не должен ронять импорт приложения."""
+    value = _env_positive(name)
+    return default if value is None else value
+
+
+def _env_positive(name: str) -> Optional[float]:
     raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
     try:
         value = float(raw)
     except ValueError:
-        return default
-    return value if value > 0 else default
+        return None
+    return value if value > 0 else None
 
 
-# Документированный лимит API Диска — 40 запросов/с на сервис. Берём половину:
-# окно учёта на стороне сервиса неизвестно, и тем же client_id могут пользоваться
-# другие интеграции организации. Видите 429 в логе — снижайте DISK_API_RPS.
-TARGET_RPS = _env_float("DISK_API_RPS", 20.0)
+def _read_rps() -> float:
+    """Читающие запросы. DISK_API_READ_RPS точнее, DISK_API_RPS — старая ручка."""
+    specific = _env_positive("DISK_API_READ_RPS")
+    if specific is not None:
+        return specific
+    legacy = _env_positive("DISK_API_RPS")
+    if legacy is not None:
+        return legacy
+    return 40.0
+
+
+def _write_rps() -> float:
+    """Модифицирующие запросы. Старая ручка DISK_API_RPS не поднимает темп выше 5."""
+    specific = _env_positive("DISK_API_WRITE_RPS")
+    if specific is not None:
+        return specific
+    legacy = _env_positive("DISK_API_RPS")
+    if legacy is not None:
+        return min(5.0, legacy)
+    return 5.0
+
+
+# Потолки API Диска на один IP и один клиент. Видите 429 — снижайте ручки.
+READ_RPS = _read_rps()
+WRITE_RPS = _write_rps()
+# Совместимость: старое имя — это темп чтения.
+TARGET_RPS = READ_RPS
+
+# GET/HEAD — чтение (листинг, ссылка на скачивание, само тело файла).
+# Остальное — изменение (publish, save-to-disk, upload, создание папки).
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def request_lane(method: str) -> str:
+    """«read» или «write» по методу. Неизвестный метод считаем изменением."""
+    if (method or "GET").upper() in _READ_METHODS:
+        return "read"
+    return "write"
+
 
 # (connect, read). Без таймаута висящий запрос держит поток переноса вечно.
 CONNECT_TIMEOUT = 10.0
@@ -125,8 +166,12 @@ class RateLimiter:
     def rps(self) -> float:
         return 1.0 / self._interval
 
-    def acquire(self) -> None:
-        """Блокирует поток до момента, когда очередной запрос разрешён."""
+    def acquire(self, _method: str = "GET") -> None:
+        """Блокирует поток до момента, когда очередной запрос разрешён.
+
+        Метод у однополосного лимитера не используется: полосу выбирает
+        SplitRateLimiter. Сигнатура общая, чтобы сессия всегда передавала метод.
+        """
         while True:
             with self._lock:
                 # барьер 429 учитывается здесь же: слоты после cooldown
@@ -165,20 +210,70 @@ class RateLimiter:
             self._sleep(delay)
 
 
-_LIMITER: Optional[RateLimiter] = None
+class SplitRateLimiter:
+    """Две полосы: чтение и изменение. 429 отодвигает барьер в обеих.
+
+    Ответ 429 не говорит, какой бюджет кончился, поэтому пауза общая.
+    """
+
+    def __init__(
+        self,
+        read_rps: float,
+        write_rps: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        max_cooldown: float = MAX_COOLDOWN,
+    ):
+        kwargs = {
+            "monotonic": monotonic,
+            "sleep": sleep,
+            "max_cooldown": max_cooldown,
+        }
+        self.read = RateLimiter(read_rps, **kwargs)
+        self.write = RateLimiter(write_rps, **kwargs)
+
+    def _lane(self, method: str) -> RateLimiter:
+        if request_lane(method) == "write":
+            return self.write
+        return self.read
+
+    def acquire(self, method: str = "GET") -> None:
+        self._lane(method).acquire()
+
+    def penalize(self, delay: float) -> float:
+        read_pause = self.read.penalize(delay)
+        write_pause = self.write.penalize(delay)
+        return max(read_pause, write_pause)
+
+    def pause(self, delay: float) -> None:
+        """Пауза одного потока на 5xx. Сон один раз, барьер полос не двигает."""
+        self.read.pause(delay)
+
+    @property
+    def cooldowns(self) -> int:
+        # penalize увеличивает счётчик в обеих полосах на одно событие
+        return self.read.cooldowns
+
+    @property
+    def rps(self) -> float:
+        return self.read.rps
+
+
+_LIMITER: Optional[SplitRateLimiter] = None
 _LIMITER_LOCK = threading.Lock()
 
 
-def get_limiter() -> RateLimiter:
+def get_limiter() -> SplitRateLimiter:
     """Один лимитер на процесс — все копиры делят общий бюджет API."""
     global _LIMITER
     with _LIMITER_LOCK:
         if _LIMITER is None:
-            _LIMITER = RateLimiter(TARGET_RPS)
+            _LIMITER = SplitRateLimiter(READ_RPS, WRITE_RPS)
         return _LIMITER
 
 
-def set_limiter(limiter: Optional[RateLimiter]) -> None:
+def set_limiter(limiter: Optional[SplitRateLimiter | RateLimiter]) -> None:
     """Подмена или сброс синглтона. Нужна тестам (фейковые часы) и только им."""
     global _LIMITER
     with _LIMITER_LOCK:
@@ -224,7 +319,7 @@ class ThrottledSession(requests.Session):
         attempt = 0
         while True:
             attempt += 1
-            self._limiter.acquire()
+            self._limiter.acquire(request.method)
             response = super().send(request, **kwargs)
             if response.status_code not in RETRY_STATUSES:
                 return response

@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .disk_copy import CopyConfig, CopyError, DiskCopier, OrgCreds
-from .throttle import TARGET_RPS
+from .throttle import READ_RPS, WRITE_RPS
 
 STATIC_DIR = Path(__file__).parent / "static"
 INSTRUCTION_MD = Path(__file__).parent.parent / "docs" / "INSTRUCTION.md"
@@ -136,8 +136,9 @@ _DONE = object()  # сентинел конца лога в очереди
 def _rate_limit_note() -> str:
     """Строка в лог: с каким темпом работали — видно в присланном логе."""
     return (
-        f"RATE LIMIT | целевой темп: {TARGET_RPS:g} запросов/с "
-        f"(общий на процесс, документированный потолок API Диска — 40)"
+        f"RATE LIMIT | чтение: {READ_RPS:g} запросов/с, "
+        f"изменение: {WRITE_RPS:g} запросов/с "
+        f"(лимит API Диска на один IP и клиент, общий на процесс)"
     )
 
 
@@ -296,7 +297,9 @@ def config() -> dict:
         "cross_org": val not in ("0", "false", "no", "off"),
         "batch_max_pairs": BATCH_MAX_PAIRS,
         "batch_concurrency": BATCH_CONCURRENCY,
-        "target_rps": TARGET_RPS,
+        "target_rps": READ_RPS,
+        "read_rps": READ_RPS,
+        "write_rps": WRITE_RPS,
         "local_save_host_dir": LOCAL_SAVE_HOST_DIR,
     }
 

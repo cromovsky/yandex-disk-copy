@@ -20,7 +20,8 @@ services:
       # темп запросов к API Диска; значения берутся из .env, дефолты — как в образе.
       # Пробрасываем поимённо, а не env_file, чтобы basic-auth хеш не утекал в
       # окружение приложения.
-      DISK_API_RPS: ${DISK_API_RPS:-20}
+      DISK_API_READ_RPS: ${DISK_API_READ_RPS:-40}
+      DISK_API_WRITE_RPS: ${DISK_API_WRITE_RPS:-5}
       HTTP_TIMEOUT_SEC: ${HTTP_TIMEOUT_SEC:-120}
       LOCAL_SAVE_DIR: /downloads
       LOCAL_SAVE_HOST_DIR: ./downloads
