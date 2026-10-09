@@ -147,6 +147,32 @@ def test_page_limit_zero_rejected():
     assert response.status_code == 422
 
 
+def test_save_local_does_not_require_destination(monkeypatch):
+    seen = {}
+
+    def fake_start(cfg):
+        seen["cfg"] = cfg
+        return {"job_id": "local-1"}
+
+    monkeypatch.setattr("app.main._start_job", fake_start)
+    response = client.post(
+        "/api/save-local",
+        json={
+            "client_id": "a",
+            "client_secret": "b",
+            "orgid": "o",
+            "admin_token": "t",
+            "source_disk_id": "s@x.ru",
+            "path": "/Docs",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["job_id"] == "local-1"
+    assert seen["cfg"].local_save is True
+    assert seen["cfg"].path == "/Docs"
+    assert seen["cfg"].destination_disk_id == ""
+
+
 def test_shared_without_vd_hash_rejected():
     response = client.post(
         "/api/run",

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
@@ -120,6 +121,10 @@ class CopyConfig:
     #          — email сотрудника с правом записи на этот общий диск).
     destination_type: str = "personal"
     destination_vd_hash: str = ""
+    # Локальное сохранение на машину, с которой запущена утилита.
+    # local_root задаёт каталог внутри процесса; на хост он попадает томом.
+    local_save: bool = False
+    local_root: str = ""
 
 
 @dataclass
@@ -404,7 +409,7 @@ class DiskCopier:
             "fields": (
                 "path,type,_embedded.total,_embedded.items.path,"
                 "_embedded.items.type,_embedded.items.public_key,"
-                "_embedded.items.name"
+                "_embedded.items.name,_embedded.items.size"
             ),
             "limit": limit,
             "offset": offset,
@@ -864,24 +869,151 @@ class DiskCopier:
             f"save_to_shared | done | saved: {len(self.links)}, fails: {len(self.fails)}"
         )
 
+    def _local_file_path(self, disk_path: str, base: Path) -> Path:
+        """Путь файла на машине запуска: <каталог>/<email>/<путь на Диске>."""
+        rel = _strip_disk_schema(disk_path or "").lstrip("/")
+        parts: list[str] = []
+        for part in rel.split("/"):
+            if part in ("", "."):
+                continue
+            if part == ".." or "\\" in part:
+                raise CopyError(f"Небезопасный путь на Диске: {disk_path}")
+            parts.append(part)
+        dest = base.joinpath(*parts) if parts else base
+        resolved = dest.resolve()
+        base_resolved = base.resolve()
+        if resolved != base_resolved:
+            resolved.relative_to(base_resolved)
+        return resolved
+
+    def _download_to_path(self, src_path: str, dest: Path) -> None:
+        """Скачивает файл токеном владельца и атомарно кладёт его в dest."""
+        href = self._owner_download_href(src_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
+        response = self.session.get(href, stream=True)
+        try:
+            if response.status_code != 200:
+                raise CopyError(
+                    f"Не удалось скачать {src_path}: {response.status_code} "
+                    f"{response.text[:200]}"
+                )
+            with part.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+            os.replace(part, dest)
+        finally:
+            response.close()
+            if part.exists():
+                part.unlink()
+
+    def save_local(self) -> None:
+        """Скачивает дерево PATH на машину, с которой запущена утилита.
+
+        Повторный запуск не качает файл заново, если локальная копия уже есть
+        и её размер совпадает с размером на Диске.
+        """
+        root = Path(self.cfg.local_root).expanduser()
+        email = (self.cfg.source_disk_id or "").strip()
+        if not email or "/" in email or email in (".", ".."):
+            raise CopyError(f"Некорректный email источника: {email}")
+        try:
+            base = self._local_file_path("disk:/", root / email)
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise CopyError(
+                f"Не удалось создать каталог сохранения: {exc}"
+            ) from exc
+        except ValueError as exc:
+            raise CopyError(
+                f"Каталог сохранения выходит за пределы LOCAL_SAVE_DIR: {exc}"
+            ) from exc
+
+        host = (os.environ.get("LOCAL_SAVE_HOST_DIR") or "").strip()
+        self.log(f"save_local | start | path: {self.cfg.path} | каталог: {base}")
+        if host:
+            self.log(f"save_local | на машине запуска: {host.rstrip('/')}/{email}")
+        downloads = Path("/downloads")
+        if root.resolve() == downloads and not downloads.is_mount():
+            self.log(
+                "save_local | ВНИМАНИЕ | /downloads не примонтирован с хоста, "
+                "файлы останутся внутри контейнера. Запускайте с томом "
+                "./downloads:/downloads"
+            )
+
+        files: list[dict] = []
+
+        def visit(item: dict) -> None:
+            kind = item.get("type")
+            path = item.get("path")
+            if not isinstance(path, str):
+                return
+            if kind == "dir":
+                self._local_file_path(path, base).mkdir(parents=True, exist_ok=True)
+                self._walk(path, visit)
+            elif kind == "file":
+                files.append(item)
+
+        self._walk(self.cfg.path, visit)
+        self.log(f"save_local | файлов: {len(files)}")
+        for i, item in enumerate(files, 1):
+            src_path = item["path"]
+            try:
+                dest = self._local_file_path(src_path, base)
+                size = item.get("size")
+                if (
+                    isinstance(size, int)
+                    and dest.is_file()
+                    and dest.stat().st_size == size
+                ):
+                    self.log(f"save_local | уже есть, пропускаю: {src_path}")
+                    self.links.append(
+                        {"path": src_path, "name": item.get("name"), "dest": str(dest)}
+                    )
+                else:
+                    self._download_to_path(src_path, dest)
+                    self.links.append(
+                        {"path": src_path, "name": item.get("name"), "dest": str(dest)}
+                    )
+                    self.log(f"save_local | сохранён {src_path}")
+            except (CopyError, OSError, ValueError) as exc:
+                self.log(f"save_local | ошибка {src_path}: {exc}")
+                self.fails.append(
+                    {"path": src_path, "name": item.get("name"), "error": str(exc)}
+                )
+            self.log(f"save_local | progress {i}/{len(files)}")
+        self.log(
+            f"save_local | done | saved: {len(self.links)}, fails: {len(self.fails)}"
+        )
+
     # ── оркестрация ────────────────────────────────────────────────────
     def run(self) -> dict:
         cfg = self.cfg
-        if self._is_shared_dest and not cfg.destination_vd_hash:
+        if cfg.local_save:
+            if not (cfg.local_root or "").strip():
+                raise CopyError(
+                    "Каталог локального сохранения не задан (LOCAL_SAVE_DIR)"
+                )
+            self.log(
+                f"START | save local from {cfg.source_disk_id} | "
+                f"path: {cfg.path}"
+            )
+        elif self._is_shared_dest and not cfg.destination_vd_hash:
             raise CopyError(
                 "Для переноса на общий диск укажите destination_vd_hash "
                 "(метка из адресной строки Диска после vd/)."
             )
-
-        dest_label = (
-            f"shared:{cfg.destination_vd_hash} (via {cfg.destination_disk_id})"
-            if self._is_shared_dest
-            else cfg.destination_disk_id
-        )
-        self.log(
-            f"START | copy from {cfg.source_disk_id} to {dest_label} | "
-            f"path: {cfg.path} | dest_type: {cfg.destination_type}"
-        )
+        else:
+            dest_label = (
+                f"shared:{cfg.destination_vd_hash} (via {cfg.destination_disk_id})"
+                if self._is_shared_dest
+                else cfg.destination_disk_id
+            )
+            self.log(
+                f"START | copy from {cfg.source_disk_id} to {dest_label} | "
+                f"path: {cfg.path} | dest_type: {cfg.destination_type}"
+            )
 
         # 1. Токен исходного диска + uid сотрудника из него.
         source_token = self._source_token()
@@ -903,42 +1035,48 @@ class DiskCopier:
 
         transfer_ok = False
         try:
-            # 3. Проверка места на диске назначения.
-            if SKIP_SPACE_CHECK:
-                self.log(
-                    "space check | пропущена (по умолчанию) — если места не "
-                    "хватит, файлы начнут падать в fails уже в процессе переноса. "
-                    "Включить сверку: SPACE_CHECK=1"
-                )
-                needed_space = free_space = 0
+            if cfg.local_save:
+                self.save_local()
             else:
-                needed_space, _ = self._disk_space_info(
-                    self._source_token(), disk_id=cfg.source_disk_id
-                )
-                if self._is_shared_dest:
-                    _, free_space = self._shared_space_info(self._destination_token())
-                else:
-                    _, free_space = self._disk_space_info(
-                        self._destination_token(), disk_id=cfg.destination_disk_id
+                # 3. Проверка места на диске назначения.
+                if SKIP_SPACE_CHECK:
+                    self.log(
+                        "space check | пропущена (по умолчанию) — если места не "
+                        "хватит, файлы начнут падать в fails уже в процессе "
+                        "переноса. Включить сверку: SPACE_CHECK=1"
                     )
-                self.log(
-                    f"space check | need: {needed_space} bytes, "
-                    f"free: {free_space} bytes"
-                )
+                    needed_space = free_space = 0
+                else:
+                    needed_space, _ = self._disk_space_info(
+                        self._source_token(), disk_id=cfg.source_disk_id
+                    )
+                    if self._is_shared_dest:
+                        _, free_space = self._shared_space_info(
+                            self._destination_token()
+                        )
+                    else:
+                        _, free_space = self._disk_space_info(
+                            self._destination_token(),
+                            disk_id=cfg.destination_disk_id,
+                        )
+                    self.log(
+                        f"space check | need: {needed_space} bytes, "
+                        f"free: {free_space} bytes"
+                    )
 
-            if not SKIP_SPACE_CHECK and free_space <= needed_space:
-                raise CopyError(
-                    f"Недостаточно места на диске назначения ({dest_label}): "
-                    f"нужно {needed_space}, свободно {free_space}"
-                )
+                if not SKIP_SPACE_CHECK and free_space <= needed_space:
+                    raise CopyError(
+                        f"Недостаточно места на диске назначения ({dest_label}): "
+                        f"нужно {needed_space}, свободно {free_space}"
+                    )
 
-            # 4. Публикация → сохранение.
-            if self._is_shared_dest:
-                self.save_to_shared()
-            else:
-                self.make_links()
-                self.get_links()
-                self.save_links()
+                # 4. Публикация → сохранение.
+                if self._is_shared_dest:
+                    self.save_to_shared()
+                else:
+                    self.make_links()
+                    self.get_links()
+                    self.save_links()
             transfer_ok = True
         finally:
             # 5. Возвращаем исходную блокировку, что бы ни случилось.

@@ -25,6 +25,11 @@ ENV DISK_API_RPS=${DISK_API_RPS}
 ARG HTTP_TIMEOUT_SEC=120
 ENV HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC}
 
+# Локальное сохранение. Каталог внутри контейнера; на хост его выводит том
+# ./downloads:/downloads. LOCAL_SAVE_HOST_DIR — путь в логе для человека.
+ENV LOCAL_SAVE_DIR=/downloads \
+    LOCAL_SAVE_HOST_DIR=./downloads
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

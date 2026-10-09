@@ -779,3 +779,98 @@ def test_context_manager_closes_session():
         assert copier.session is session
 
     assert session.closed
+
+
+# ── локальное сохранение на машину запуска ──────────────────────────────
+def _local_session(listing: dict, body: str = "hello") -> FakeSession:
+    return FakeSession(
+        {
+            ("GET", DOWNLOAD_HREF_URL): FakeResponse(
+                200, payload={"href": "https://downloader/file"}
+            ),
+            ("GET", "https://downloader/file"): FakeResponse(200, text=body),
+            ("GET", RESOURCES_URL): FakeResponse(200, payload=listing),
+        }
+    )
+
+
+def test_save_local_writes_file_under_email_directory(tmp_path):
+    name = "HR аналитика.xlsx"
+    session = _local_session(
+        embedded(
+            [{"path": f"disk:/{name}", "type": "file", "name": name, "size": 5}]
+        )
+    )
+    copier = make_copier(session)
+    copier.cfg.local_root = str(tmp_path)
+
+    copier.save_local()
+
+    dest = tmp_path / "src@company.ru" / name
+    assert dest.read_bytes() == b"hello"
+    assert copier.fails == []
+
+
+def test_save_local_skips_file_of_the_same_size(tmp_path):
+    name = "a.txt"
+    session = _local_session(
+        embedded([{"path": f"disk:/{name}", "type": "file", "name": name, "size": 4}]),
+        body="same",
+    )
+    dest = tmp_path / "src@company.ru" / name
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"same")
+    copier = make_copier(session)
+    copier.cfg.local_root = str(tmp_path)
+
+    copier.save_local()
+
+    assert session.calls_to(DOWNLOAD_HREF_URL, "GET") == []
+    assert dest.read_bytes() == b"same"
+
+
+def test_save_local_replaces_file_when_size_differs(tmp_path):
+    name = "a.txt"
+    session = _local_session(
+        embedded([{"path": f"disk:/{name}", "type": "file", "name": name, "size": 5}]),
+        body="hello",
+    )
+    dest = tmp_path / "src@company.ru" / name
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old")
+    copier = make_copier(session)
+    copier.cfg.local_root = str(tmp_path)
+
+    copier.save_local()
+
+    assert dest.read_bytes() == b"hello"
+
+
+def test_save_local_rejects_parent_path(tmp_path):
+    session = _local_session(
+        embedded(
+            [{"path": "disk:/../secret", "type": "file", "name": "secret", "size": 1}]
+        )
+    )
+    copier = make_copier(session)
+    copier.cfg.local_root = str(tmp_path)
+
+    copier.save_local()
+
+    assert copier.links == []
+    assert "Небезопасный путь" in copier.fails[0]["error"]
+    assert not (tmp_path / "secret").exists()
+
+
+def test_run_local_does_not_call_save_to_disk(tmp_path):
+    session = FakeSession(
+        {("GET", RESOURCES_URL): FakeResponse(200, payload=embedded([]))}
+    )
+    copier = make_copier(session, admin_token="")
+    copier.cfg.local_save = True
+    copier.cfg.local_root = str(tmp_path)
+
+    result = copier.run()
+
+    assert result == {"saved": [], "fails": []}
+    assert session.calls_to(SAVE_TO_DISK_URL, "POST") == []

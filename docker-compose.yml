@@ -4,4 +4,10 @@ services:
     container_name: yandex-disk-copy
     ports:
       - "8000:8000"
+    environment:
+      LOCAL_SAVE_DIR: /downloads
+      LOCAL_SAVE_HOST_DIR: ./downloads
+    volumes:
+      # локальное сохранение пишет сюда, на машину запуска, а не внутрь контейнера
+      - ./downloads:/downloads
     restart: unless-stopped

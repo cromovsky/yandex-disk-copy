@@ -322,6 +322,9 @@ docker pull cromovsky/yandex-disk-copy:latest
 docker run -d \
   --name yandex-disk-copy \
   -p 8000:8000 \
+  -v "$(pwd)/downloads:/downloads" \
+  -e LOCAL_SAVE_DIR=/downloads \
+  -e LOCAL_SAVE_HOST_DIR="$(pwd)/downloads" \
   --restart unless-stopped \
   cromovsky/yandex-disk-copy:latest
 ```
@@ -341,6 +344,11 @@ services:
     image: cromovsky/yandex-disk-copy:latest
     ports:
       - "8000:8000"
+    environment:
+      LOCAL_SAVE_DIR: /downloads
+      LOCAL_SAVE_HOST_DIR: ./downloads
+    volumes:
+      - ./downloads:/downloads
     restart: unless-stopped
 ```
 
@@ -394,6 +402,11 @@ TLS передаются открыто — не публикуйте порт `
        restart: unless-stopped
        expose:
          - "8000"
+       environment:
+         LOCAL_SAVE_DIR: /downloads
+         LOCAL_SAVE_HOST_DIR: ./downloads
+       volumes:
+         - ./downloads:/downloads
      caddy:
        image: cromovsky/yandex-disk-copy-caddy:latest
        restart: unless-stopped
@@ -450,6 +463,12 @@ TLS передаются открыто — не публикуйте порт `
 3. Загрузите файл кнопкой-скрепкой.
 4. PATH и тип назначения общие для всего пакета; одновременно идут **5** переносов.
 5. В логе у каждой строки префикс `[N/M source → destination]`.
+
+### Локальное сохранение
+
+Кнопка **«Сохранить локально»** есть на вкладке **«Один диск»** (в обоих режимах). Она скачивает папку `PATH` источника на машину, с которой запущена утилита: `./downloads/<email>/…`, с теми же путями, что на Диске. `/` — весь Диск. Получатель, тип назначения и `VD_HASH` не нужны.
+
+Файлы пишутся не внутрь контейнера, а в каталог, проброшенный томом (`./downloads:/downloads` в compose, или `-v "$(pwd)/downloads:/downloads"` у `docker run`). Точный путь есть в логе, строка `save_local | на машине запуска`. Повторный запуск пропускает файл, который уже лежит локально и совпадает по размеру. Если том не примонтирован, в логе будет предупреждение, что файлы останутся внутри контейнера.
 
 Что происходит под капотом:
 

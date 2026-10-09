@@ -241,8 +241,8 @@
     .subtab-panel { display: none; }
     .subtab-panel.active { display: block; }
     .run-row { grid-column: 1 / -1; display: flex; justify-content: center;
-               margin: 4px 0 2px; }
-    .run-btn { width: auto; min-width: 320px; padding: 15px 56px; border-radius: 14px;
+               gap: 12px; flex-wrap: wrap; margin: 4px 0 2px; }
+    .run-btn { width: auto; min-width: 240px; padding: 15px 28px; border-radius: 14px;
            background: var(--accent-grad); color: #fff; font-size: 16px;
            font-weight: 700; box-shadow: 0 8px 22px rgba(15,106,230,.32);
            transition: filter .12s, box-shadow .12s, transform .08s; }
@@ -250,6 +250,9 @@
            box-shadow: 0 12px 28px rgba(15,106,230,.40); }
     .run-btn:active:not(:disabled) { transform: translateY(1px); }
     .run-btn:disabled { box-shadow: none; }
+    .run-btn.local { background: #fff; color: var(--accent-dark);
+      border: 1px solid var(--line); box-shadow: none; font-weight: 600; }
+    .run-btn.local:hover:not(:disabled) { background: #f2f6fd; filter: none; }
     .log-head { grid-column: 1 / -1; display: flex; align-items: baseline;
                 gap: 10px; flex-wrap: wrap; margin: 6px 4px -8px; }
     .log-title { font-size: 15px; font-weight: 700; color: var(--ink); }
@@ -516,7 +519,8 @@
         </div>
       </div>
       <div class="run-row">
-        <button id="run" class="run-btn">Запустить перенос</button>
+        <button id="run" class="run-btn" type="button">Запустить перенос</button>
+        <button id="run-local" class="run-btn local" type="button">Сохранить локально</button>
       </div>
     </div>
 
@@ -643,7 +647,8 @@
       </div>
 
       <div class="run-row">
-        <button id="run-cross" class="run-btn">Запустить перенос между организациями</button>
+        <button id="run-cross" class="run-btn" type="button">Запустить перенос между организациями</button>
+        <button id="run-local-cross" class="run-btn local" type="button">Сохранить локально</button>
       </div>
     </div>
 
@@ -655,7 +660,11 @@
       <strong>«Несколько дисков»</strong>. На <strong>личные Диски</strong> —
       шаблон пар <code>SOURCE;DESTINATION</code>; на <strong>общий диск</strong> —
       список источников и один сотрудник с правом записи + <code>vd_hash</code>
-      (до 25, по 5 переносов одновременно). Если сотрудник-источник
+      (до 25, по 5 переносов одновременно).
+      <strong>Сохранить локально</strong> скачивает папку <code>PATH</code> одного
+      источника в каталог <code data-local-hint>./downloads</code>/<code>&lt;email&gt;</code>
+      на машине, где запущена утилита (<code>/</code> — весь Диск). Получатель для
+      этого не нужен. Если сотрудник-источник
       заблокирован, он временно разблокируется на время переноса и блокируется обратно.
     </p>
 
@@ -1038,6 +1047,11 @@
       if (cfg.batch_max_pairs) BATCH_MAX = cfg.batch_max_pairs;
       if (cfg.batch_concurrency) BATCH_CONCURRENCY = cfg.batch_concurrency;
       if (cfg.target_rps) TARGET_RPS = cfg.target_rps;
+      if (cfg.local_save_host_dir) {
+        document.querySelectorAll("[data-local-hint]").forEach((el) => {
+          el.textContent = cfg.local_save_host_dir;
+        });
+      }
       document.querySelectorAll("[data-batch-max-label]").forEach((el) => {
         if (!el.dataset.fixed) {
           el.textContent = `Список пар SOURCE → DESTINATION (макс. ${BATCH_MAX})`;
@@ -1285,6 +1299,7 @@
         }
         syncSharedUi();
         updateRunLabel();
+        if (ids.localBtn && $(ids.localBtn)) $(ids.localBtn).hidden = on;
       }
 
       tabBtns.forEach((b) =>
@@ -1335,16 +1350,20 @@
       subtabs: "single", panel: "batch_panel", file: "batch_file",
       textarea: "batch_pairs", preview: "batch_preview",
       template: "batch_template", writerBlock: "batch_shared_writer",
+      localBtn: "run-local",
     }, $("run"), "Запустить перенос", getDestType);
 
     const batchCross = wireBatchMode({
       subtabs: "cross", panel: "x_batch_panel", file: "x_batch_file",
       textarea: "x_batch_pairs", preview: "x_batch_preview",
       template: "x_batch_template", writerBlock: "x_batch_shared_writer",
+      localBtn: "run-local-cross",
     }, $("run-cross"), "Запустить перенос между организациями", getCrossDestType);
 
     // общий запуск: собираем body по карте {ключ_API: id_поля}, шлём и стримим лог
-    async function startCopy(endpoint, fieldMap, button, extras, batchCtrl) {
+    async function startCopy(endpoint, fieldMap, button, extras, batchCtrl, options) {
+      const local = !!(options && options.local);
+      const lock = (options && options.lock) || [button];
       if (!consentAccepted()) { showConsent(); return; }
       const body = {};
       for (const [key, id] of Object.entries(fieldMap)) {
@@ -1354,8 +1373,11 @@
       Object.assign(body, extras || {});
       body.page_limit = parseInt(body.page_limit || "1000", 10);
 
-      const useBatch = batchCtrl && batchCtrl.isActive();
+      const useBatch = !local && batchCtrl && batchCtrl.isActive();
       let url = endpoint;
+      if (local) {
+        url = endpoint === "/api/run-cross" ? "/api/save-local-cross" : "/api/save-local";
+      }
       if (useBatch) {
         const got = batchCtrl.getPairs();
         if (got.error) { setStatus(got.error, "error"); return; }
@@ -1377,6 +1399,10 @@
       }
 
       const optional = new Set(["path", "page_limit", "destination_vd_hash", "pairs"]);
+      if (local) {
+        ["destination_disk_id", "dst_client_id", "dst_client_secret",
+         "destination_vd_hash", "destination_type"].forEach((key) => optional.add(key));
+      }
       if (body.destination_type !== "shared") optional.add("destination_vd_hash");
       if (useBatch) {
         optional.add("source_disk_id");
@@ -1388,14 +1414,18 @@
         if (useBatch && key === "destination_disk_id") continue;
         if (!body[key]) { setStatus("Заполните поле: " + key, "error"); return; }
       }
-      if (body.destination_type === "shared" && !body.destination_vd_hash) {
+      if (!local && body.destination_type === "shared" && !body.destination_vd_hash) {
         setStatus("Для общего диска укажите VD_HASH", "error");
         return;
       }
 
       logEl.textContent = "";
-      button.disabled = true;
-      setStatus(useBatch ? `Запуск пакета (${body.pairs.length})…` : "Запуск…", "running");
+      lock.forEach((b) => { b.disabled = true; });
+      setStatus(
+        local ? "Запуск локального сохранения…"
+          : (useBatch ? `Запуск пакета (${body.pairs.length})…` : "Запуск…"),
+        "running"
+      );
 
       let res;
       try {
@@ -1406,7 +1436,7 @@
         });
       } catch (e) {
         setStatus("Сеть недоступна: " + e, "error");
-        button.disabled = false; return;
+        lock.forEach((b) => { b.disabled = false; }); return;
       }
       if (!res.ok) {
         let detail = res.status;
@@ -1416,10 +1446,14 @@
             ? err.detail : JSON.stringify(err.detail);
         } catch (e) {}
         setStatus("Ошибка запуска: " + detail, "error");
-        button.disabled = false; return;
+        lock.forEach((b) => { b.disabled = false; }); return;
       }
       const { job_id } = await res.json();
-      setStatus(useBatch ? "Пакет выполняется…" : "Выполняется…", "running");
+      setStatus(
+        local ? "Сохраняю на машину запуска…"
+          : (useBatch ? "Пакет выполняется…" : "Выполняется…"),
+        "running"
+      );
 
       const es = new EventSource(`/api/run/${job_id}/stream`);
       es.onmessage = (e) => addLine(e.data);
@@ -1430,11 +1464,11 @@
         } else {
           setStatus("Готово ✓", "done");
         }
-        es.close(); button.disabled = false;
+        es.close(); lock.forEach((b) => { b.disabled = false; });
       });
       es.addEventListener("error", (e) => {
         if (e && e.data) { setStatus("Ошибка: " + e.data, "error"); es.close(); }
-        button.disabled = false;
+        lock.forEach((b) => { b.disabled = false; });
       });
     }
 
@@ -1445,7 +1479,14 @@
       destination_disk_id: "destination_disk_id",
       destination_vd_hash: "destination_vd_hash",
       path: "path", page_limit: "page_limit",
-    }, $("run"), { destination_type: getDestType() }, batchSingle));
+    }, $("run"), { destination_type: getDestType() }, batchSingle,
+       { lock: [$("run"), $("run-local")] }));
+
+    $("run-local").addEventListener("click", () => startCopy("/api/run", {
+      client_id: "client_id", client_secret: "client_secret", orgid: "orgid",
+      admin_token: "admin_token", source_disk_id: "source_disk_id",
+      path: "path", page_limit: "page_limit",
+    }, $("run-local"), {}, null, { local: true, lock: [$("run"), $("run-local")] }));
 
     // режим 2 — между организациями
     $("run-cross").addEventListener("click", () => startCopy("/api/run-cross", {
@@ -1456,7 +1497,16 @@
       destination_disk_id: "x_destination_disk_id",
       destination_vd_hash: "x_destination_vd_hash",
       path: "x_path", page_limit: "x_page_limit",
-    }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross));
+    }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross,
+       { lock: [$("run-cross"), $("run-local-cross")] }));
+
+    $("run-local-cross").addEventListener("click", () => startCopy("/api/run-cross", {
+      src_client_id: "x_src_client_id", src_client_secret: "x_src_client_secret",
+      src_orgid: "x_src_orgid", src_admin_token: "x_src_admin_token",
+      source_disk_id: "x_source_disk_id",
+      path: "x_path", page_limit: "x_page_limit",
+    }, $("run-local-cross"), {}, null,
+       { local: true, lock: [$("run-cross"), $("run-local-cross")] }));
   </script>
 </body>
 </html>

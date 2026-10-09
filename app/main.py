@@ -25,6 +25,11 @@ INSTRUCTION_MD = Path(__file__).parent.parent / "docs" / "INSTRUCTION.md"
 
 BATCH_MAX_PAIRS = 25
 BATCH_CONCURRENCY = 5
+# Куда писать локальное сохранение внутри процесса. На хост каталог попадает
+# томом ./downloads:/downloads (см. docker-compose). LOCAL_SAVE_HOST_DIR —
+# путь, который показываем в логе: его видит человек на машине запуска.
+LOCAL_SAVE_DIR = os.environ.get("LOCAL_SAVE_DIR", "./downloads")
+LOCAL_SAVE_HOST_DIR = os.environ.get("LOCAL_SAVE_HOST_DIR", "./downloads")
 
 app = FastAPI(title="Yandex Disk Copy")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -292,6 +297,7 @@ def config() -> dict:
         "batch_max_pairs": BATCH_MAX_PAIRS,
         "batch_concurrency": BATCH_CONCURRENCY,
         "target_rps": TARGET_RPS,
+        "local_save_host_dir": LOCAL_SAVE_HOST_DIR,
     }
 
 
@@ -467,6 +473,71 @@ def run_cross(req: RunCrossRequest) -> dict:
         destination_vd_hash=vd_hash,
     )
     return _start_job(cfg)
+
+
+class LocalSaveRequest(BaseModel):
+    """Скачать Диск источника на машину, с которой запущена утилита."""
+
+    client_id: str = Field(..., min_length=1)
+    client_secret: str = Field(..., min_length=1)
+    orgid: str = Field(..., min_length=1)
+    admin_token: str = Field(..., min_length=1)
+    source_disk_id: str = Field(..., min_length=1)
+    path: str = "/"
+    page_limit: int = Field(1000, ge=1)
+
+
+class LocalSaveCrossRequest(BaseModel):
+    """То же между организациями: нужны только реквизиты источника."""
+
+    src_client_id: str = Field(..., min_length=1)
+    src_client_secret: str = Field(..., min_length=1)
+    src_orgid: str = Field(..., min_length=1)
+    src_admin_token: str = Field(..., min_length=1)
+    source_disk_id: str = Field(..., min_length=1)
+    path: str = "/"
+    page_limit: int = Field(1000, ge=1)
+
+
+def _local_cfg(
+    source: OrgCreds, source_disk_id: str, path: str, page_limit: int
+) -> CopyConfig:
+    return CopyConfig(
+        source=source,
+        destination=source,
+        source_disk_id=source_disk_id.strip(),
+        destination_disk_id="",
+        path=path or "/",
+        page_limit=page_limit,
+        local_save=True,
+        local_root=LOCAL_SAVE_DIR,
+    )
+
+
+@app.post("/api/save-local")
+def save_local(req: LocalSaveRequest) -> dict:
+    creds = OrgCreds(
+        client_id=req.client_id,
+        client_secret=req.client_secret,
+        orgid=req.orgid,
+        admin_token=req.admin_token,
+    )
+    return _start_job(
+        _local_cfg(creds, req.source_disk_id, req.path, req.page_limit)
+    )
+
+
+@app.post("/api/save-local-cross")
+def save_local_cross(req: LocalSaveCrossRequest) -> dict:
+    creds = OrgCreds(
+        client_id=req.src_client_id,
+        client_secret=req.src_client_secret,
+        orgid=req.src_orgid,
+        admin_token=req.src_admin_token,
+    )
+    return _start_job(
+        _local_cfg(creds, req.source_disk_id, req.path, req.page_limit)
+    )
 
 
 @app.post("/api/run-batch")

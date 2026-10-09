@@ -35,6 +35,9 @@ class FakeResponse:
         for offset in range(0, len(data), step):
             yield data[offset : offset + step]
 
+    def close(self) -> None:
+        return None
+
     def json(self) -> Any:
         if self._payload is None:
             raise ValueError("ответ без JSON-тела")
