@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+import random
 import re
 import tempfile
 import time
@@ -24,7 +26,10 @@ from typing import Callable, Optional
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-from .throttle import ThrottledSession, get_limiter
+from .throttle import (
+    RETRY_STATUSES, ThrottledSession, backoff_delay, get_limiter,
+    retry_after_seconds,
+)
 
 
 def _parse_bool(raw: str | None) -> Optional[bool]:
@@ -77,6 +82,7 @@ def _build_session() -> requests.Session:
 # Сколько непереносённых файлов перечислять в логе поимённо: список нужен
 # для разбора, но при тысячах ошибок он вытеснит остальной лог из окна.
 FAILS_LOG_LIMIT = 50
+LOCAL_DOWNLOAD_RETRIES = 5
 # Прямое копирование тащит файл через процесс. Выше этого порога отказываемся,
 # чтобы один большой файл не съел память контейнера.
 DIRECT_COPY_MAX_BYTES = 512 * 1024 * 1024
@@ -175,6 +181,7 @@ class DiskCopier:
         # 429 и ретраи должны быть видны в SSE-логе браузера, а не выглядеть
         # для пользователя как «просто стало медленно»
         self.session.set_log(self.log)
+        self._download_session: Optional[requests.Session] = None
         self.source = _DiskAuth()
         self.destination = _DiskAuth()
         self.links: list[dict] = []
@@ -186,6 +193,8 @@ class DiskCopier:
     def close(self) -> None:
         """Отпускает пул соединений (в батче живёт до BATCH_CONCURRENCY копиров)."""
         self.session.close()
+        if self._download_session is not None:
+            self._download_session.close()
 
     def __enter__(self) -> "DiskCopier":
         return self
@@ -944,35 +953,71 @@ class DiskCopier:
         Ссылка на скачивание и само тело файла — GET, то есть читающие запросы:
         они идут в полосу 40 rps, а не в полосу изменения (5 rps).
         """
-        token = self._source_token()
-        href = self._owner_download_href(src_path, token=token)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        # API общего диска требует тот же OAuth-токен и для полученного URL.
-        kwargs = (
-            {"headers": {"Authorization": f"OAuth {token}"}}
-            if self._is_shared_source else {}
-        )
-        response = self.session.get(href, stream=True, **kwargs)
-        part = None
-        try:
-            if response.status_code != 200:
-                raise CopyError(
-                    f"Не удалось скачать {src_path}: {response.status_code} "
-                    f"{response.text[:200]}"
+        if self._download_session is None:
+            # Повторы всего файла считаем здесь; signed URL в общий лог не пишем.
+            self._download_session = ThrottledSession(get_limiter(), max_attempts=1)
+        for attempt in range(LOCAL_DOWNLOAD_RETRIES + 1):
+            response = part = None
+            status = retry_after = None
+            try:
+                token = self._source_token()
+                href = self._owner_download_href(src_path, token=token)
+                # API общего диска требует тот же OAuth-токен и для полученного URL.
+                kwargs = (
+                    {"headers": {"Authorization": f"OAuth {token}"}}
+                    if self._is_shared_source else {}
                 )
-            with tempfile.NamedTemporaryFile(
-                mode="wb", dir=dest.parent, prefix=".disk-copy-", suffix=".part",
-                delete=False,
-            ) as handle:
-                part = Path(handle.name)
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-            os.replace(part, dest)
-        finally:
-            response.close()
-            if part is not None and part.exists():
-                part.unlink()
+                response = self._download_session.get(href, stream=True, **kwargs)
+                status = response.status_code
+                if status != 200:
+                    error = CopyError(f"Не удалось скачать {src_path}: HTTP {status}")
+                    if status not in RETRY_STATUSES and status != 408:
+                        raise error
+                    reason = f"HTTP {status}"
+                    retry_after = retry_after_seconds(
+                        response.headers.get("Retry-After")
+                    )
+                else:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb", dir=dest.parent,
+                        prefix=".disk-copy-", suffix=".part",
+                        delete=False,
+                    ) as handle:
+                        part = Path(handle.name)
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                handle.write(chunk)
+                    os.replace(part, dest)
+                    return
+            except requests.exceptions.SSLError:
+                raise
+            except (
+                requests.Timeout, requests.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ContentDecodingError,
+            ) as exc:
+                error = exc
+                reason = type(exc).__name__
+            finally:
+                if response is not None:
+                    response.close()
+                if part is not None and part.exists():
+                    part.unlink()
+
+            if attempt == LOCAL_DOWNLOAD_RETRIES:
+                raise error
+            base_delay = backoff_delay(attempt + 2)
+            delay = base_delay + random.uniform(0, base_delay / 4)
+            if retry_after is not None and math.isfinite(retry_after):
+                delay = max(delay, retry_after)
+            if status == 429:
+                get_limiter().penalize(delay)
+            self.log(
+                f"save_local | {src_path} | {reason} | "
+                f"retry {attempt + 1}/{LOCAL_DOWNLOAD_RETRIES} через {delay:.1f} с"
+            )
+            self._sleep(delay)
 
     def save_local(self) -> None:
         """Скачивает дерево PATH на машину, с которой запущена утилита.

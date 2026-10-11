@@ -18,8 +18,11 @@ class FakeResponse:
         status_code: int = 200,
         payload: Optional[dict] = None,
         text: Optional[str] = None,
+        headers: Optional[dict] = None,
     ):
         self.status_code = status_code
+        self.headers = headers or {}
+        self.closed = False
         self._payload = payload
         if text is not None:
             self.text = text
@@ -36,7 +39,7 @@ class FakeResponse:
             yield data[offset : offset + step]
 
     def close(self) -> None:
-        return None
+        self.closed = True
 
     def json(self) -> Any:
         if self._payload is None:

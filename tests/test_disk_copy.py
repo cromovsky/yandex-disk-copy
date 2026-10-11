@@ -71,6 +71,7 @@ def make_copier(
         cfg, log=lambda _m: None, monotonic=clock.monotonic, sleep=clock.sleep
     )
     copier.session = session
+    copier._download_session = session
     far = datetime.now() + timedelta(hours=1)
     copier.source = _DiskAuth(token=source_token, expiry=far)
     copier.destination = _DiskAuth(token="dst-token", expiry=dest_expiry or far)
@@ -861,6 +862,168 @@ def test_save_local_rejects_parent_path(tmp_path):
     assert copier.links == []
     assert "Небезопасный путь" in copier.fails[0]["error"]
     assert not (tmp_path / "secret").exists()
+
+
+@pytest.mark.parametrize("source_type", ["personal", "shared"])
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_local_download_retries_temporary_status_with_fresh_link(
+    tmp_path, monkeypatch, source_type, status,
+):
+    session = _local_session(embedded([]))
+    link_route = VD_DOWNLOAD_URL if source_type == "shared" else DOWNLOAD_HREF_URL
+    session.routes[("GET", link_route)] = [
+        FakeResponse(200, payload={"href": "https://downloader/file?sig=first"}),
+        FakeResponse(200, payload={"href": "https://downloader/file?sig=second"}),
+    ]
+    failed, success = FakeResponse(status), FakeResponse(200, text="hello")
+    session.routes[("GET", "https://downloader/file")] = [failed, success]
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    copier.cfg.source_type = source_type
+    copier.cfg.source_vd_hash = "shared-hash"
+    monkeypatch.setattr("app.disk_copy.random.uniform", lambda a, b: 0)
+    monkeypatch.setattr("app.disk_copy.get_limiter", lambda: type(
+        "Limiter", (), {"penalize": lambda self, delay: delay},
+    )())
+    logs = []
+    copier._log = logs.append
+
+    dest = tmp_path / "a.txt"
+    copier._download_to_path("disk:/a.txt", dest)
+
+    assert dest.read_bytes() == b"hello"
+    assert clock.sleeps == [2]
+    downloads = session.calls_to("https://downloader/file")
+    assert [call.url for call in downloads] == [
+        "https://downloader/file?sig=first", "https://downloader/file?sig=second",
+    ]
+    assert [call.headers for call in downloads] == (
+        [{"Authorization": "OAuth t.uid-42.sig"}] * 2
+        if source_type == "shared" else [None, None]
+    )
+    assert failed.closed and success.closed
+    assert not list(tmp_path.glob(".disk-copy-*.part"))
+    assert "retry 1/5" in "\n".join(logs)
+    assert "sig=" not in "\n".join(logs)
+
+
+def test_local_download_stops_after_five_retries_and_continues_next_file(
+    tmp_path, monkeypatch,
+):
+    session = _local_session(embedded([
+        {"path": "disk:/a.txt", "type": "file", "size": 5},
+        {"path": "disk:/b.txt", "type": "file", "size": 5},
+    ]))
+    session.routes[("GET", DOWNLOAD_HREF_URL)] = [
+        *[FakeResponse(200, payload={"href": "https://downloader/a"})
+          for _ in range(6)],
+        FakeResponse(200, payload={"href": "https://downloader/b"}),
+    ]
+    session.routes[("GET", "https://downloader/a")] = FakeResponse(503)
+    session.routes[("GET", "https://downloader/b")] = FakeResponse(200, text="hello")
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    copier.cfg.local_root = str(tmp_path)
+    monkeypatch.setattr("app.disk_copy.random.uniform", lambda a, b: 0)
+    base = tmp_path / "src@company.ru"
+    base.mkdir()
+    (base / "a.txt").write_bytes(b"old")
+    (base / "a.txt.part").write_bytes(b"user data")
+
+    copier.save_local()
+
+    assert clock.sleeps == [2, 4, 8, 16, 32]
+    assert len(session.calls_to("https://downloader/a")) == 6
+    assert len(copier.fails) == len(copier.links) == 1
+    assert (base / "a.txt").read_bytes() == b"old"
+    assert (base / "a.txt.part").read_bytes() == b"user data"
+    assert (base / "b.txt").read_bytes() == b"hello"
+
+
+@pytest.mark.parametrize("exception", [
+    requests.Timeout, requests.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+])
+def test_local_download_restarts_interrupted_stream_atomically(
+    tmp_path, monkeypatch, exception,
+):
+    dest = tmp_path / "a.txt"
+    dest.write_bytes(b"old")
+
+    class InterruptedResponse(FakeResponse):
+        def iter_content(self, chunk_size):
+            yield b"partial"
+            assert dest.read_bytes() == b"old"
+            raise exception("https://downloader/file?sig=secret")
+
+    session = _local_session(embedded([]))
+    failed, success = InterruptedResponse(), FakeResponse(200, text="hello")
+    session.routes[("GET", "https://downloader/file")] = [failed, success]
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    monkeypatch.setattr("app.disk_copy.random.uniform", lambda a, b: 0)
+    logs = []
+    copier._log = logs.append
+
+    copier._download_to_path("disk:/a.txt", dest)
+
+    assert dest.read_bytes() == b"hello"
+    assert clock.sleeps == [2]
+    assert failed.closed and success.closed
+    assert not list(tmp_path.glob(".disk-copy-*.part"))
+    assert "sig=secret" not in "\n".join(logs)
+
+
+@pytest.mark.parametrize("header,expected", [("15", 15), ("0", 2), ("inf", 2)])
+def test_local_download_respects_retry_after_without_unbounded_sleep(
+    tmp_path, monkeypatch, header, expected,
+):
+    session = _local_session(embedded([]))
+    session.routes[("GET", "https://downloader/file")] = [
+        FakeResponse(503, headers={"Retry-After": header}),
+        FakeResponse(200, text="hello"),
+    ]
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    monkeypatch.setattr("app.disk_copy.random.uniform", lambda a, b: 0)
+
+    copier._download_to_path("disk:/a.txt", tmp_path / "a.txt")
+
+    assert clock.sleeps == [expected]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 416])
+def test_local_download_does_not_retry_permanent_http_error(tmp_path, status):
+    session = _local_session(embedded([]))
+    session.routes[("GET", "https://downloader/file")] = FakeResponse(
+        status, text="https://downloader/file?sig=secret",
+    )
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    with pytest.raises(CopyError) as error:
+        copier._download_to_path("disk:/a.txt", tmp_path / "a.txt")
+    assert clock.sleeps == []
+    assert len(session.calls_to("https://downloader/file")) == 1
+    assert "sig=secret" not in str(error.value)
+
+
+def test_local_byte_session_disables_inner_retries_and_closes(tmp_path, monkeypatch):
+    session = _local_session(embedded([]))
+    copier = make_copier(session)
+    copier._download_session = None
+    monkeypatch.setattr(
+        "app.disk_copy.ThrottledSession.get", lambda *a, **kw: FakeResponse(200),
+    )
+    copier._download_to_path("disk:/a.txt", tmp_path / "a.txt")
+    byte_session = copier._download_session
+    assert byte_session._max_attempts == 1
+    assert byte_session.get_adapter("https://downloader/file").max_retries.total == 0
+    assert byte_session._limiter is get_limiter()
+    closed = []
+    monkeypatch.setattr(byte_session, "close", lambda: closed.append(True))
+    copier.close()
+    assert closed == [True]
 
 
 def test_run_local_does_not_call_save_to_disk(tmp_path):
