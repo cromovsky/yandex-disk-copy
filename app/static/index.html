@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Перенос файлов между Дисками сотрудников</title>
+  <title>Перенос и локальное сохранение файлов Диска</title>
   <link rel="icon" type="image/png" href="/static/logo.png">
   <script>
     // ранняя установка темы, чтобы не было вспышки светлого фона
@@ -50,7 +50,9 @@
                 border: 1px solid #eceef1; border-radius: 14px; color: var(--ink-soft);
                 font-size: 14px; font-weight: 700; box-shadow: 0 2px 10px rgba(52,52,60,.04);
                 transition: color .12s, border-color .12s, background .12s; }
-    .mode-tab:hover:not(.active) { color: var(--ink); }
+    .mode-tab:hover:not(.active):not(:disabled) { color: var(--ink); }
+    .mode-tab:disabled { background: #e8eaee; color: #8c9099;
+                         border-color: #dfe2e7; box-shadow: none; opacity: 1; }
     .mode-tab.active { color: #fff; background: var(--accent-grad);
                        border-color: transparent; box-shadow: 0 8px 18px rgba(15,106,230,.28); }
     .mode-panel { display: none; flex-direction: column; gap: 20px; }
@@ -133,7 +135,8 @@
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
     /* отрендеренный markdown инструкции */
-    .md-body { font-size: 13px; line-height: 1.6; color: #2b2f36; }
+    .md-body { font-size: 13px; line-height: 1.6; color: #2b2f36;
+               overflow-wrap: anywhere; }
     .md-body h1 { font-size: 19px; margin: 0 0 10px; color: #1a1a1a; }
     .md-body h2 { font-size: 16px; margin: 22px 0 8px; color: #1a1a1a;
                   border-top: 1px solid #eceef1; padding-top: 16px; }
@@ -141,7 +144,7 @@
     .md-body p { margin: 8px 0; }
     .md-body ul, .md-body ol { margin: 6px 0; padding-left: 22px; }
     .md-body li { margin: 3px 0; }
-    .md-body a { color: var(--accent-dark); font-weight: 600; word-break: break-all; }
+    .md-body a { color: var(--accent-dark); font-weight: 600; }
     .md-body code { background: #f1f2f5; color: #0a5fca; padding: 1px 5px;
                     border-radius: 4px; font-size: 12px;
                     font-family: ui-monospace, Menlo, monospace; }
@@ -158,6 +161,7 @@
     .md-body th, .md-body td { text-align: left; padding: 6px 8px;
                               border: 1px solid #e3e5ea; vertical-align: top; }
     .md-body th { background: #f7f8fa; color: #1a1a1a; }
+    .md-body th:first-child { min-width: 100px; }
     .card { background: #fff; border: 1px solid #eceef1; border-radius: 20px;
             padding: 24px; box-shadow: 0 4px 20px rgba(52,52,60,.05); }
     .card-title { font-size: 15px; font-weight: 700; color: var(--ink); }
@@ -250,9 +254,6 @@
            box-shadow: 0 12px 28px rgba(15,106,230,.40); }
     .run-btn:active:not(:disabled) { transform: translateY(1px); }
     .run-btn:disabled { box-shadow: none; }
-    .run-btn.local { background: #fff; color: var(--accent-dark);
-      border: 1px solid var(--line); box-shadow: none; font-weight: 600; }
-    .run-btn.local:hover:not(:disabled) { background: #f2f6fd; filter: none; }
     .log-head { grid-column: 1 / -1; display: flex; align-items: baseline;
                 gap: 10px; flex-wrap: wrap; margin: 6px 4px -8px; }
     .log-title { font-size: 15px; font-weight: 700; color: var(--ink); }
@@ -386,11 +387,97 @@
     [data-theme="dark"] .modal .close { color: #9a9ca6; }
     /* вкладки режимов на тёмном */
     [data-theme="dark"] .mode-tab { background: #1c1f26; border-color: #2b303a; }
+    [data-theme="dark"] .mode-tab:disabled { background: #252830;
+      color: #787d88; border-color: #30343e; }
     /* подсказка про copy-by-click — читаемая на тёмном */
     [data-theme="dark"] .copy-hint { background: #17263a; color: #a9c6ea; }
     /* логотип: плитка под белую окантовку, чтобы не торчала на тёмном фоне */
     [data-theme="dark"] .hero .logo { background: #eef2f7; border-radius: 12px;
                                       padding: 5px; box-sizing: content-box; }
+    .mode-tab[hidden], #mode-onprem[hidden], #mode-onprem [hidden],
+    [data-legacy-output][hidden] { display: none !important; }
+    #mode-onprem select, #mode-onprem textarea {
+      width: 100%; padding: 11px 13px; border: 1px solid var(--line);
+      border-radius: 12px; font: inherit; font-size: 14px;
+      background: #fbfbfc; color: var(--ink);
+    }
+    #mode-onprem select:focus, #mode-onprem textarea:focus {
+      outline: none; border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(15,127,240,.18);
+    }
+    #mode-onprem textarea { resize: vertical; min-height: 80px; }
+    #mode-onprem .card { min-width: 0; }
+    .onprem-section { border-top: 1px solid var(--line); padding-top: 18px; }
+    .onprem-section h2 { font-size: 15px; line-height: 1.4; margin: 0 0 12px; }
+    .onprem-warning { margin: 0; padding: 10px 12px; border-left: 3px solid #d08700;
+      background: #fff7dc; color: #74500c; border-radius: 0 6px 6px 0;
+      font-size: 13px; line-height: 1.5; }
+    .onprem-check { display: flex; gap: 10px; align-items: flex-start;
+      margin: 14px 0; color: var(--ink); font-size: 13px; line-height: 1.5; }
+    .onprem-check input { width: 18px; height: 18px; flex: 0 0 18px;
+      margin: 1px 0 0; accent-color: var(--accent); }
+    .onprem-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+      margin: 12px 0; }
+    .onprem-actions .secondary-btn { flex: 0 1 auto; min-width: 0; padding: 8px 14px; }
+    .onprem-actions select { width: auto !important; max-width: 100%; min-height: 42px; }
+    .onprem-history { display: flex; flex-direction: column; gap: 8px; }
+    .onprem-history > div { min-width: 0; width: 100%; }
+    .onprem-history-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .onprem-history .secondary-btn { flex: 0 0 42px; min-width: 42px; width: 42px;
+      height: 42px; font-size: 22px; padding: 0; }
+    #onprem-history-page { flex: 1 1 100px; margin: 0; }
+    .onprem-summary { display: flex; flex-wrap: wrap; gap: 12px 24px;
+      margin: 12px 0; font-size: 13px; }
+    .onprem-summary > div { min-width: 100px; }
+    .onprem-summary dt { color: var(--ink-soft); }
+    .onprem-summary dd { margin: 4px 0 0; font-weight: 600; overflow-wrap: anywhere; }
+    .onprem-path { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+      overflow-wrap: anywhere; white-space: pre-wrap; }
+    .onprem-table-wrap { overflow-x: auto; border: 1px solid var(--line);
+      border-radius: 6px; margin-top: 14px; }
+    .onprem-table { border-collapse: collapse; width: 100%; min-width: 700px;
+      table-layout: fixed; font-size: 12px; }
+    .onprem-table th, .onprem-table td { text-align: left; vertical-align: top;
+      padding: 10px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+    .onprem-table th { color: var(--ink-soft); font-weight: 600; }
+    .onprem-table th:nth-child(1), .onprem-table th:nth-child(2) { width: 25%; }
+    .onprem-table th:nth-child(3) { width: 10%; }
+    .onprem-table th:nth-child(4) { width: 18%; }
+    .onprem-table tbody tr:last-child td { border-bottom: 0; }
+    .onprem-table .onprem-result { display: block; font-weight: 600; margin-bottom: 4px; }
+    .onprem-result.good { color: #15803d; }
+    .onprem-result.bad { color: #dc2626; }
+    .onprem-result.attention { color: #996200; }
+    #onprem-notice, #onprem-poll-notice { margin: 0; min-height: 22px; font-size: 13px; line-height: 1.5; }
+    #onprem-notice.error, #onprem-poll-notice.error { color: #dc2626; }
+    #onprem-log { min-height: 100px; max-height: 260px; overflow: auto;
+      margin: 0; padding: 12px 0; white-space: pre-wrap; overflow-wrap: anywhere;
+      font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.6; }
+    #onprem-remote-attempts { margin: 8px 0; }
+    [data-theme="dark"] #mode-onprem select,
+    [data-theme="dark"] #mode-onprem textarea { background: #23272f; color: var(--ink); }
+    [data-theme="dark"] .onprem-warning { background: #332b17; color: #f1cf7e; }
+    [data-theme="dark"] .onprem-result.good { color: #79ce92; }
+    [data-theme="dark"] .onprem-result.bad { color: #ff9a9a; }
+    [data-theme="dark"] .onprem-result.attention { color: #f1cf7e; }
+    [data-theme="dark"] #onprem-notice.error,
+    [data-theme="dark"] #onprem-poll-notice.error { color: #ff9a9a; }
+    @media (max-width: 650px) {
+      .hero { display: grid; grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px; padding: 18px; }
+      .hero .logo { height: 44px; max-width: 100%; grid-column: 1; grid-row: 1;
+        justify-self: start; }
+      .hero .hero-actions { grid-column: 2; grid-row: 1; }
+      .hero .titles { grid-column: 1 / -1; grid-row: 2; }
+      .hero h1 { font-size: 22px; line-height: 1.3; letter-spacing: 0; }
+      .mode-tabs { flex-wrap: wrap; }
+      .mode-tab { flex-basis: 100%; }
+      #mode-onprem .row { grid-template-columns: minmax(0, 1fr); }
+      #mode-onprem .card { padding: 18px; }
+      #mode-onprem .run-btn { min-width: 0; width: 100%; }
+      .onprem-actions .secondary-btn { flex: 1 1 auto; }
+      .onprem-summary { gap: 12px; }
+    }
   </style>
 </head>
 <body>
@@ -398,8 +485,8 @@
     <div class="hero">
       <img class="logo" src="/static/logo-mark.png" alt="Логотип">
       <div class="titles">
-        <h1>Перенос файлов между Дисками сотрудников</h1>
-        <p class="subtitle">Копирование файлов между Дисками сотрудников Яндекс&nbsp;360</p>
+        <h1>Перенос и локальное сохранение файлов</h1>
+        <p class="subtitle">Диски сотрудников и общие диски Яндекс&nbsp;360</p>
       </div>
       <div class="hero-actions">
         <button id="theme-btn" class="help-btn"
@@ -412,6 +499,8 @@
     <div class="mode-tabs">
       <button class="mode-tab active" data-mode="single">Одна организация</button>
       <button class="mode-tab" data-mode="cross">Между организациями</button>
+      <button class="mode-tab" data-mode="local">Сохранить локально</button>
+      <button class="mode-tab" data-mode="onprem" disabled title="В разработке">SaaS → On-premises</button>
     </div>
 
     <div id="mode-single" class="mode-panel active">
@@ -440,7 +529,7 @@
           </div>
 
           <div id="single_pair_fields" class="subtab-panel active" data-subtab-panel="one">
-            <label>SOURCE (email — откуда копируем)</label>
+            <label id="source_label" for="source_disk_id">SOURCE (email — откуда копируем)</label>
             <input id="source_disk_id" autocomplete="off" placeholder="user@company.ru">
 
             <label id="destination_label">DESTINATION (email — куда копируем)</label>
@@ -518,9 +607,17 @@
                  title="Размер страницы при обходе папки: сколько элементов запрашивается у API за один запрос. НЕ ограничивает число копируемых файлов — обрабатываются все, порциями. По умолчанию 1000.">
         </div>
       </div>
+      <p class="hint">
+        На <strong>личный Диск</strong> файлы сохраняются в папку по email источника
+        с оригинальными именами. На <strong>общий диск</strong> — в папку с тем же
+        именем на выбранном общем диске (нужны метка <code>vd_hash</code> и сотрудник
+        с правом записи). Для пакетного переноса откройте вкладку
+        <strong>«Несколько дисков»</strong>: до 25 источников, по 5 переносов одновременно.
+        Если сотрудник-источник заблокирован, он временно разблокируется
+        на время переноса и блокируется обратно.
+      </p>
       <div class="run-row">
         <button id="run" class="run-btn" type="button">Запустить перенос</button>
-        <button id="run-local" class="run-btn local" type="button">Сохранить локально</button>
       </div>
     </div>
 
@@ -563,7 +660,7 @@
         <div id="x_single_pair_fields" class="subtab-panel active" data-subtab-panel="one">
           <div class="row">
             <div>
-              <label>SOURCE (email — откуда копируем)</label>
+              <label id="x_source_label" for="x_source_disk_id">SOURCE (email — откуда копируем)</label>
               <input id="x_source_disk_id" autocomplete="off" placeholder="user@company1.ru">
             </div>
             <div>
@@ -646,34 +743,263 @@
         </div>
       </div>
 
+      <p class="hint">
+        На <strong>личный Диск</strong> файлы сохраняются в папку по email источника
+        с оригинальными именами. На <strong>общий диск</strong> — в папку с тем же
+        именем на выбранном общем диске (нужны метка <code>vd_hash</code> и сотрудник
+        с правом записи). Для пакетного переноса откройте вкладку
+        <strong>«Несколько дисков»</strong>: до 25 источников, по 5 переносов одновременно.
+        Если сотрудник-источник заблокирован, он временно разблокируется
+        на время переноса и блокируется обратно.
+      </p>
       <div class="run-row">
         <button id="run-cross" class="run-btn" type="button">Запустить перенос между организациями</button>
-        <button id="run-local-cross" class="run-btn local" type="button">Сохранить локально</button>
       </div>
     </div>
 
-    <p class="hint">
-      На <strong>личный Диск</strong> файлы сохраняются в папку по email источника
-      с оригинальными именами. На <strong>общий диск</strong> — в папку с тем же
-      именем на выбранном общем диске (нужна метка <code>vd_hash</code> и сотрудник
-      с правом записи). Для пакетного переноса откройте вкладку
-      <strong>«Несколько дисков»</strong>. На <strong>личные Диски</strong> —
-      шаблон пар <code>SOURCE;DESTINATION</code>; на <strong>общий диск</strong> —
-      список источников и один сотрудник с правом записи + <code>vd_hash</code>
-      (до 25, по 5 переносов одновременно).
-      <strong>Сохранить локально</strong> скачивает папку <code>PATH</code> одного
-      источника в каталог <code data-local-hint>./downloads</code>/<code>&lt;email&gt;</code>
-      на машине, где запущена утилита (<code>/</code> — весь Диск). Получатель для
-      этого не нужен. Если сотрудник-источник
-      заблокирован, он временно разблокируется на время переноса и блокируется обратно.
-    </p>
+    <div id="mode-local" class="mode-panel">
+      <div class="forms">
+        <div class="card">
+          <div class="card-title">Организация источника</div>
+          <label for="local_client_id">CLIENT_ID</label>
+          <input id="local_client_id" autocomplete="off" placeholder="id сервисного приложения">
+          <label for="local_client_secret">CLIENT_SECRET</label>
+          <input id="local_client_secret" type="password" autocomplete="off">
+          <label for="local_orgid">ORGID</label>
+          <input id="local_orgid" autocomplete="off" placeholder="ID организации источника">
+          <label for="local_admin_token">ADMIN_TOKEN</label>
+          <input id="local_admin_token" type="password" autocomplete="off"
+                 placeholder="токен с правами на сотрудников">
+          <p class="field-note">
+            Укажите доступы организации, с Диска которой нужно сохранить файлы.
+          </p>
+        </div>
 
-    <div class="log-head">
+        <div class="card">
+          <div class="card-title">Что сохраняем</div>
+          <label>Тип диска</label>
+          <div class="dest-type" role="radiogroup" aria-label="Тип диска для локального сохранения">
+            <label class="chip">
+              <input type="radio" name="local_source_type" value="personal" checked>
+              Личный Диск
+            </label>
+            <label class="chip">
+              <input type="radio" name="local_source_type" value="shared">
+              Общий диск
+            </label>
+          </div>
+
+          <label id="local_source_label" for="local_source_disk_id">SOURCE (email владельца личного Диска)</label>
+          <input id="local_source_disk_id" type="email" autocomplete="off" placeholder="user@company.ru">
+
+          <div id="local_source_shared_fields" class="local-source-shared-fields" hidden>
+            <label for="local_source_vd_hash">SOURCE_VD_HASH (метка общего диска)</label>
+            <input id="local_source_vd_hash" autocomplete="off"
+                   placeholder="метка после vd/ или целиком URL">
+            <p class="field-note">
+              Откройте общий диск в браузере: в адресе будет
+              <code>.../vd/&lt;метка&gt;/...</code>. Вставьте метку или весь URL.
+              В SOURCE укажите email сотрудника с доступом к этому диску.
+            </p>
+          </div>
+
+          <label for="local_path">PATH (папка)</label>
+          <input id="local_path" value="/">
+          <p class="field-note">
+            Путь внутри выбранного диска. <code>/</code> сохраняет весь диск.
+          </p>
+          <details>
+            <summary>Дополнительные настройки</summary>
+            <label for="local_page_limit">PAGE_LIMIT</label>
+            <input id="local_page_limit" type="number" min="1" max="1000" value="1000">
+            <p class="field-note">
+              Число элементов в одном запросе при обходе папок.
+              Все файлы сохраняются независимо от размера страницы.
+            </p>
+          </details>
+        </div>
+      </div>
+      <p class="hint">
+        Файлы сохраняются на машине, где запущена утилита.
+        Личный Диск — в <code data-local-hint>./downloads</code>/<code>&lt;email&gt;</code>,
+        общий диск — в <code data-local-hint>./downloads</code>/<code>shared/&lt;метка&gt;</code>.
+        В стандартном Docker Compose это папка <code>downloads</code> проекта на машине запуска.
+        Если сотрудник-источник заблокирован, утилита временно разблокирует его
+        и вернёт блокировку после завершения.
+      </p>
+      <div class="run-row">
+        <button id="run-local" class="run-btn" type="button">Сохранить локально</button>
+      </div>
+    </div>
+
+    <div id="mode-onprem" class="mode-panel" hidden>
+      <p class="onprem-warning">Пилотный режим. Совместимость и безопасная финализация должны быть подтверждены на стенде.</p>
+
+      <div id="onprem-access" class="onprem-section" hidden>
+        <label for="onprem-access-key">Ключ доступа к режиму on-premises</label>
+        <input id="onprem-access-key" type="password" autocomplete="new-password">
+      </div>
+
+      <form id="onprem-form" autocomplete="off">
+        <div class="forms">
+          <div class="card">
+            <div class="card-title">Источник — SaaS</div>
+            <label for="onprem-source-org">ID организации</label>
+            <input id="onprem-source-org" data-onprem-config="source_org_id" required autocomplete="off">
+            <label for="onprem-source-client">Client ID сервисного приложения</label>
+            <input id="onprem-source-client" data-onprem-config="source_client_id" required autocomplete="off">
+            <label for="onprem-source-secret">Client secret</label>
+            <input id="onprem-source-secret" type="password" required autocomplete="new-password">
+            <label for="onprem-source-email">Email сотрудника</label>
+            <input id="onprem-source-email" data-onprem-config="source_email" type="email" required autocomplete="off">
+            <label for="onprem-source-path">Исходный путь</label>
+            <input id="onprem-source-path" data-onprem-config="source_path" value="/" required autocomplete="off">
+          </div>
+          <div class="card">
+            <div class="card-title">Получатель — On-premises</div>
+            <label for="onprem-destination-url">Адрес API</label>
+            <input id="onprem-destination-url" data-onprem-config="destination_url" type="url" required autocomplete="off" placeholder="https://disk-api.company.ru">
+            <label for="onprem-destination-identity">Владелец токена назначения</label>
+            <input id="onprem-destination-identity" data-onprem-config="destination_identity" required autocomplete="off" placeholder="Логин или email получателя">
+            <label for="onprem-destination-token">OAuth-токен получателя</label>
+            <input id="onprem-destination-token" type="password" required autocomplete="new-password">
+            <label for="onprem-destination-root">Папка назначения</label>
+            <input id="onprem-destination-root" data-onprem-config="destination_root" required autocomplete="off" placeholder="disk:/source@company.ru">
+            <label for="onprem-strategy">Способ переноса</label>
+            <select id="onprem-strategy" data-onprem-config="strategy">
+              <option value="url" selected>Напрямую по ссылке</option>
+              <option value="staged">С временным сохранением</option>
+            </select>
+          </div>
+        </div>
+        <label class="onprem-check" for="onprem-identity-confirmed">
+          <input id="onprem-identity-confirmed" type="checkbox" required>
+          <span>Подтверждаю привязку токена к указанному получателю. При повторном предоставлении доступа владелец токена проверен заново.</span>
+        </label>
+        <div class="run-row">
+          <button id="onprem-plan" class="run-btn" type="submit" disabled>Подготовить план</button>
+        </div>
+      </form>
+
+      <p id="onprem-notice" role="status" aria-live="polite"></p>
+      <p id="onprem-poll-notice" class="error" role="status" aria-live="polite" hidden></p>
+
+      <section class="onprem-section">
+        <div class="onprem-history">
+          <div>
+            <label for="onprem-history">История заданий</label>
+            <select id="onprem-history"><option value="">Выберите задание</option></select>
+          </div>
+          <div class="onprem-history-controls">
+            <button id="onprem-history-newer" class="secondary-btn" type="button" title="Более новые задания" aria-label="Более новые задания" disabled>←</button>
+            <span id="onprem-history-page" class="field-note">Страница 1</span>
+            <button id="onprem-history-older" class="secondary-btn" type="button" title="Более старые задания" aria-label="Более старые задания" disabled>→</button>
+            <button id="onprem-refresh" class="secondary-btn" type="button" title="Обновить задания" aria-label="Обновить задания">↻</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="onprem-job" class="onprem-section" hidden>
+        <h2>Задание <span id="onprem-job-id" class="onprem-path"></span></h2>
+        <dl class="onprem-summary">
+          <div><dt>Состояние</dt><dd id="onprem-job-state"></dd></div>
+          <div><dt>Объекты</dt><dd id="onprem-job-counts"></dd></div>
+          <div><dt>Проверено байтов</dt><dd id="onprem-job-bytes"></dd></div>
+        </dl>
+        <div id="onprem-job-blocked" role="status" hidden>
+          <p id="onprem-job-blocked-reason" class="onprem-result attention"></p>
+          <p id="onprem-job-blocked-holder" class="onprem-path"></p>
+          <div class="onprem-actions">
+            <button id="onprem-open-blocker" class="secondary-btn" type="button" disabled>Открыть блокирующее задание</button>
+          </div>
+        </div>
+        <p id="onprem-job-error" class="onprem-warning" hidden></p>
+        <p id="onprem-job-pause" class="field-note" hidden>Пауза запрошена. Текущая операция ещё выполняется.</p>
+        <p id="onprem-job-stop" class="onprem-warning" role="status" hidden></p>
+        <p class="field-note">Каталог технических попыток</p>
+        <div id="onprem-remote-root" class="onprem-path"></div>
+        <div class="onprem-actions">
+          <button id="onprem-start" class="secondary-btn" type="button" disabled>Начать перенос</button>
+          <button id="onprem-pause" class="secondary-btn" type="button" disabled>Пауза</button>
+          <button id="onprem-resume" class="secondary-btn" type="button" disabled>Продолжить</button>
+          <button id="onprem-stop" class="secondary-btn" type="button" disabled>Остановить</button>
+          <button id="onprem-restart" class="secondary-btn" type="button" disabled>Повторить перенос заново</button>
+          <button id="onprem-credentials" class="secondary-btn" type="button" disabled>Предоставить доступ</button>
+          <button id="onprem-report" class="secondary-btn" type="button" disabled>Скачать CSV</button>
+        </div>
+        <div class="onprem-actions">
+          <label for="onprem-retry-strategy">Повтор ошибок</label>
+          <select id="onprem-retry-strategy" aria-label="Способ повтора ошибок">
+            <option value="url">Напрямую по ссылке</option>
+            <option value="staged">С временным сохранением</option>
+          </select>
+          <button id="onprem-retry" class="secondary-btn" type="button" disabled>Повторить ошибки</button>
+        </div>
+        <div class="onprem-table-wrap">
+          <table class="onprem-table">
+            <thead><tr><th>Источник</th><th>Назначение</th><th>Размер</th><th>MD5</th><th>Результат</th></tr></thead>
+            <tbody id="onprem-entry-body"><tr><td colspan="5">План ещё не готов</td></tr></tbody>
+          </table>
+        </div>
+        <p id="onprem-entry-count" class="field-note"></p>
+        <div class="onprem-actions">
+          <button id="onprem-entry-previous" class="secondary-btn" type="button" title="Предыдущая страница плана" aria-label="Предыдущая страница плана" disabled>←</button>
+          <span id="onprem-entry-page" class="field-note"></span>
+          <button id="onprem-entry-next" class="secondary-btn" type="button" title="Следующая страница плана" aria-label="Следующая страница плана" disabled>→</button>
+        </div>
+      </section>
+
+      <section id="onprem-resolve-panel" class="onprem-section" hidden>
+        <h2 id="onprem-resolve-title">Неопределённый исход операции</h2>
+        <p id="onprem-resolve-warning" class="onprem-warning">Повтор этой попытки заблокирован. Укажите восстановленный ID операции или терминальный результат по серверным журналам администратора. Таймаут и отсутствие файла не подтверждают завершение.</p>
+        <label for="onprem-resolve-attempt">Попытка</label>
+        <select id="onprem-resolve-attempt"></select>
+        <div class="row">
+          <div>
+            <label for="onprem-resolve-operation">Восстановленный ID операции</label>
+            <input id="onprem-resolve-operation" autocomplete="off" placeholder="ID или ?id=ID" maxlength="260">
+          </div>
+          <div>
+            <label for="onprem-resolve-status">Результат по журналам администратора</label>
+            <select id="onprem-resolve-status">
+              <option value="">Не установлен</option>
+              <option value="success">Успешно завершена</option>
+              <option value="failed">Завершилась ошибкой</option>
+            </select>
+          </div>
+        </div>
+        <label for="onprem-resolve-evidence">Подтверждение по серверным журналам, минимум 20 символов, без токенов и ссылок</label>
+        <textarea id="onprem-resolve-evidence" autocomplete="off" minlength="20" maxlength="1000"></textarea>
+        <label class="onprem-check" for="onprem-resolve-confirmed">
+          <input id="onprem-resolve-confirmed" type="checkbox">
+          <span>Подтверждаю установленный исход и отсутствие продолжающейся операции для терминального решения.</span>
+        </label>
+        <div class="onprem-actions">
+          <button id="onprem-resolve" class="secondary-btn" type="button" disabled>Сохранить проверенный исход</button>
+        </div>
+      </section>
+
+      <section id="onprem-cleanup-panel" class="onprem-section" hidden>
+        <h2>Временные файлы</h2>
+        <div class="onprem-actions">
+          <button id="onprem-cleanup" class="secondary-btn" type="button" disabled>Очистить локальные файлы</button>
+        </div>
+        <p id="onprem-cleanup-result" class="field-note"></p>
+        <div id="onprem-remote-attempts" class="onprem-path"></div>
+      </section>
+
+      <section id="onprem-log-panel" class="onprem-section" hidden>
+        <h2>Журнал задания</h2>
+        <pre id="onprem-log" aria-live="polite"></pre>
+      </section>
+    </div>
+
+    <div class="log-head" data-legacy-output>
       <span class="log-title">Журнал выполнения</span>
       <span class="log-sub">пошаговый лог появится здесь после запуска</span>
     </div>
-    <div id="status" class="status"></div>
-    <div id="log" data-empty="Здесь появится лог: получение токенов → проверка статуса сотрудника → сверка свободного места → публикация и сохранение файлов. Запустите копирование, чтобы начать."></div>
+    <div id="status" class="status" data-legacy-output></div>
+    <div id="log" data-legacy-output data-empty="Здесь появится лог: получение токенов → проверка статуса сотрудника → сверка свободного места → публикация и сохранение файлов. Запустите копирование, чтобы начать."></div>
   </div>
 
   <div id="help-overlay" class="overlay">
@@ -686,15 +1012,33 @@
 
       <div id="tab-tokens" class="tab-panel active">
       <h2>Токены, права и доступы</h2>
-      <p>Для работы нужны два независимых набора данных:
+      <h3>SaaS → On-premises</h3>
+      <p>Для источника нужны ID SaaS-организации, Client ID и Client secret
+         зарегистрированного сервисного приложения с правом
+         <code>cloud_api:disk.read</code>, а также email сотрудника.
+         Для назначения нужны HTTPS-адрес API установки и
+         <strong>пользовательский OAuth-токен получателя из паспорта on-premises</strong>.
+         Админ-токен API&nbsp;360 и SCIM-токен здесь не используются.</p>
+      <p>Где получить каждый доступ, как заполнить форму и выполнить перенос:
+         вкладка <strong>«Инструкция»</strong>, раздел
+         <strong>«SaaS → On-premises: инструкция миграции»</strong>.</p>
+      <h3>Перенос между SaaS-Дисками</h3>
+      <p>Для этих режимов нужны два независимых набора данных:
          <strong>сервисное приложение</strong> (доступ к Дискам сотрудников) и
          <strong>админ-токен API&nbsp;360</strong> (временная разблокировка
          сотрудника-источника). Их получают разные роли.</p>
-      <p>Инструмент работает в двух режимах: <strong>«Одна организация»</strong> —
+      <p>Здесь доступны <strong>«Одна организация»</strong> —
          источник и получатель в одной орге, один сервис-аккаунт на обоих; и
          <strong>«Между организациями»</strong> — источник и получатель в разных
          оргах, тогда нужен <strong>свой сервис-аккаунт в каждой</strong>
          (см. раздел «Режим „Между организациями“» ниже).</p>
+      <h3>Сохранение локально</h3>
+      <p>Откройте главную вкладку <strong>«Сохранить локально»</strong>.
+         Заполните доступы организации источника и выберите личный или общий диск.
+         Для личного Диска SOURCE — email владельца; для общего — email сотрудника
+         с доступом и отдельная метка SOURCE_VD_HASH. PATH задаёт папку,
+         <code>/</code> — весь диск. Файлы сохраняются в папке downloads на машине
+         запуска. Подробные шаги есть во вкладке <strong>«Инструкция»</strong>.</p>
       <p class="copy-hint">
          💡 Текст, выделенный <span class="copyable">пунктиром</span>, копируется
          по клику — ссылки, права (scopes), эндпоинты и тела запросов.</p>
@@ -760,6 +1104,12 @@
 
       <p><span class="step">Шаг 6.</span> Зарегистрируйте приложение из шага 4 как
          сервисное для организации:</p>
+      <p><strong>POST заменяет весь список сервисных приложений.</strong>
+         Сначала получите текущий список запросом GET из шага 7, сохраните
+         прежние записи и добавьте новое приложение. Пример ниже подходит
+         только для пустого списка; иначе передайте все записи с их правами.
+         <a href="https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Create"
+            target="_blank" rel="noopener">Описание замены списка</a>.</p>
       <p>POST <code class="copyable">https://api360.yandex.net/security/v1/org/&lt;ORGID&gt;/service_applications</code></p>
       <p>Тело запроса (поле <code>id</code> — это ClientID из шага 4):</p>
       <pre class="code-block copyable">{
@@ -820,7 +1170,7 @@
       <ul>
         <li><code>ORGID</code> — числовой идентификатор организации. Виден в админке
             Яндекс&nbsp;360 или через API&nbsp;360:
-            GET <code class="copyable">https://api360.yandex.net/directory/v1/orgs</code></li>
+            GET <code class="copyable">https://api360.yandex.net/directory/v1/org</code></li>
         <li><code>SOURCE</code> — email сотрудника, с Диска которого копируем.</li>
         <li><code>DESTINATION</code> — email сотрудника, на Диск которого копируем.</li>
       </ul>
@@ -1003,6 +1353,7 @@
         body.innerHTML = await res.text();
         // внешние ссылки открываем в новой вкладке
         body.querySelectorAll("a").forEach((a) => {
+          if ((a.getAttribute("href") || "").startsWith("#")) return;
           a.target = "_blank";
           a.rel = "noopener";
         });
@@ -1037,13 +1388,18 @@
     let BATCH_CONCURRENCY = 5;
     let READ_RPS = 40;
     let WRITE_RPS = 5;
-    fetch("/api/config").then((r) => r.json()).then((cfg) => {
+    window.diskCopyConfigPromise = fetch("/api/config").then((r) => r.json()).then((cfg) => {
       if (!cfg.cross_org) {
-        const tabs = document.querySelector(".mode-tabs");
-        if (tabs) tabs.remove();
+        const tab = document.querySelector('.mode-tab[data-mode="cross"]');
+        if (tab) tab.remove();
         const cross = $("mode-cross");
+        const wasActive = cross?.classList.contains("active");
         if (cross) cross.remove();
-        $("mode-single").classList.add("active");
+        if (wasActive) {
+          $("mode-single").classList.add("active");
+          const singleTab = document.querySelector('.mode-tab[data-mode="single"]');
+          if (singleTab) singleTab.classList.add("active");
+        }
       }
       if (cfg.batch_max_pairs) BATCH_MAX = cfg.batch_max_pairs;
       if (cfg.batch_concurrency) BATCH_CONCURRENCY = cfg.batch_concurrency;
@@ -1062,11 +1418,13 @@
       });
       // обновить подсказки пакетного режима после загрузки лимитов
       document.dispatchEvent(new Event("batch-limits-ready"));
-    }).catch(() => {});
+      return cfg;
+    }).catch(() => null);
 
     // переключение вкладок режимов на главной
     document.querySelectorAll(".mode-tab").forEach((tab) => {
       tab.addEventListener("click", () => {
+        if (tab.disabled) return;
         const m = tab.dataset.mode;
         document.querySelectorAll(".mode-tab").forEach((t) =>
           t.classList.toggle("active", t === tab));
@@ -1106,6 +1464,25 @@
     }
     const getDestType = wireDestType("");
     const getCrossDestType = wireDestType("x_");
+
+    // тип источника применяется только к локальному сохранению
+    function wireLocalSourceType(prefix) {
+      const name = prefix + "source_type";
+      const fields = $(prefix + "source_shared_fields");
+      const selected = () => document.querySelector(`input[name="${name}"]:checked`)?.value || "personal";
+      const apply = () => {
+        const shared = selected() === "shared";
+        fields.hidden = !shared;
+        $(prefix + "source_label").textContent = shared
+          ? "SOURCE (email сотрудника с доступом к общему диску)"
+          : "SOURCE (email владельца личного Диска)";
+      };
+      document.querySelectorAll(`input[name="${name}"]`).forEach((el) =>
+        el.addEventListener("change", apply));
+      apply();
+      return selected;
+    }
+    const getLocalSourceType = wireLocalSourceType("local_");
 
     // ── пакетный режим: список пар / источников ──────────────────────
     function parsePairsText(text, { shared = false } = {}) {
@@ -1302,7 +1679,6 @@
         }
         syncSharedUi();
         updateRunLabel();
-        if (ids.localBtn && $(ids.localBtn)) $(ids.localBtn).hidden = on;
       }
 
       tabBtns.forEach((b) =>
@@ -1353,20 +1729,18 @@
       subtabs: "single", panel: "batch_panel", file: "batch_file",
       textarea: "batch_pairs", preview: "batch_preview",
       template: "batch_template", writerBlock: "batch_shared_writer",
-      localBtn: "run-local",
     }, $("run"), "Запустить перенос", getDestType);
 
     const batchCross = wireBatchMode({
       subtabs: "cross", panel: "x_batch_panel", file: "x_batch_file",
       textarea: "x_batch_pairs", preview: "x_batch_preview",
       template: "x_batch_template", writerBlock: "x_batch_shared_writer",
-      localBtn: "run-local-cross",
     }, $("run-cross"), "Запустить перенос между организациями", getCrossDestType);
 
     // общий запуск: собираем body по карте {ключ_API: id_поля}, шлём и стримим лог
     async function startCopy(endpoint, fieldMap, button, extras, batchCtrl, options) {
       const local = !!(options && options.local);
-      const lock = (options && options.lock) || [button];
+      const lock = [$("run"), $("run-cross"), $("run-local")].filter(Boolean);
       if (!consentAccepted()) { showConsent(); return; }
       const body = {};
       for (const [key, id] of Object.entries(fieldMap)) {
@@ -1378,9 +1752,6 @@
 
       const useBatch = !local && batchCtrl && batchCtrl.isActive();
       let url = endpoint;
-      if (local) {
-        url = endpoint === "/api/run-cross" ? "/api/save-local-cross" : "/api/save-local";
-      }
       if (useBatch) {
         const got = batchCtrl.getPairs();
         if (got.error) { setStatus(got.error, "error"); return; }
@@ -1401,10 +1772,14 @@
         url = endpoint === "/api/run-cross" ? "/api/run-batch-cross" : "/api/run-batch";
       }
 
-      const optional = new Set(["path", "page_limit", "destination_vd_hash", "pairs"]);
+      const optional = new Set(["path", "page_limit", "destination_vd_hash", "source_vd_hash", "pairs"]);
       if (local) {
-        ["destination_disk_id", "dst_client_id", "dst_client_secret",
-         "destination_vd_hash", "destination_type"].forEach((key) => optional.add(key));
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.source_disk_id || "")) {
+          setStatus(body.source_type === "shared"
+            ? "В SOURCE укажите email сотрудника с доступом к общему диску. Метку диска укажите в SOURCE_VD_HASH."
+            : "В SOURCE укажите email владельца личного Диска.", "error");
+          return;
+        }
       }
       if (body.destination_type !== "shared") optional.add("destination_vd_hash");
       if (useBatch) {
@@ -1419,6 +1794,10 @@
       }
       if (!local && body.destination_type === "shared" && !body.destination_vd_hash) {
         setStatus("Для общего диска укажите VD_HASH", "error");
+        return;
+      }
+      if (local && body.source_type === "shared" && !body.source_vd_hash) {
+        setStatus("Для локального сохранения общего диска укажите SOURCE_VD_HASH", "error");
         return;
       }
 
@@ -1482,14 +1861,15 @@
       destination_disk_id: "destination_disk_id",
       destination_vd_hash: "destination_vd_hash",
       path: "path", page_limit: "page_limit",
-    }, $("run"), { destination_type: getDestType() }, batchSingle,
-       { lock: [$("run"), $("run-local")] }));
+    }, $("run"), { destination_type: getDestType() }, batchSingle));
 
-    $("run-local").addEventListener("click", () => startCopy("/api/run", {
-      client_id: "client_id", client_secret: "client_secret", orgid: "orgid",
-      admin_token: "admin_token", source_disk_id: "source_disk_id",
-      path: "path", page_limit: "page_limit",
-    }, $("run-local"), {}, null, { local: true, lock: [$("run"), $("run-local")] }));
+    // локальное сохранение — только доступы и параметры источника
+    $("run-local").addEventListener("click", () => startCopy("/api/save-local", {
+      client_id: "local_client_id", client_secret: "local_client_secret",
+      orgid: "local_orgid", admin_token: "local_admin_token",
+      source_disk_id: "local_source_disk_id", source_vd_hash: "local_source_vd_hash",
+      path: "local_path", page_limit: "local_page_limit",
+    }, $("run-local"), { source_type: getLocalSourceType() }, null, { local: true }));
 
     // режим 2 — между организациями
     $("run-cross").addEventListener("click", () => startCopy("/api/run-cross", {
@@ -1500,16 +1880,9 @@
       destination_disk_id: "x_destination_disk_id",
       destination_vd_hash: "x_destination_vd_hash",
       path: "x_path", page_limit: "x_page_limit",
-    }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross,
-       { lock: [$("run-cross"), $("run-local-cross")] }));
+    }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross));
 
-    $("run-local-cross").addEventListener("click", () => startCopy("/api/run-cross", {
-      src_client_id: "x_src_client_id", src_client_secret: "x_src_client_secret",
-      src_orgid: "x_src_orgid", src_admin_token: "x_src_admin_token",
-      source_disk_id: "x_source_disk_id",
-      path: "x_path", page_limit: "x_page_limit",
-    }, $("run-local-cross"), {}, null,
-       { local: true, lock: [$("run-cross"), $("run-local-cross")] }));
   </script>
+  <script src="/static/onprem.js"></script>
 </body>
 </html>

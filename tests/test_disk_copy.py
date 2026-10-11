@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+import requests
 
 from app.disk_copy import (
     POLL_FIRST_DELAY,
@@ -874,3 +875,203 @@ def test_run_local_does_not_call_save_to_disk(tmp_path):
 
     assert result == {"saved": [], "fails": []}
     assert session.calls_to(SAVE_TO_DISK_URL, "POST") == []
+
+
+VD_DOWNLOAD_URL = "/v1/disk/virtual-disks/resources/download"
+
+
+def shared_local_copier(session, tmp_path, *, path="/", page_limit=1000):
+    copier = make_copier(session, admin_token="", path=path, page_limit=page_limit)
+    copier.cfg.local_save = True
+    copier.cfg.local_root = str(tmp_path)
+    copier.cfg.source_type = "shared"
+    copier.cfg.source_vd_hash = "9Uyws5pZmXgDNA"
+    return copier
+
+
+@pytest.mark.parametrize("response_prefix", [
+    "vd:9Uyws5pZmXgDNA:disk:", "vd:/9Uyws5pZmXgDNA/disk"
+])
+def test_shared_local_downloads_paginated_tree_without_publishing(
+    tmp_path, response_prefix
+):
+    prefix = "vd:9Uyws5pZmXgDNA:disk:"
+    session = FakeSession({
+        ("GET", VD_DOWNLOAD_URL): FakeResponse(
+            200, payload={"href": "https://downloader/file"}
+        ),
+        ("GET", "https://downloader/file"): FakeResponse(200, text="hello"),
+        ("GET", VD_RESOURCES_URL): [
+            FakeResponse(200, payload=embedded([
+                {"path": response_prefix + "/Документы с пробелами", "type": "dir"}
+            ], total=2)),
+            FakeResponse(200, payload=embedded([
+                {"path": response_prefix + "/Документы с пробелами/отчёт.txt",
+                 "type": "file",
+                 "name": "отчёт.txt", "size": 5}
+            ])),
+            FakeResponse(200, payload=embedded([
+                {"path": response_prefix + "/root.txt", "type": "file",
+                 "name": "root.txt", "size": 5}
+            ], total=2)),
+        ],
+    })
+    copier = shared_local_copier(session, tmp_path, page_limit=1)
+
+    result = copier.run()
+
+    base = tmp_path / "shared" / "9Uyws5pZmXgDNA"
+    assert (base / "Документы с пробелами" / "отчёт.txt").read_bytes() == b"hello"
+    assert (base / "root.txt").read_bytes() == b"hello"
+    assert len(result["saved"]) == 2
+    assert result["fails"] == []
+    listings = [c for c in session.calls if c.url.endswith(VD_RESOURCES_URL)]
+    assert [(c.params["path"], c.params["offset"]) for c in listings] == [
+        (prefix + "/", 0), (prefix + "/Документы с пробелами", 0),
+        (prefix + "/", 1)
+    ]
+    assert [c.params["path"] for c in session.calls_to(VD_DOWNLOAD_URL)] == [
+        prefix + "/Документы с пробелами/отчёт.txt", prefix + "/root.txt"
+    ]
+    assert session.auth_tokens_for("https://downloader/file") == [
+        "OAuth t.uid-42.sig", "OAuth t.uid-42.sig"
+    ]
+    assert all(c.method == "GET" for c in session.calls)
+    assert session.calls_to(RESOURCES_URL) == []
+
+
+@pytest.mark.parametrize(
+    "path", [
+        "/Docs", "disk:/Docs", "vd:9Uyws5pZmXgDNA:disk:/Docs",
+        "vd:/9Uyws5pZmXgDNA/disk/Docs",
+    ]
+)
+def test_shared_local_preserves_subfolder_and_skips_same_size(tmp_path, path):
+    prefix = "vd:9Uyws5pZmXgDNA:disk:"
+    session = FakeSession({
+        ("GET", VD_RESOURCES_URL): FakeResponse(200, payload=embedded([
+            {"path": prefix + "/Docs/a.txt", "type": "file", "size": 4}
+        ])),
+    })
+    dest = tmp_path / "shared" / "9Uyws5pZmXgDNA" / "Docs" / "a.txt"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"same")
+    copier = shared_local_copier(session, tmp_path, path=path)
+
+    result = copier.run()
+
+    assert result["fails"] == []
+    assert len(result["saved"]) == 1
+    assert dest.read_bytes() == b"same"
+    assert session.calls[0].params["path"] == prefix + "/Docs"
+    assert session.calls_to(VD_DOWNLOAD_URL) == []
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_shared_local_unavailable_folder_is_error(tmp_path, status):
+    session = FakeSession({
+        ("GET", VD_RESOURCES_URL): FakeResponse(status, payload={"error": "missing"})
+    })
+    copier = shared_local_copier(session, tmp_path)
+
+    with pytest.raises(CopyError, match=str(status)):
+        copier.run()
+
+
+@pytest.mark.parametrize("path", [
+    "vd:another:disk:/secret.txt", "vd:9Uyws5pZmXgDNA:disk:/../secret.txt",
+    "vd:/another/disk/secret.txt", "vd:/9Uyws5pZmXgDNA/disk/../secret.txt",
+    "vd:/9Uyws5pZmXgDNA-extra/disk/secret.txt",
+    "vd:/9Uyws5pZmXgDNA/disk-extra/secret.txt",
+])
+def test_shared_local_rejects_resource_outside_selected_disk(tmp_path, path):
+    session = FakeSession({
+        ("GET", VD_RESOURCES_URL): FakeResponse(200, payload=embedded([
+            {"path": path, "type": "file", "size": 5}
+        ]))
+    })
+    copier = shared_local_copier(session, tmp_path)
+
+    result = copier.run()
+
+    assert result["saved"] == []
+    assert len(result["fails"]) == 1
+    assert session.calls_to(VD_DOWNLOAD_URL) == []
+
+
+def test_shared_local_does_not_follow_base_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "downloads"
+    root.mkdir()
+    (root / "shared").symlink_to(outside, target_is_directory=True)
+    copier = shared_local_copier(FakeSession(), root)
+
+    with pytest.raises(CopyError, match="LOCAL_SAVE_DIR"):
+        copier.run()
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("status", [200, 403])
+def test_local_download_preserves_user_part_file(tmp_path, status):
+    session = _local_session(embedded([
+        {"path": "disk:/a.txt", "type": "file", "size": 5}
+    ]))
+    session.routes[("GET", "https://downloader/file")] = FakeResponse(
+        status, text="hello"
+    )
+    base = tmp_path / "src@company.ru"
+    base.mkdir()
+    (base / "a.txt.part").write_bytes(b"user data")
+    copier = make_copier(session)
+    copier.cfg.local_root = str(tmp_path)
+
+    copier.save_local()
+
+    assert (base / "a.txt.part").read_bytes() == b"user data"
+    assert sorted(p.name for p in base.iterdir()) == (
+        ["a.txt", "a.txt.part"] if status == 200 else ["a.txt.part"]
+    )
+
+
+def test_shared_local_download_failure_keeps_files_and_hides_signed_url(tmp_path):
+    class InterruptedResponse(FakeResponse):
+        def iter_content(self, chunk_size=1024 * 1024):
+            yield b"partial"
+            raise requests.ConnectionError("https://downloader/file?secret=signature")
+
+    session = FakeSession({
+        ("GET", VD_DOWNLOAD_URL): FakeResponse(
+            200, payload={"href": "https://downloader/file"}
+        ),
+        ("GET", "https://downloader/file"): InterruptedResponse(200),
+        ("GET", VD_RESOURCES_URL): FakeResponse(200, payload=embedded([
+            {"path": "vd:9Uyws5pZmXgDNA:disk:/a.txt", "type": "file", "size": 5}
+        ])),
+    })
+    base = tmp_path / "shared" / "9Uyws5pZmXgDNA"
+    base.mkdir(parents=True)
+    (base / "a.txt").write_bytes(b"old")
+    (base / "a.txt.part").write_bytes(b"user data")
+    copier = shared_local_copier(session, tmp_path)
+
+    result = copier.run()
+
+    assert result["saved"] == []
+    assert len(result["fails"]) == 1
+    assert "signature" not in result["fails"][0]["error"]
+    assert (base / "a.txt").read_bytes() == b"old"
+    assert (base / "a.txt.part").read_bytes() == b"user data"
+    assert sorted(p.name for p in base.iterdir()) == ["a.txt", "a.txt.part"]
+
+
+def test_shared_local_rejects_hash_as_email_without_api_requests(tmp_path):
+    session = FakeSession()
+    copier = shared_local_copier(session, tmp_path)
+    copier.cfg.source_disk_id = "3f90fe10-ee1a-48b1-b445-2b2f09f45af7"
+
+    with pytest.raises(CopyError, match="email сотрудника с доступом"):
+        copier.run()
+
+    assert session.calls == []

@@ -2,12 +2,30 @@ services:
   disk-copy:
     build: .
     container_name: yandex-disk-copy
+    # Встроенный резолвер OrbStack (127.0.0.11) иногда не резолвит oauth.yandex.ru.
+    # Прямые DNS обходят его. 77.88.8.8 — публичный DNS Яндекса.
+    dns:
+      - 1.1.1.1
+      - 77.88.8.8
     ports:
       - "8000:8000"
     environment:
       LOCAL_SAVE_DIR: /downloads
       LOCAL_SAVE_HOST_DIR: ./downloads
+      # Пилотный режим включается отдельно для локальной разработки.
+      ONPREM_ENABLED: ${ONPREM_ENABLED:-0}
+      ONPREM_ALLOW_INSECURE_HTTP: ${ONPREM_ALLOW_INSECURE_HTTP:-0}
+      ONPREM_DATA_DIR: /var/lib/disk-copy
+      ONPREM_ADMIN_TOKEN: ${ONPREM_ADMIN_TOKEN:-}
+      ONPREM_STAGING_MAX_BYTES: ${ONPREM_STAGING_MAX_BYTES:-21474836480}
+      ONPREM_STAGING_RESERVE_BYTES: ${ONPREM_STAGING_RESERVE_BYTES:-1073741824}
+      ONPREM_API_READ_RPS: ${ONPREM_API_READ_RPS:-10}
+      ONPREM_API_WRITE_RPS: ${ONPREM_API_WRITE_RPS:-2}
     volumes:
       # локальное сохранение пишет сюда, на машину запуска, а не внутрь контейнера
       - ./downloads:/downloads
+      - migration-data:/var/lib/disk-copy
     restart: unless-stopped
+
+volumes:
+  migration-data:

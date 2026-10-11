@@ -6,4 +6,5 @@ venv/
 .DS_Store
 .env
 downloads/
+migration-data/
 CONTEXT.md

@@ -30,7 +30,12 @@ ENV HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC}
 # Локальное сохранение. Каталог внутри контейнера; на хост его выводит том
 # ./downloads:/downloads. LOCAL_SAVE_HOST_DIR — путь в логе для человека.
 ENV LOCAL_SAVE_DIR=/downloads \
-    LOCAL_SAVE_HOST_DIR=./downloads
+    LOCAL_SAVE_HOST_DIR=./downloads \
+    ONPREM_ENABLED=0 \
+    ONPREM_DATA_DIR=/var/lib/disk-copy
+
+RUN mkdir -p /var/lib/disk-copy/staging \
+    && chmod 700 /var/lib/disk-copy /var/lib/disk-copy/staging
 
 EXPOSE 8000
 

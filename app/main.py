@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -17,11 +20,16 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .disk_copy import CopyConfig, CopyError, DiskCopier, OrgCreds
+from .disk_copy import (
+    CopyConfig, CopyError, DiskCopier, OrgCreds, validate_source_email,
+)
 from .throttle import READ_RPS, WRITE_RPS
+from .migration.api import router as onprem_router
+from .migration.worker import MigrationService, enabled as onprem_enabled
 
 STATIC_DIR = Path(__file__).parent / "static"
 INSTRUCTION_MD = Path(__file__).parent.parent / "docs" / "INSTRUCTION.md"
+ONPREM_INSTRUCTION_MD = INSTRUCTION_MD.with_name("ONPREM.md")
 
 BATCH_MAX_PAIRS = 25
 BATCH_CONCURRENCY = 5
@@ -31,10 +39,26 @@ BATCH_CONCURRENCY = 5
 LOCAL_SAVE_DIR = os.environ.get("LOCAL_SAVE_DIR", "./downloads")
 LOCAL_SAVE_HOST_DIR = os.environ.get("LOCAL_SAVE_HOST_DIR", "./downloads")
 
-app = FastAPI(title="Yandex Disk Copy")
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# рендер инструкции из markdown один раз при старте (единый источник — .md-файл)
+@asynccontextmanager
+async def lifespan(application):
+    application.state.onprem = None
+    if onprem_enabled():
+        root = os.environ.get("ONPREM_DATA_DIR", "./migration-data")
+        application.state.onprem = MigrationService(root)
+    try:
+        yield
+    finally:
+        if application.state.onprem:
+            await asyncio.to_thread(application.state.onprem.close)
+            application.state.onprem = None
+
+
+app = FastAPI(title="Yandex Disk Copy", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.include_router(onprem_router)
+
+# Справка включает тот же runbook, который доступен отдельно в docs/ONPREM.md.
 _instruction_html: Optional[str] = None
 
 
@@ -45,6 +69,16 @@ def _render_instruction() -> str:
             _instruction_html = "<p>Инструкция недоступна.</p>"
         else:
             text = INSTRUCTION_MD.read_text(encoding="utf-8")
+            marker = "<!-- onprem-instruction -->"
+            if marker in text:
+                if ONPREM_INSTRUCTION_MD.exists():
+                    runbook = ONPREM_INSTRUCTION_MD.read_text(encoding="utf-8")
+                else:
+                    runbook = "Инструкция по переносу в on-premises недоступна."
+                text = text.replace(marker, runbook)
+                text = text.replace(
+                    "[onprem-guide]: ONPREM.md", "[onprem-guide]: #onprem-guide"
+                )
             _instruction_html = markdown.markdown(
                 text, extensions=["tables", "fenced_code", "sane_lists"]
             )
@@ -295,6 +329,8 @@ def config() -> dict:
     val = os.environ.get("CROSS_ORG_ENABLED", "1").strip().lower()
     return {
         "cross_org": val not in ("0", "false", "no", "off"),
+        "onprem_enabled": onprem_enabled(),
+        "onprem_auth_required": bool(os.environ.get("ONPREM_ADMIN_TOKEN")),
         "batch_max_pairs": BATCH_MAX_PAIRS,
         "batch_concurrency": BATCH_CONCURRENCY,
         "target_rps": READ_RPS,
@@ -485,7 +521,9 @@ class LocalSaveRequest(BaseModel):
     client_secret: str = Field(..., min_length=1)
     orgid: str = Field(..., min_length=1)
     admin_token: str = Field(..., min_length=1)
-    source_disk_id: str = Field(..., min_length=1)
+    source_disk_id: str = ""
+    source_type: str = "personal"
+    source_vd_hash: str = ""
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
 
@@ -497,23 +535,45 @@ class LocalSaveCrossRequest(BaseModel):
     src_client_secret: str = Field(..., min_length=1)
     src_orgid: str = Field(..., min_length=1)
     src_admin_token: str = Field(..., min_length=1)
-    source_disk_id: str = Field(..., min_length=1)
+    source_disk_id: str = ""
+    source_type: str = "personal"
+    source_vd_hash: str = ""
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
 
 
 def _local_cfg(
-    source: OrgCreds, source_disk_id: str, path: str, page_limit: int
+    source: OrgCreds, source_disk_id: str, path: str, page_limit: int,
+    source_type: str = "personal", source_vd_hash: str = "",
 ) -> CopyConfig:
+    source_type = (source_type or "personal").strip().lower()
+    if source_type not in ("personal", "shared"):
+        raise HTTPException(
+            status_code=400, detail="source_type должен быть 'personal' или 'shared'"
+        )
+    try:
+        source_disk_id = validate_source_email(
+            source_disk_id, shared=source_type == "shared"
+        )
+    except CopyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    vd_hash = _normalize_vd_hash(source_vd_hash) if source_type == "shared" else ""
+    if source_type == "shared" and not re.fullmatch(r"[A-Za-z0-9_-]+", vd_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="Для общего источника укажите корректный source_vd_hash",
+        )
     return CopyConfig(
         source=source,
         destination=source,
-        source_disk_id=source_disk_id.strip(),
+        source_disk_id=source_disk_id,
         destination_disk_id="",
         path=path or "/",
         page_limit=page_limit,
         local_save=True,
         local_root=LOCAL_SAVE_DIR,
+        source_type=source_type,
+        source_vd_hash=vd_hash,
     )
 
 
@@ -526,7 +586,10 @@ def save_local(req: LocalSaveRequest) -> dict:
         admin_token=req.admin_token,
     )
     return _start_job(
-        _local_cfg(creds, req.source_disk_id, req.path, req.page_limit)
+        _local_cfg(
+            creds, req.source_disk_id, req.path, req.page_limit,
+            req.source_type, req.source_vd_hash,
+        )
     )
 
 
@@ -539,7 +602,10 @@ def save_local_cross(req: LocalSaveCrossRequest) -> dict:
         admin_token=req.src_admin_token,
     )
     return _start_job(
-        _local_cfg(creds, req.source_disk_id, req.path, req.page_limit)
+        _local_cfg(
+            creds, req.source_disk_id, req.path, req.page_limit,
+            req.source_type, req.source_vd_hash,
+        )
     )
 
 

@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import os
+import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -125,6 +127,9 @@ class CopyConfig:
     # local_root задаёт каталог внутри процесса; на хост он попадает томом.
     local_save: bool = False
     local_root: str = ""
+    # Для локального сохранения общего диска source_disk_id — email читателя.
+    source_type: str = "personal"
+    source_vd_hash: str = ""
 
 
 @dataclass
@@ -135,6 +140,18 @@ class _DiskAuth:
 
 class CopyError(Exception):
     """Прерывание процесса с человекочитаемой причиной."""
+
+
+def validate_source_email(value: str, *, shared: bool = False) -> str:
+    email = (value or "").strip()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        if shared:
+            raise CopyError(
+                "В SOURCE укажите email сотрудника с доступом к общему диску. "
+                "Метку диска укажите в SOURCE_VD_HASH."
+            )
+        raise CopyError("В SOURCE укажите email владельца личного Диска.")
+    return email
 
 
 LogCallback = Callable[[str], None]
@@ -183,6 +200,32 @@ class DiskCopier:
     @property
     def _is_shared_dest(self) -> bool:
         return self.cfg.destination_type == "shared"
+
+    @property
+    def _is_shared_source(self) -> bool:
+        return self.cfg.source_type == "shared"
+
+    def _source_inner_path(self, path: str) -> str:
+        """Путь внутри выбранного источника, без метки общего диска."""
+        if self._is_shared_source and path.startswith("vd:"):
+            # Запросы используют vd:<hash>:disk:/..., ответы API также
+            # возвращают vd:/<hash>/disk/... (включая вложенные каталоги).
+            prefixes = (
+                f"vd:{self.cfg.source_vd_hash}:disk:",
+                f"vd:/{self.cfg.source_vd_hash}/disk",
+            )
+            for prefix in prefixes:
+                if path == prefix or path.startswith(prefix + "/"):
+                    path = path[len(prefix):]
+                    break
+            else:
+                raise CopyError(f"Путь не принадлежит выбранному общему диску: {path}")
+        return _strip_disk_schema(path)
+
+    def _source_path(self, path: str) -> str:
+        if self._is_shared_source:
+            return f"vd:{self.cfg.source_vd_hash}:disk:{self._source_inner_path(path)}"
+        return path
 
     # ── токены сервисного приложения ───────────────────────────────────
     def _get_token(self, creds: OrgCreds, disk_id: str) -> _DiskAuth:
@@ -402,10 +445,11 @@ class DiskCopier:
         return used, total - used
 
     def _disk_get_meta(self, token: str, limit: int, offset: int, path: str) -> dict:
-        url = "https://cloud-api.yandex.net/v1/disk/resources"
+        resource = "virtual-disks/resources" if self._is_shared_source else "resources"
+        url = f"https://cloud-api.yandex.net/v1/disk/{resource}"
         headers = {"Authorization": f"OAuth {token}"}
         params = {
-            "path": path,
+            "path": self._source_path(path),
             "fields": (
                 "path,type,_embedded.total,_embedded.items.path,"
                 "_embedded.items.type,_embedded.items.public_key,"
@@ -420,10 +464,12 @@ class DiskCopier:
             f"disk_get_meta | status: {response.status_code} | "
             f"path: {path}, limit: {limit}, offset: {offset}"
         )
-        # 404 — «нет такой папки», это не ошибка доступа: обработает _walk.
+        # Для личного Диска 404 обработает _walk; общий источник обязан
+        # сообщить об отсутствующей папке, а не завершиться пустым успехом.
         # Остальные не-200 (401/403/5xx) молча превращать в «папка пуста» нельзя:
         # иначе перенос отрапортует COMPLETED, не скопировав ничего.
-        if response.status_code not in (200, 404):
+        allowed = (200,) if self._is_shared_source else (200, 404)
+        if response.status_code not in allowed:
             raise CopyError(
                 f"Не удалось прочитать {path} на Диске {self.cfg.source_disk_id}: "
                 f"{response.status_code} {self._response_payload(response)}"
@@ -613,6 +659,8 @@ class DiskCopier:
             )
             emb = response.get("_embedded")
             if not isinstance(emb, dict):
+                if self._is_shared_source:
+                    raise CopyError(f"Не удалось прочитать папку общего диска: {path}")
                 self.log(f"No such resource: {self.cfg.source_disk_id} | {path}")
                 return
             total = emb.get("total", 0)
@@ -700,15 +748,18 @@ class DiskCopier:
             f"save_links | done | saved: {len(self.links)}, fails: {len(self.fails)}"
         )
 
-    def _owner_download_href(self, path: str) -> str:
+    def _owner_download_href(self, path: str, *, token: str = "") -> str:
         """Временная ссылка на скачивание файла токеном владельца.
 
         Не путать с публичной: та для некоторых файлов отвечает 404, хотя
         сам файл на Диске есть (типично — метка антивируса).
         """
-        url = "https://cloud-api.yandex.net/v1/disk/resources/download"
-        headers = {"Authorization": f"OAuth {self._source_token()}"}
-        response = self.session.get(url, params={"path": path}, headers=headers)
+        resource = "virtual-disks/resources" if self._is_shared_source else "resources"
+        url = f"https://cloud-api.yandex.net/v1/disk/{resource}/download"
+        headers = {"Authorization": f"OAuth {token or self._source_token()}"}
+        response = self.session.get(
+            url, params={"path": self._source_path(path)}, headers=headers
+        )
         payload = self._response_payload(response)
         href = payload.get("href") if response.status_code == 200 else None
         self.log(
@@ -810,7 +861,7 @@ class DiskCopier:
         self._copy_file_bytes(link["path"], link["name"])
 
     def save_to_shared(self) -> None:
-        """Публикует файлы источника и заливает их на общий диск (с сохранением дерева)."""
+        """Публикует файлы источника и загружает их на общий диск, сохраняя дерево."""
         root_inner = f"/{self.cfg.source_disk_id}"
         root_vd = self._target_folder_shared()
         self.log(
@@ -866,12 +917,13 @@ class DiskCopier:
             self.log(f"save_to_shared | progress {i}/{len(files)}")
 
         self.log(
-            f"save_to_shared | done | saved: {len(self.links)}, fails: {len(self.fails)}"
+            f"save_to_shared | done | saved: {len(self.links)}, "
+            f"fails: {len(self.fails)}"
         )
 
     def _local_file_path(self, disk_path: str, base: Path) -> Path:
-        """Путь файла на машине запуска: <каталог>/<email>/<путь на Диске>."""
-        rel = _strip_disk_schema(disk_path or "").lstrip("/")
+        """Безопасный путь файла внутри локальной папки выбранного источника."""
+        rel = self._source_inner_path(disk_path or "").lstrip("/")
         parts: list[str] = []
         for part in rel.split("/"):
             if part in ("", "."):
@@ -892,24 +944,34 @@ class DiskCopier:
         Ссылка на скачивание и само тело файла — GET, то есть читающие запросы:
         они идут в полосу 40 rps, а не в полосу изменения (5 rps).
         """
-        href = self._owner_download_href(src_path)
+        token = self._source_token()
+        href = self._owner_download_href(src_path, token=token)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        part = dest.with_name(dest.name + ".part")
-        response = self.session.get(href, stream=True)
+        # API общего диска требует тот же OAuth-токен и для полученного URL.
+        kwargs = (
+            {"headers": {"Authorization": f"OAuth {token}"}}
+            if self._is_shared_source else {}
+        )
+        response = self.session.get(href, stream=True, **kwargs)
+        part = None
         try:
             if response.status_code != 200:
                 raise CopyError(
                     f"Не удалось скачать {src_path}: {response.status_code} "
                     f"{response.text[:200]}"
                 )
-            with part.open("wb") as handle:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=dest.parent, prefix=".disk-copy-", suffix=".part",
+                delete=False,
+            ) as handle:
+                part = Path(handle.name)
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         handle.write(chunk)
             os.replace(part, dest)
         finally:
             response.close()
-            if part.exists():
+            if part is not None and part.exists():
                 part.unlink()
 
     def save_local(self) -> None:
@@ -922,8 +984,13 @@ class DiskCopier:
         email = (self.cfg.source_disk_id or "").strip()
         if not email or "/" in email or email in (".", ".."):
             raise CopyError(f"Некорректный email источника: {email}")
+        subdir = (
+            Path("shared") / self.cfg.source_vd_hash
+            if self._is_shared_source else Path(email)
+        )
         try:
-            base = self._local_file_path("disk:/", root / email)
+            base = self._local_file_path("disk:/", root / subdir)
+            base.relative_to(root.resolve())
             base.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise CopyError(
@@ -937,7 +1004,10 @@ class DiskCopier:
         host = (os.environ.get("LOCAL_SAVE_HOST_DIR") or "").strip()
         self.log(f"save_local | start | path: {self.cfg.path} | каталог: {base}")
         if host:
-            self.log(f"save_local | на машине запуска: {host.rstrip('/')}/{email}")
+            self.log(
+                f"save_local | на машине запуска: "
+                f"{host.rstrip('/')}/{subdir.as_posix()}"
+            )
         downloads = Path("/downloads")
         if root.resolve() == downloads and not downloads.is_mount():
             self.log(
@@ -981,10 +1051,14 @@ class DiskCopier:
                         {"path": src_path, "name": item.get("name"), "dest": str(dest)}
                     )
                     self.log(f"save_local | сохранён {src_path}")
-            except (CopyError, OSError, ValueError) as exc:
-                self.log(f"save_local | ошибка {src_path}: {exc}")
+            except (CopyError, OSError, ValueError, requests.RequestException) as exc:
+                error = (
+                    f"Ошибка скачивания: {type(exc).__name__}"
+                    if isinstance(exc, requests.RequestException) else str(exc)
+                )
+                self.log(f"save_local | ошибка {src_path}: {error}")
                 self.fails.append(
-                    {"path": src_path, "name": item.get("name"), "error": str(exc)}
+                    {"path": src_path, "name": item.get("name"), "error": error}
                 )
             self.log(f"save_local | progress {i}/{len(files)}")
         self.log(
@@ -994,15 +1068,30 @@ class DiskCopier:
     # ── оркестрация ────────────────────────────────────────────────────
     def run(self) -> dict:
         cfg = self.cfg
+        if cfg.source_type not in ("personal", "shared"):
+            raise CopyError("source_type должен быть 'personal' или 'shared'")
+        if self._is_shared_source:
+            if not cfg.local_save:
+                raise CopyError(
+                    "Общий диск как источник поддержан для локального сохранения"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", cfg.source_vd_hash):
+                raise CopyError(
+                    "Для общего источника укажите корректный source_vd_hash"
+                )
         if cfg.local_save:
+            cfg.source_disk_id = validate_source_email(
+                cfg.source_disk_id, shared=self._is_shared_source
+            )
             if not (cfg.local_root or "").strip():
                 raise CopyError(
                     "Каталог локального сохранения не задан (LOCAL_SAVE_DIR)"
                 )
-            self.log(
-                f"START | save local from {cfg.source_disk_id} | "
-                f"path: {cfg.path}"
+            source_label = (
+                f"shared:{cfg.source_vd_hash} (via {cfg.source_disk_id})"
+                if self._is_shared_source else cfg.source_disk_id
             )
+            self.log(f"START | save local from {source_label} | path: {cfg.path}")
         elif self._is_shared_dest and not cfg.destination_vd_hash:
             raise CopyError(
                 "Для переноса на общий диск укажите destination_vd_hash "

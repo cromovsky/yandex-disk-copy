@@ -1,21 +1,29 @@
-# Production-вариант (pull-only из Docker Hub): сервис не публикуется наружу
+# HTTPS-вариант: сервис не публикуется наружу
 # напрямую, перед ним стоит Caddy с автоматическим HTTPS и basic-auth.
-# Оба образа готовые — локальная сборка не нужна.
+# Приложение собирается локально; образ Caddy скачивается из Docker Hub.
 #
 # Запуск:
 #   1) cp .env.example .env  и заполни SITE_ADDRESS / BASIC_AUTH_USER / BASIC_AUTH_HASH
-#   2) docker compose -f docker-compose.caddy.yml pull
-#   3) docker compose -f docker-compose.caddy.yml up -d
+#   2) Для on-prem режима задай ONPREM_ADMIN_TOKEN (см. docs/ONPREM.md)
+#   3) docker compose -f docker-compose.caddy.yml up --build -d
 #
 # Не запускай одновременно с обычным docker-compose.yml — конфликт имени контейнера.
 
 services:
   disk-copy:
     image: cromovsky/yandex-disk-copy:latest
+    build:
+      context: .
+      args:
+        CROSS_ORG_ENABLED: "0"
     container_name: yandex-disk-copy
     restart: unless-stopped
     expose:
       - "8000"          # доступен только внутри docker-сети, не на хост
+    # Только для этой закрытой сети: HTTPS и адрес клиента передаёт Caddy.
+    # Не публиковать порт приложения с таким доверием к proxy-заголовкам.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--proxy-headers", "--forwarded-allow-ips", "*"]
     environment:
       # темп запросов к API Диска; значения берутся из .env, дефолты — как в образе.
       # Пробрасываем поимённо, а не env_file, чтобы basic-auth хеш не утекал в
@@ -25,8 +33,16 @@ services:
       HTTP_TIMEOUT_SEC: ${HTTP_TIMEOUT_SEC:-120}
       LOCAL_SAVE_DIR: /downloads
       LOCAL_SAVE_HOST_DIR: ./downloads
+      ONPREM_ENABLED: ${ONPREM_ENABLED:-0}
+      ONPREM_DATA_DIR: /var/lib/disk-copy
+      ONPREM_ADMIN_TOKEN: ${ONPREM_ADMIN_TOKEN:-}
+      ONPREM_STAGING_MAX_BYTES: ${ONPREM_STAGING_MAX_BYTES:-21474836480}
+      ONPREM_STAGING_RESERVE_BYTES: ${ONPREM_STAGING_RESERVE_BYTES:-1073741824}
+      ONPREM_API_READ_RPS: ${ONPREM_API_READ_RPS:-10}
+      ONPREM_API_WRITE_RPS: ${ONPREM_API_WRITE_RPS:-2}
     volumes:
       - ./downloads:/downloads
+      - migration-data:/var/lib/disk-copy
 
   caddy:
     image: cromovsky/yandex-disk-copy-caddy:latest
@@ -44,5 +60,6 @@ services:
       - disk-copy
 
 volumes:
+  migration-data:
   caddy_data:
   caddy_config:

@@ -1,0 +1,7 @@
+# Только для локальной доработки пилотного режима через localhost.
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
+services:
+  disk-copy:
+    environment:
+      ONPREM_ENABLED: "1"
+      ONPREM_ALLOW_INSECURE_HTTP: "1"

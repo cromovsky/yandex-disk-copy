@@ -190,6 +190,86 @@ def test_shared_without_vd_hash_rejected():
     assert "destination_vd_hash" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("cross", [False, True])
+def test_save_local_shared_normalizes_source_hash_without_destination(
+    monkeypatch, cross
+):
+    seen = {}
+
+    def fake_start(cfg):
+        seen["cfg"] = cfg
+        return {"job_id": "shared-local"}
+
+    monkeypatch.setattr("app.main._start_job", fake_start)
+    prefix = "src_" if cross else ""
+    payload = {prefix + key: value for key, value in {
+        "client_id": "a", "client_secret": "b", "orgid": "o", "admin_token": "t"
+    }.items()}
+    payload.update({
+        "source_disk_id": " reader@x.ru ", "source_type": "shared",
+        "source_vd_hash": "https://disk.yandex.ru/client/vd/9Uyws5pZmXgDNA/Docs",
+        "path": "/Docs"
+    })
+
+    response = client.post(
+        "/api/save-local-cross" if cross else "/api/save-local", json=payload
+    )
+
+    assert response.status_code == 200
+    cfg = seen["cfg"]
+    assert cfg.source_type == "shared"
+    assert cfg.source_vd_hash == "9Uyws5pZmXgDNA"
+    assert cfg.source_disk_id == "reader@x.ru"
+    assert cfg.path == "/Docs"
+    assert cfg.local_save is True
+    assert cfg.destination_disk_id == ""
+
+
+@pytest.mark.parametrize("source_type,source_vd_hash", [
+    ("shared", ""), ("invalid", "hash"), ("shared", ".."), ("shared", "bad\\hash")
+])
+def test_save_local_rejects_invalid_source(monkeypatch, source_type, source_vd_hash):
+    def unexpected_start(cfg):
+        pytest.fail("invalid source must not start a job")
+
+    monkeypatch.setattr("app.main._start_job", unexpected_start)
+    response = client.post("/api/save-local", json={
+        "client_id": "a", "client_secret": "b", "orgid": "o", "admin_token": "t",
+        "source_disk_id": "s@x.ru", "source_type": source_type,
+        "source_vd_hash": source_vd_hash
+    })
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("cross", [False, True])
+@pytest.mark.parametrize(
+    "email", [None, "", " ", "3f90fe10-ee1a-48b1-b445-2b2f09f45af7"]
+)
+def test_shared_local_requires_reader_email_before_start(monkeypatch, cross, email):
+    def unexpected_start(cfg):
+        pytest.fail("a disk hash cannot be used for email token exchange")
+
+    monkeypatch.setattr("app.main._start_job", unexpected_start)
+    prefix = "src_" if cross else ""
+    payload = {
+        prefix + "client_id": "a", prefix + "client_secret": "b",
+        prefix + "orgid": "o", prefix + "admin_token": "t",
+        "source_disk_id": email, "source_type": "shared",
+        "source_vd_hash": "3f90fe10-ee1a-48b1-b445-2b2f09f45af7",
+    }
+    if email is None:
+        del payload["source_disk_id"]
+
+    response = client.post(
+        "/api/save-local-cross" if cross else "/api/save-local", json=payload
+    )
+
+    assert response.status_code == 400
+    assert "email сотрудника с доступом" in response.json()["detail"]
+    assert "SOURCE_VD_HASH" in response.json()["detail"]
+
+
 def test_batch_pairs_reject_duplicates():
     pairs = [
         TransferPair(source_disk_id="a@x.ru", destination_disk_id="b@x.ru"),

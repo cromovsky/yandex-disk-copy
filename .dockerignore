@@ -6,3 +6,7 @@ __pycache__/
 venv/
 .DS_Store
 README.md
+.env
+downloads/
+migration-data/
+CONTEXT.md
