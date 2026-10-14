@@ -5,15 +5,17 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .credentials import CredentialRegistry
-from .runner import ACTIVE, FINAL_PENDING, MigrationRunner
+from .runner import ACTIVE, MigrationRunner
 from .store import MigrationStore
+from app.source_slots import SOURCE_SLOTS
 
 
 def enabled():
-    return os.environ.get("ONPREM_ENABLED", "0").strip().lower() in {
+    return os.environ.get("ONPREM_ENABLED", "1").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
@@ -27,7 +29,7 @@ def _positive_int(name, default):
 
 
 class MigrationService:
-    def __init__(self, root, *, start_worker=True):
+    def __init__(self, root, *, start_worker=True, slots=None):
         self.root = Path(root)
         if self.root.is_symlink():
             raise RuntimeError("invalid_migration_volume")
@@ -43,24 +45,36 @@ class MigrationService:
             self.store = MigrationStore(self.root)
             self.registry = CredentialRegistry()
             self.guard = threading.Lock()
+            self.slots = slots or SOURCE_SLOTS
+            self.excluded_job_ids = set()
+            self._job_locks = {}
+            self._job_locks_guard = threading.Lock()
             self.runner = MigrationRunner(
                 self.store, self.registry,
                 staging_budget=_positive_int("ONPREM_STAGING_MAX_BYTES", 20 * 1024**3),
                 reserve_bytes=_positive_int("ONPREM_STAGING_RESERVE_BYTES", 1024**3),
             )
             self.store.recover()
+            self.store.release_cancelled_path_conflicts()
             for job in self.store.jobs(limit=1000000):
+                if job["state"] == "stopped" and job.get("full_stop_requested"):
+                    self.store.cancel_local_entries(job["id"])
                 self.runner.cleanup(job["id"], successes_only=True)
             self.stop = threading.Event()
+            self.runner.shutdown_event = self.stop
             self.wake = threading.Event()
             self._closed = False
             self._polls = {}
+            # Recovered stopped jobs have no local clients to acknowledge.
+            self._full_stop_acknowledged = {
+                job["id"] for job in self.store.jobs(limit=1000000)
+                if job["state"] == "stopped" and job.get("full_stop_requested")
+            }
             self.thread = None
+            self._executor = ThreadPoolExecutor(max_workers=self.slots.limit, thread_name_prefix="onprem-source")
+            self._tasks = {}
             if start_worker:
-                self.thread = threading.Thread(
-                    target=self._run, name="onprem-migration", daemon=False,
-                )
-                self.thread.start()
+                self.start()
         except BaseException:
             self._volume_lock.close()
             raise
@@ -80,63 +94,90 @@ class MigrationService:
     def notify(self):
         self.wake.set()
 
+    def start(self):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._run, name="onprem-migration",
+                                           daemon=False)
+            self.thread.start()
+
+    def job_guard(self, job_id):
+        with self._job_locks_guard:
+            return self._job_locks.setdefault(job_id, threading.RLock())
+
     def holding_job(self, jobs=None):
         jobs = self.store.jobs(limit=1000000) if jobs is None else jobs
         return next((job for job in sorted(jobs, key=lambda j: j["created_at"])
-                     if (bool(self.runner.final_pending(job["id"]))
-                         if job["state"] == "stopped" else any(
-                             entry["state"] in ACTIVE | {"outcome_unknown"}
-                             for entry in self.store.entries(
-                                 job["id"], limit=1000000,
-                             )))), None)
+                     if not job.get("full_stop_requested") and job["state"] != "stopped"
+                     and any(entry["state"] in ACTIVE
+                             for entry in self.store.entries(job["id"], limit=1000000))), None)
 
     def describe_job(self, job, holding):
         blocker = None
         pending = job["state"] == "running" or (
             job["state"] == "awaiting_credentials" and job["resume_state"] == "running"
         )
-        if pending and holding and holding["id"] != job["id"]:
-            unknown = any(
-                entry["state"] == "outcome_unknown"
-                for entry in self.store.entries(holding["id"], limit=1000000)
-            )
+        owner = "onprem:" + job["id"]
+        if (pending and holding and holding["id"] != job["id"]
+                and owner not in self.slots.active_owners
+                and len(self.slots.active_owners) >= self.slots.limit):
             blocker = {
                 "job_id": holding["id"], "state": holding["state"],
-                "reason": "operation_outcome_unknown" if unknown
-                else "operation_in_progress",
+                "reason": "operation_in_progress",
             }
         pending_final = (self.runner.final_pending(job["id"])
-                         if job["state"] == "stopped" else [])
+                         if job["state"] == "stopped" or job.get("full_stop_requested")
+                         else [])
         return {**job, "blocked_by": blocker,
-                "stop_blocked": bool(pending_final),
-                "stop_blocked_attempt_ids": [a["id"] for a in pending_final],
-                "stop_resolvable_attempt_ids": [
-                    a["id"] for a in pending_final
-                    if a["phase"] in FINAL_PENDING
-                ]}
+                "transfer_rates": self.runner.transfer_rates(job["id"]),
+                "stop_blocked": False,
+                "remote_pending": bool(pending_final),
+                "stop_blocked_attempt_ids": []}
 
     def _stop_requested_jobs(self, jobs):
         for job in jobs:
-            if job["state"] == "stopped":
-                if not self.runner.final_pending(job["id"]):
-                    with self.guard:
-                        self.runner.release_clients(job["id"])
+            if job["id"] in self.excluded_job_ids:
                 continue
-            if not job.get("stop_requested"):
+            lock = self.job_guard(job["id"])
+            if not lock.acquire(blocking=False):
                 continue
-            with self.guard:
-                current = self.store.get(job["id"])
-                if current.get("stop_requested") and current["state"] != "stopped":
-                    self.runner.stop_job(job["id"])
-                    self._polls.pop(job["id"], None)
+            try:
+                self._stop_one_job(job)
+            finally:
+                lock.release()
+
+    def _stop_one_job(self, job):
+        if job["state"] == "stopped":
+            if job.get("full_stop_requested"):
+                self._polls.pop(job["id"], None)
+                if job["id"] not in self._full_stop_acknowledged:
+                    self.store.cancel_local_entries(job["id"])
+                    self.runner.release_clients(job["id"])
+                    self._full_stop_acknowledged.add(job["id"])
+                return
+            self._polls.pop(job["id"], None)
+            self.runner.release_clients(job["id"])
+            return
+        if not job.get("stop_requested"):
+            return
+        current = self.store.get(job["id"])
+        if current.get("stop_requested") and current["state"] != "stopped":
+            self.runner.stop_job(job["id"])
+            self._polls.pop(job["id"], None)
+            if current.get("full_stop_requested"):
+                self._full_stop_acknowledged.add(job["id"])
 
     def _pause_idle_jobs(self, jobs):
         for job in jobs:
+            if job["id"] in self.excluded_job_ids:
+                continue
             if not job["pause_requested"] or job["state"] not in {
                 "running", "awaiting_credentials",
             }:
                 continue
-            with self.guard:
+            lock = self.job_guard(job["id"])
+            if not lock.acquire(blocking=False):
+                continue
+            try:
                 current = self.store.get(job["id"])
                 if (
                     not current.get("stop_requested")
@@ -148,7 +189,7 @@ class MigrationService:
                     )
                     and current["namespace_state"] in {"unclaimed", "owned"}
                     and not any(
-                        entry["state"] in ACTIVE | {"outcome_unknown"}
+                        entry["state"] in ACTIVE
                         for entry in self.store.entries(job["id"], limit=1000000)
                     )
                 ):
@@ -156,6 +197,8 @@ class MigrationService:
                     fields = {"state": "paused"} if current["state"] == "running" \
                         else {"resume_state": "paused"}
                     self.store.update_job(job["id"], **fields)
+            finally:
+                lock.release()
 
     def _run(self):
         while not self.stop.is_set():
@@ -166,47 +209,66 @@ class MigrationService:
             self._pause_idle_jobs(jobs)
             jobs = self.store.jobs(limit=1000000)
             jobs.sort(key=lambda j: j["created_at"])
-            # Explicitly stopped imports can only finish in their old namespace.
-            # Pending final moves still reserve the lane, including after stop.
-            holding = self.holding_job(jobs)
-            running = holding or next((j for j in jobs if j["state"] == "running"),
-                                      None)
-            can_work = running and (
-                running["state"] == "running" or (
-                    running["state"] == "stopped"
-                    and self.registry.get(running["id"])
-                    and any(a["phase"] == "waiting_move"
-                            for a in self.runner.final_pending(running["id"]))
-                )
-            )
-            candidates = ([running] if can_work else []) + [
-                j for j in jobs if j["state"] == "queued"
-            ]
+            for job_id, task in list(self._tasks.items()):
+                if task.done():
+                    try:
+                        task.result()
+                    except Exception:
+                        # A damaged source must not terminate the other lane.
+                        # Persist only a fixed code; raw exceptions may contain URLs.
+                        self.slots.release("onprem:" + job_id)
+                        with self.job_guard(job_id):
+                            current = self.store.get(job_id)
+                            if current["state"] != "stopped":
+                                self.store.update_job(job_id, state="needs_attention",
+                                                      error="internal_error")
+                    self._tasks.pop(job_id)
+            for job in jobs:
+                if (job["id"] not in self._tasks and job["id"] not in self.excluded_job_ids
+                        and (job["state"] not in {"running", "queued"}
+                             or job.get("full_stop_requested"))):
+                    self.slots.release("onprem:" + job["id"])
+            candidates = [j for j in jobs if j["state"] in {"running", "queued"}
+                          and not j.get("full_stop_requested")
+                          and j["id"] not in self.excluded_job_ids]
             for job in candidates:
+                if job["id"] in self._tasks or len(self._tasks) >= self.slots.limit:
+                    continue
                 previous = self._polls.get(job["id"], (None, 0, 0))
                 if previous[2] > time.monotonic():
                     continue
+                if not self.slots.try_acquire("onprem:" + job["id"]):
+                    continue
                 with self.guard:
-                    if job["state"] == "stopped":
-                        self.runner.reconcile_stopped_move(job["id"])
-                    else:
-                        self.runner.step(job["id"])
-                    current = self.store.get(job["id"])
-                    if (current.get("stop_requested")
-                            and current["state"] != "stopped"):
-                        self.runner.stop_job(job["id"])
-                current = self.store.get(job["id"])
-                waiting = next((a for a in self.store.attempts(job["id"])
-                                if a["phase"] in {"waiting_transfer", "waiting_move"}),
-                               None)
-                if waiting and current["state"] in {"running", "stopped"}:
+                    self._tasks[job["id"]] = self._executor.submit(self._advance, job["id"])
+            self.wake.wait(0.1)
+
+    def _advance(self, job_id):
+        try:
+            with self.job_guard(job_id):
+                previous = self._polls.get(job_id, (None, 0, 0))
+                self.runner.step(job_id)
+                current = self.store.get(job_id)
+                if current.get("stop_requested") and current["state"] != "stopped":
+                    self.runner.stop_job(job_id)
+                    if current.get("full_stop_requested"):
+                        self._full_stop_acknowledged.add(job_id)
+                current = self.store.get(job_id)
+                waiting = next((a for a in self.store.attempts(job_id)
+                                if a["phase"] in {"waiting_transfer", "waiting_move"}), None)
+                if (waiting and current["state"] == "running"
+                        and not current.get("full_stop_requested")):
                     marker = (waiting["id"], waiting["phase"])
                     delay = min(10, previous[1] * 2) if marker == previous[0] else 0.5
-                    self._polls[job["id"]] = (marker, delay, time.monotonic() + delay)
+                    self._polls[job_id] = (marker, delay, time.monotonic() + delay)
                 else:
-                    self._polls.pop(job["id"], None)
-                break
-            self.wake.wait(0.5)
+                    self._polls.pop(job_id, None)
+        finally:
+            current = self.store.get(job_id)
+            if (self.stop.is_set() or current["state"] not in {"running", "queued"}
+                    or current.get("full_stop_requested")):
+                self.slots.release("onprem:" + job_id)
+            self.notify()
 
     def close(self):
         if self._closed:
@@ -215,6 +277,9 @@ class MigrationService:
         self.wake.set()
         if self.thread:
             self.thread.join()
+        self._executor.shutdown(wait=True)
+        for job in self.store.jobs(limit=1000000):
+            self.slots.release("onprem:" + job["id"])
         self.runner.close()
         self.registry.clear()
         self.store.close()

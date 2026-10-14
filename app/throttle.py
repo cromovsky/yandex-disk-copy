@@ -1,7 +1,8 @@
 """Процесс-глобальный троттлинг исходящих HTTP-запросов.
 
-Лимит API Диска — на один IP и один клиент: 40 запросов/с на чтение и 5 на
-изменение. Заголовков X-RateLimit-* API не отдаёт, поэтому темп задаём сами,
+Опубликованный предел API Диска — 40 запросов/с. По умолчанию держим общий
+темп 30 запросов/с и не более 3 изменений/с. Заголовков X-RateLimit-* API не
+отдаёт, поэтому темп задаём сами,
 а по факту 429 тормозим все потоки сразу (общий барьер + Retry-After).
 
 Бюджет один на процесс: пакетные переносы и локальное скачивание ходят с одного
@@ -16,6 +17,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 import requests
@@ -46,23 +48,24 @@ def _read_rps() -> float:
     legacy = _env_positive("DISK_API_RPS")
     if legacy is not None:
         return legacy
-    return 40.0
+    return 30.0
 
 
 def _write_rps() -> float:
-    """Модифицирующие запросы. Старая ручка DISK_API_RPS не поднимает темп выше 5."""
+    """Модифицирующие запросы. Старая ручка DISK_API_RPS не поднимает темп выше 3."""
     specific = _env_positive("DISK_API_WRITE_RPS")
     if specific is not None:
         return specific
     legacy = _env_positive("DISK_API_RPS")
     if legacy is not None:
-        return min(5.0, legacy)
-    return 5.0
+        return min(3.0, legacy)
+    return 3.0
 
 
-# Потолки API Диска на один IP и один клиент. Видите 429 — снижайте ручки.
+# Консервативный бюджет утилиты; второй контейнер этот бюджет не разделяет.
 READ_RPS = _read_rps()
 WRITE_RPS = _write_rps()
+TOTAL_RPS = _env_float("DISK_API_TOTAL_RPS", min(30.0, READ_RPS))
 # Совместимость: старое имя — это темп чтения.
 TARGET_RPS = READ_RPS
 
@@ -166,13 +169,27 @@ class RateLimiter:
     def rps(self) -> float:
         return 1.0 / self._interval
 
-    def acquire(self, _method: str = "GET") -> None:
+    def _wait(self, delay: float, checkpoint=None) -> None:
+        if checkpoint is None:
+            self._sleep(delay)
+            return
+        deadline = self._monotonic() + max(0, delay)
+        while True:
+            checkpoint()
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return
+            self._sleep(min(.2, remaining))
+
+    def acquire(self, _method: str = "GET", *, checkpoint=None) -> None:
         """Блокирует поток до момента, когда очередной запрос разрешён.
 
         Метод у однополосного лимитера не используется: полосу выбирает
         SplitRateLimiter. Сигнатура общая, чтобы сессия всегда передавала метод.
         """
         while True:
+            if checkpoint is not None:
+                checkpoint()
             with self._lock:
                 # барьер 429 учитывается здесь же: слоты после cooldown
                 # раскладываются по интервалу, а не выстреливают залпом
@@ -180,7 +197,7 @@ class RateLimiter:
                 self._next_slot = slot + self._interval
             wait = slot - self._monotonic()
             if wait > 0:
-                self._sleep(wait)
+                self._wait(wait, checkpoint)
                 with self._lock:
                     self.total_wait += wait
             with self._lock:
@@ -204,10 +221,10 @@ class RateLimiter:
             self.cooldowns += 1
         return capped
 
-    def pause(self, delay: float) -> None:
+    def pause(self, delay: float, *, checkpoint=None) -> None:
         """Пауза одного потока (откат на 5xx) — общий барьер не двигает."""
         if delay > 0:
-            self._sleep(delay)
+            self._wait(delay, checkpoint)
 
 
 class SplitRateLimiter:
@@ -221,6 +238,7 @@ class SplitRateLimiter:
         read_rps: float,
         write_rps: float,
         *,
+        total_rps: Optional[float] = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         max_cooldown: float = MAX_COOLDOWN,
@@ -232,23 +250,48 @@ class SplitRateLimiter:
         }
         self.read = RateLimiter(read_rps, **kwargs)
         self.write = RateLimiter(write_rps, **kwargs)
+        self.total = RateLimiter(total_rps, **kwargs) if total_rps is not None else None
+        self._schedule_lock = threading.Lock()
 
     def _lane(self, method: str) -> RateLimiter:
         if request_lane(method) == "write":
             return self.write
         return self.read
 
-    def acquire(self, method: str = "GET") -> None:
-        self._lane(method).acquire()
+    def acquire(self, method: str = "GET", *, checkpoint=None) -> None:
+        lane = self._lane(method)
+        if self.total is None:
+            lane.acquire(checkpoint=checkpoint)
+            return
+        # Reserve lane and parent in one transaction. Serial independent gates can
+        # bunch delayed writes together and violate the mutation budget.
+        parent = self.total
+        while True:
+            if checkpoint is not None:
+                checkpoint()
+            with self._schedule_lock, lane._lock, parent._lock:
+                slot = max(parent._monotonic(), lane._next_slot, parent._next_slot,
+                           lane._blocked_until, parent._blocked_until)
+                lane._next_slot = slot + lane._interval
+                parent._next_slot = slot + parent._interval
+            wait = slot - parent._monotonic()
+            if wait > 0:
+                parent._wait(wait, checkpoint)
+                with parent._lock:
+                    parent.total_wait += wait
+            with lane._lock, parent._lock:
+                if max(lane._blocked_until, parent._blocked_until) <= slot:
+                    return
 
     def penalize(self, delay: float) -> float:
         read_pause = self.read.penalize(delay)
         write_pause = self.write.penalize(delay)
-        return max(read_pause, write_pause)
+        parent_pause = self.total.penalize(delay) if self.total is not None else 0
+        return max(read_pause, write_pause, parent_pause)
 
-    def pause(self, delay: float) -> None:
+    def pause(self, delay: float, *, checkpoint=None) -> None:
         """Пауза одного потока на 5xx. Сон один раз, барьер полос не двигает."""
-        self.read.pause(delay)
+        self.read.pause(delay, checkpoint=checkpoint)
 
     @property
     def cooldowns(self) -> int:
@@ -269,7 +312,7 @@ def get_limiter() -> SplitRateLimiter:
     global _LIMITER
     with _LIMITER_LOCK:
         if _LIMITER is None:
-            _LIMITER = SplitRateLimiter(READ_RPS, WRITE_RPS)
+            _LIMITER = SplitRateLimiter(READ_RPS, WRITE_RPS, total_rps=TOTAL_RPS)
         return _LIMITER
 
 
@@ -280,8 +323,11 @@ def set_limiter(limiter: Optional[SplitRateLimiter | RateLimiter]) -> None:
         _LIMITER = limiter
 
 
-def _short(url: str, limit: int = 80) -> str:
-    return url[:limit]
+def _safe_host(url: str) -> str:
+    from .migration.diagnostics import response_details
+
+    response = SimpleNamespace(url=url, headers={}, content=b"")
+    return response_details(response, "saas").get("request_host", "неизвестный сервер")
 
 
 class ThrottledSession(requests.Session):
@@ -306,10 +352,66 @@ class ThrottledSession(requests.Session):
         self._timeout = timeout
         self._max_attempts = max_attempts
         self._log = log or (lambda _msg: None)
+        self._observer: Optional[Callable[[dict], None]] = None
 
     def set_log(self, log: Callable[[str], None]) -> None:
         """Подключить лог копира, чтобы 429 были видны в SSE-логе браузера."""
         self._log = log
+
+    def set_observer(self, callback: Optional[Callable[[dict], None]]) -> None:
+        """Подключить структурированный журнал без изменения поведения запросов."""
+        self._observer = callback
+
+    def _notify(self, payload: dict) -> None:
+        try:
+            if self._observer is not None:
+                self._observer(payload)
+        except Exception:
+            # A degraded journal must not repeat or interrupt an HTTP mutation.
+            pass
+
+    def _attempt_event(self, request, attempt, started, *, response=None,
+                       error=None, streaming=False):
+        from .migration.diagnostics import response_details, transport_details
+
+        payload = {
+            "event_type": "http", "attempt": attempt,
+            "max_attempts": self._max_attempts,
+            "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+        }
+        mutation = request_lane(request.method) == "write"
+        if error is not None:
+            payload.update(
+                status="outcome_unknown" if mutation else "failed",
+                error="transport_error",
+            )
+            details = transport_details(error, "saas", request.url)
+        else:
+            code = response.status_code
+            if code == 409:
+                status = "skipped"
+            elif code == 202 or 300 <= code < 400:
+                status = "waiting"
+            elif code >= 500 and mutation:
+                status = "outcome_unknown"
+            else:
+                status = "failed" if code >= 400 else "succeeded"
+            payload.update(status=status, http_status=code)
+            if code >= 400:
+                payload["error"] = "http_error"
+            if streaming:
+                # Never consume file data or a streamed error to populate a journal.
+                response = SimpleNamespace(
+                    url=getattr(response, "url", None), headers=response.headers,
+                    content=b"",
+                )
+            details = response_details(
+                response, "saas", getattr(response, "url", None) or request.url,
+            )
+        details.pop("error_side", None)
+        payload.update(details)
+        self._notify(payload)
+        return payload
 
     def send(self, request, **kwargs):
         # единственное место, где ставится таймаут
@@ -320,7 +422,19 @@ class ThrottledSession(requests.Session):
         while True:
             attempt += 1
             self._limiter.acquire(request.method)
-            response = super().send(request, **kwargs)
+            started = time.monotonic()
+            try:
+                response = super().send(request, **kwargs)
+            except requests.RequestException as error:
+                if self._observer is not None:
+                    self._attempt_event(request, attempt, started, error=error)
+                raise
+            payload = None
+            if self._observer is not None:
+                payload = self._attempt_event(
+                    request, attempt, started, response=response,
+                    streaming=bool(kwargs.get("stream")),
+                )
             if response.status_code not in RETRY_STATUSES:
                 return response
 
@@ -334,23 +448,31 @@ class ThrottledSession(requests.Session):
                 # продлевают лимит. Паузу додержит acquire() на следующем витке.
                 actual = self._limiter.penalize(delay)
                 note = "" if actual >= delay else f" | Retry-After {delay:.0f} с урезан"
-                self._log(
-                    f"429 | {request.method} {_short(request.url)} | "
-                    f"общая пауза {actual:.1f} с | "
-                    f"попытка {attempt}/{self._max_attempts}{note}"
-                )
+                if payload is None:
+                    self._log(
+                        f"429 | {request.method} {_safe_host(request.url)} | "
+                        f"общая пауза {actual:.1f} с | "
+                        f"попытка {attempt}/{self._max_attempts}{note}"
+                    )
                 if last:
                     return response
+                if payload is not None:
+                    self._notify(dict(payload, event_type="retry", status="waiting",
+                                      retry_delay_ms=int(actual * 1000)))
                 response.close()
                 continue
 
             # 5xx — беда одной ручки, барьер для всех не ставим
-            self._log(
-                f"{response.status_code} | {request.method} "
-                f"{_short(request.url)} | повтор через {delay:.1f} с | "
-                f"попытка {attempt}/{self._max_attempts}"
-            )
+            if payload is None:
+                self._log(
+                    f"{response.status_code} | {request.method} "
+                    f"{_safe_host(request.url)} | повтор через {delay:.1f} с | "
+                    f"попытка {attempt}/{self._max_attempts}"
+                )
             if last:
                 return response
+            if payload is not None:
+                self._notify(dict(payload, event_type="retry", status="waiting",
+                                  retry_delay_ms=int(delay * 1000)))
             response.close()
             self._limiter.pause(delay)

@@ -150,7 +150,7 @@ def test_page_limit_zero_rejected():
 def test_save_local_does_not_require_destination(monkeypatch):
     seen = {}
 
-    def fake_start(cfg):
+    def fake_start(cfg, **kwargs):
         seen["cfg"] = cfg
         return {"job_id": "local-1"}
 
@@ -196,7 +196,7 @@ def test_save_local_shared_normalizes_source_hash_without_destination(
 ):
     seen = {}
 
-    def fake_start(cfg):
+    def fake_start(cfg, **kwargs):
         seen["cfg"] = cfg
         return {"job_id": "shared-local"}
 
@@ -229,7 +229,7 @@ def test_save_local_shared_normalizes_source_hash_without_destination(
     ("shared", ""), ("invalid", "hash"), ("shared", ".."), ("shared", "bad\\hash")
 ])
 def test_save_local_rejects_invalid_source(monkeypatch, source_type, source_vd_hash):
-    def unexpected_start(cfg):
+    def unexpected_start(cfg, **kwargs):
         pytest.fail("invalid source must not start a job")
 
     monkeypatch.setattr("app.main._start_job", unexpected_start)
@@ -247,7 +247,7 @@ def test_save_local_rejects_invalid_source(monkeypatch, source_type, source_vd_h
     "email", [None, "", " ", "3f90fe10-ee1a-48b1-b445-2b2f09f45af7"]
 )
 def test_shared_local_requires_reader_email_before_start(monkeypatch, cross, email):
-    def unexpected_start(cfg):
+    def unexpected_start(cfg, **kwargs):
         pytest.fail("a disk hash cannot be used for email token exchange")
 
     monkeypatch.setattr("app.main._start_job", unexpected_start)
@@ -282,17 +282,20 @@ def test_batch_pairs_reject_duplicates():
 def test_config_exposes_read_and_write_rps():
     cfg = client.get("/api/config").json()
 
-    assert cfg["read_rps"] == 40
-    assert cfg["write_rps"] == 5
+    assert cfg["read_rps"] == 30
+    assert cfg["write_rps"] == 3
     assert cfg["target_rps"] == cfg["read_rps"]
+    assert cfg["total_rps"] == 30
+    assert cfg["source_concurrency"] == 4
 
 
 def test_rate_limit_note_mentions_pace_and_ceiling():
     note = _rate_limit_note()
 
     assert "RATE LIMIT" in note
-    assert "40" in note
-    assert "5" in note
+    assert "30" in note
+    assert "3" in note
+    assert "всего" in note
 
 
 def test_run_job_logs_rate_limit_first(monkeypatch):

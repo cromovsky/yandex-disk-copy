@@ -1,4 +1,4 @@
-# Только для локальной доработки пилотного режима через localhost.
+# Локальный запуск SaaS → On-premises через HTTP на localhost.
 # docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
 services:
   disk-copy:

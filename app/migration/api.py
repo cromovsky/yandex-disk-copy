@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import hashlib
 import hmac
 import io
 import ipaddress
@@ -14,14 +13,16 @@ import re
 from contextlib import contextmanager
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from .destination import normalize_destination_url
+from .destination import destination_path, normalize_destination_url
+from .diagnostics import describe_diagnostics
 from .errors import MigrationError
-from .operations import valid_operation_reference
-from .runner import FINAL_PENDING, UNKNOWN_PHASES, disk_path
+from .runner import ACTIVE, disk_path, join_path
+from .store import canonical_config
 from .worker import enabled
 
 
@@ -57,7 +58,28 @@ def require_access(request: Request):
         raise HTTPException(403, "onprem_origin_rejected")
 
 
-router = APIRouter(prefix="/api/onprem", dependencies=[Depends(require_access)])
+class MigrationRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def migration_handler(request):
+            try:
+                return await handler(request)
+            except MigrationError as exc:
+                content = {"detail": exc.code}
+                message = describe_diagnostics({
+                    "error": exc.code, "http_status": exc.http_status,
+                    **exc.diagnostics,
+                })
+                if message:
+                    content["diagnostic_message"] = message
+                return JSONResponse(status_code=409, content=content)
+
+        return migration_handler
+
+
+router = APIRouter(prefix="/api/onprem", dependencies=[Depends(require_access)],
+                   route_class=MigrationRoute)
 
 
 class StrictModel(BaseModel):
@@ -69,16 +91,24 @@ class Configuration(StrictModel):
     source_client_id: str = Field(min_length=1, max_length=256)
     source_email: str = Field(min_length=3, max_length=254)
     source_path: str = "/"
+    source_type: Literal["personal", "shared"] = "personal"
+    source_vd_hash: str = ""
+    source_folder: str = ""
     destination_url: str = Field(min_length=1, max_length=2048)
     destination_identity: str = Field(min_length=1, max_length=256)
     destination_root: str = ""
-    strategy: Literal["url", "staged"] = "url"
+    destination_type: Literal["personal", "shared"] = "personal"
+    destination_vd_hash: str = ""
+    destination_base: str = "disk:/"
+    strategy: Literal["url", "staged"] = "staged"
+    source_public: bool = Field(default=False, strict=True)
     identity_confirmed: Literal[True]
 
 
 class Credentials(StrictModel):
     source_client_secret: SecretStr
     destination_token: SecretStr
+    source_admin_token: SecretStr | None = None
 
 
 class AccessRequest(StrictModel):
@@ -86,21 +116,21 @@ class AccessRequest(StrictModel):
     credentials: Credentials
 
 
+class CredentialsRequest(AccessRequest):
+    point_retry_entry_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
 class CreateRequest(AccessRequest):
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
 class RetryRequest(StrictModel):
-    strategy: Literal["url", "staged"] = "url"
+    strategy: Literal["url", "staged"] = "staged"
 
 
-class ResolveRequest(StrictModel):
-    attempt_id: str = Field(min_length=1, max_length=64)
-    revision: int = Field(ge=0)
-    operation_id: str | None = None
-    terminal_status: Literal["success", "failed"] | None = None
-    evidence: str = Field(default="", max_length=2000)
-    confirmed: Literal[True]
+class PointRetryRequest(StrictModel):
+    attempt_id: str | None = Field(default=None, min_length=1, max_length=64)
+    revision: int = Field(ge=0, strict=True)
 
 
 async def body(request, model):
@@ -111,8 +141,21 @@ async def body(request, model):
         raise HTTPException(422, "invalid_request") from None
 
 
-def access_data(model):
+def access_data(model, *, new_job=False, staged_only=False):
     config = model.config.model_dump()
+    if (new_job or staged_only) and config["strategy"] != "staged":
+        raise HTTPException(422, "onprem_staged_required")
+    source_shared = config["source_type"] == "shared"
+    if not source_shared:
+        if config["source_vd_hash"] or config["source_folder"]:
+            raise HTTPException(422, "invalid_source_shared_disk")
+        for key in ("source_type", "source_vd_hash", "source_folder"):
+            config.pop(key)
+    if config["source_public"]:
+        if config["destination_type"] != "shared":
+            raise HTTPException(422, "invalid_source_public")
+    else:
+        config.pop("source_public")
     if ("@" not in config["source_email"] or "/" in config["source_email"]
             or any(c.isspace() for c in config["source_email"])):
         raise HTTPException(422, "invalid_source_email")
@@ -121,14 +164,42 @@ def access_data(model):
             raise HTTPException(422, "invalid_config")
     try:
         config["source_path"] = disk_path(config["source_path"])
-        config["destination_root"] = disk_path(
-            config["destination_root"] or "disk:/" + config["source_email"],
-        )
         config["destination_url"] = normalize_destination_url(config["destination_url"])
     except (MigrationError, ValueError):
         raise HTTPException(422, "invalid_paths_or_destination") from None
+    if config["destination_type"] == "shared":
+        try:
+            config["destination_base"] = disk_path(config["destination_base"])
+            folder = config.get("source_folder") or config["source_email"]
+            root = join_path(config["destination_base"], folder)
+            if (config["destination_root"]
+                    and disk_path(config["destination_root"]) != root):
+                raise ValueError("invalid_destination_shared_disk")
+            config["destination_root"] = root
+            config = canonical_config(config)
+            if new_job:
+                config.update(
+                    destination_base="disk:/",
+                    destination_root=join_path("disk:/", folder),
+                    source_public=not source_shared,
+                )
+                if source_shared or "strategy" not in model.config.model_fields_set:
+                    config["strategy"] = "staged"
+        except (MigrationError, ValueError):
+            raise HTTPException(422, "invalid_destination_shared_disk") from None
+    else:
+        if config["destination_vd_hash"]:
+            raise HTTPException(422, "invalid_destination_shared_disk")
+        for key in ("destination_type", "destination_vd_hash", "destination_base"):
+            config.pop(key)
+        try:
+            config["destination_root"] = disk_path(
+                config["destination_root"] or "disk:/" + config["source_email"],
+            )
+        except ValueError:
+            raise HTTPException(422, "invalid_paths_or_destination") from None
     credentials = {k: v.get_secret_value()
-                   for k, v in model.credentials.__dict__.items()}
+                   for k, v in model.credentials.__dict__.items() if v is not None}
     if any(not value or len(value) > 8192 or any(ord(c) < 32 for c in value)
            for value in credentials.values()):
         raise HTTPException(422, "invalid_credentials")
@@ -154,31 +225,37 @@ def require_live_job(job):
         raise HTTPException(409, "job_stopped")
 
 
-def has_pending_final_move(value, job_id):
-    return any(attempt["phase"] in FINAL_PENDING
-               for attempt in value.store.attempts(job_id))
+def require_batch_active(request, job_id, *, starting=False):
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is None:
+        return
+    try:
+        managed = batches.require_child_active(job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    if starting and managed:
+        raise HTTPException(409, "managed_batch_start_required")
 
 
 @contextmanager
-def guarded(value):
-    if not value.guard.acquire(blocking=False):
+def guarded(value, job_id=None):
+    lock = value.job_guard(job_id) if job_id else value.guard
+    if not lock.acquire(blocking=False):
         raise HTTPException(409, "job_busy")
     try:
         yield
-    except MigrationError as exc:
-        raise HTTPException(409, exc.code) from None
     except ValueError as exc:
         code = str(exc)
         if not re.fullmatch(r"[a-z_]{1,80}", code):
             code = "invalid_action"
         raise HTTPException(409, code) from None
     finally:
-        value.guard.release()
+        lock.release()
 
 
 @router.post("/preflight")
 async def preflight(request: Request):
-    config, credentials = access_data(await body(request, AccessRequest))
+    config, credentials = access_data(await body(request, AccessRequest), new_job=True)
     value = service(request)
     with guarded(value):
         return await asyncio.to_thread(value.runner.preflight, config, credentials)
@@ -187,7 +264,9 @@ async def preflight(request: Request):
 @router.post("/jobs")
 async def create_job(request: Request):
     model = await body(request, CreateRequest)
-    config, credentials = access_data(model)
+    if model.idempotency_key.startswith("batch-"):
+        raise HTTPException(422, "reserved_idempotency_key")
+    config, credentials = access_data(model, new_job=True)
     value = service(request)
     with guarded(value):
         job = value.store.create(config, model.idempotency_key)
@@ -201,14 +280,14 @@ async def create_job(request: Request):
 @router.post("/jobs/{job_id}/restart")
 async def restart(job_id: str, request: Request):
     model = await body(request, CreateRequest)
-    config, credentials = access_data(model)
+    config, credentials = access_data(model, staged_only=True)
     value = service(request)
-    with guarded(value):
-        job_of(value, job_id)
+    with guarded(value, job_id):
+        value.runner.require_staged_job(job_of(value, job_id))
         job = value.store.restart(job_id, config, model.idempotency_key)
         if (job["state"] == "queued" and job["revision"] == 0
                 and not job["stop_requested"] and not value.registry.get(job["id"])):
-            value.registry.put(job["id"], config, credentials)
+            value.registry.put(job["id"], job["config"], credentials)
     value.notify()
     return job
 
@@ -220,7 +299,7 @@ async def stop(job_id: str, request: Request):
     value = service(request)
     job_of(value, job_id)
     try:
-        job = value.store.request_stop(job_id)
+        job = value.store.request_full_stop(job_id)
     except ValueError:
         raise HTTPException(409, "job_not_stoppable") from None
     value.notify()
@@ -247,17 +326,29 @@ def entries(job_id: str, request: Request, limit: int = 200, offset: int = 0,
             state: str | None = None):
     value = service(request)
     job_of(value, job_id)
-    return {"entries": value.store.entries(
+    return {"entries": value.store.describe_entries(job_id, value.store.entries(
         job_id, limit=max(1, min(limit, 1000)), offset=max(0, offset), state=state,
-    )}
+    ))}
+
+
+@router.get("/jobs/{job_id}/entries/{entry_id}")
+def get_entry(job_id: str, entry_id: str, request: Request):
+    value = service(request)
+    job_of(value, job_id)
+    try:
+        return value.store.describe_entries(job_id, [{"id": entry_id}])[0]
+    except KeyError:
+        raise HTTPException(404, "entry_not_found") from None
 
 
 @router.post("/jobs/{job_id}/start")
 def start(job_id: str, request: Request):
+    require_batch_active(request, job_id, starting=True)
     value = service(request)
-    with guarded(value):
+    with guarded(value, job_id):
         job = job_of(value, job_id)
         require_live_job(job)
+        value.runner.require_staged_job(job)
         if job["state"] != "ready":
             raise HTTPException(409, "plan_not_ready")
         if not value.registry.get(job_id):
@@ -281,158 +372,193 @@ def pause(job_id: str, request: Request):
 
 @router.put("/jobs/{job_id}/credentials")
 async def credentials(job_id: str, request: Request):
-    config, secret = access_data(await body(request, AccessRequest))
+    require_batch_active(request, job_id)
+    model = await body(request, CredentialsRequest)
+    config, secret = access_data(model, staged_only=True)
     value = service(request)
-    with guarded(value):
+    with guarded(value, job_id):
         job = job_of(value, job_id)
-        stopped_final_move = (
-            job["state"] == "stopped" and has_pending_final_move(value, job_id)
-        )
-        if not stopped_final_move:
-            require_live_job(job)
+        require_live_job(job)
+        value.runner.require_staged_job(job)
         if job["config"] != config:
             raise HTTPException(409, "credential_binding_mismatch")
-        if not stopped_final_move and job["state"] not in {
+        if job["state"] not in {
             "awaiting_credentials", "ready", "paused", "needs_attention",
             "completed_with_issues",
         }:
             raise HTTPException(409, "job_not_awaiting_credentials")
-        # Read-only validation before trusting a freshly provided token.
-        validate = (value.runner.preflight_destination if stopped_final_move
-                    else value.runner.preflight)
-        await asyncio.to_thread(validate, config, secret)
-        if not stopped_final_move:
+        # A recovered point retry also reattaches without requiring SaaS.
+        active_entry = value.store.active_point_retry_entry(job_id)
+        retry_entry_id = model.point_retry_entry_id or (
+            active_entry["id"] if active_entry else None
+        )
+
+        def check_retry_entry():
+            if retry_entry_id is None:
+                return None
+            try:
+                entry = value.store.describe_entries(job_id, [{"id": retry_entry_id}])[0]
+            except KeyError:
+                raise HTTPException(404, "entry_not_found") from None
+            pending = value.store.active_point_retry_entry(job_id)
+            if not entry["can_retry"] and not (
+                pending and pending["id"] == entry["id"] and entry["kind"] == "file"
+            ):
+                raise HTTPException(409, "attempt_not_retryable")
+            return entry
+
+        retry_entry = check_retry_entry()
+        try:
+            if retry_entry:
+                attempt = (value.store.attempt(retry_entry["attempt_id"])
+                           if retry_entry["attempt_id"] else None)
+                await asyncio.to_thread(
+                    value.runner._logged, job, retry_entry, "check_destination_access",
+                    value.runner.preflight_destination, config, secret, attempt=attempt,
+                )
+            else:
+                await asyncio.to_thread(value.runner.preflight, config, secret)
+        except Exception:
             require_live_job(job_of(value, job_id))
+            raise
+        require_live_job(job_of(value, job_id))
+        check_retry_entry()
         value.registry.put(job_id, config, secret)
-    if stopped_final_move:
-        value.notify()
     return value.store.get(job_id)
 
 
 @router.post("/jobs/{job_id}/resume")
 def resume(job_id: str, request: Request):
+    require_batch_active(request, job_id)
     value = service(request)
-    with guarded(value):
+    value.runner.require_staged_job(job_of(value, job_id))
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is not None:
+        batches.prepare_child_retry(job_id)
+    with guarded(value, job_id):
         job = job_of(value, job_id)
         require_live_job(job)
         if not value.registry.get(job_id):
             raise HTTPException(409, "credentials_required")
         if job["state"] not in {"paused", "awaiting_credentials", "needs_attention"}:
             raise HTTPException(409, "job_not_resumable")
-        if any(e["state"] == "outcome_unknown"
-               for e in value.store.entries(job_id, limit=1000000)):
+        entries = value.store.entries(job_id, limit=1000000)
+        if (not job["point_retry_active"]
+                and not any(e["state"] == "planned" or e["state"] in ACTIVE
+                            for e in entries)
+                and any(e["state"] == "outcome_unknown" for e in entries)):
             raise HTTPException(409, "active_or_unknown_attempt")
         if job.get("namespace_state") in {"intent", "unknown"}:
             raise HTTPException(409, "technical_namespace_outcome_unknown")
         target = job.get("resume_state")
-        if target in {"queued", "planning"}:
+        if job["point_retry_active"]:
+            target = "running"
+        elif target in {"queued", "planning"}:
             target = "queued"
         elif target == "ready":
             target = "ready"
-        elif not value.store.entries(job_id, limit=1):
+        elif not entries:
             target = "queued"
         else:
             target = "running"
         value.store.update_job(job_id, state=target, resume_state=None,
                                pause_requested=False, error=None)
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is not None:
+        batches.activate_child_retry(job_id)
     value.notify()
     return value.store.get(job_id)
 
 
 @router.post("/jobs/{job_id}/retry")
 async def retry(job_id: str, request: Request):
+    require_batch_active(request, job_id)
     model = await body(request, RetryRequest)
+    if model.strategy != "staged":
+        raise HTTPException(422, "onprem_staged_required")
     value = service(request)
-    with guarded(value):
+    value.runner.require_staged_job(job_of(value, job_id))
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is not None:
+        batches.prepare_child_retry(job_id)
+    with guarded(value, job_id):
         require_live_job(job_of(value, job_id))
         if not value.registry.get(job_id):
             raise HTTPException(409, "credentials_required")
         value.runner.retry(job_id, model.strategy)
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is not None:
+        batches.activate_child_retry(job_id)
     value.notify()
     return value.store.get(job_id)
 
 
-@router.post("/jobs/{job_id}/resolve")
-async def resolve(job_id: str, request: Request):
-    model = await body(request, ResolveRequest)
+@router.post("/jobs/{job_id}/entries/{entry_id}/retry")
+async def point_retry(job_id: str, entry_id: str, request: Request):
+    require_batch_active(request, job_id)
+    model = await body(request, PointRetryRequest)
     value = service(request)
-    with guarded(value):
-        job = job_of(value, job_id)
-        if job.get("stop_requested") and job["state"] != "stopped":
-            raise HTTPException(409, "job_stopped")
+    value.runner.require_staged_job(job_of(value, job_id))
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is not None:
+        batches.prepare_child_retry(job_id)
+    with guarded(value, job_id):
+        require_live_job(job_of(value, job_id))
+        if not value.registry.get(job_id):
+            raise HTTPException(409, "credentials_required")
         try:
-            attempt = value.store.attempt(model.attempt_id)
-            entry = value.store.entry(attempt["entry_id"])
+            value.store.entry(entry_id)
         except KeyError:
-            raise HTTPException(404, "attempt_not_found") from None
-        stopped_final_move = (
-            job["state"] == "stopped" and attempt["phase"] in FINAL_PENDING
+            raise HTTPException(404, "entry_not_found") from None
+        if model.attempt_id is not None:
+            try:
+                value.store.attempt(model.attempt_id)
+            except KeyError:
+                raise HTTPException(404, "attempt_not_found") from None
+        value.store.queue_point_retry(
+            job_id, entry_id, model.attempt_id, model.revision,
         )
-        if job["state"] == "stopped" and not stopped_final_move:
-            raise HTTPException(409, "job_stopped")
-        if (entry["job_id"] != job_id or entry["attempt_id"] != attempt["id"]
-                or (not stopped_final_move and attempt["phase"] not in UNKNOWN_PHASES)):
-            raise HTTPException(409, "attempt_not_unknown")
-        if job["revision"] != model.revision:
-            raise HTTPException(409, "stale_revision")
-        is_move = "move" in attempt["phase"]
-        if model.operation_id:
-            if (
-                model.terminal_status
-                or not valid_operation_reference(model.operation_id)
-            ):
-                raise HTTPException(422, "invalid_operation_id")
-            if (stopped_final_move and attempt["operation_id"]
-                    and attempt["operation_id"] != model.operation_id):
-                raise HTTPException(409, "operation_reference_mismatch")
-            if stopped_final_move:
-                destination = value.runner.destination_client(job)
-            else:
-                _, destination = value.runner.clients(job)
-            status = await asyncio.to_thread(destination.poll, model.operation_id)
-            phase = "waiting_move" if is_move else "waiting_transfer"
-            if stopped_final_move and status == "success":
-                phase = "verifying_final"
-            operation_id = model.operation_id
-        else:
-            if (not model.terminal_status or len(model.evidence.strip()) < 20
-                    or re.search(r"https?://|oauth|bearer|token=", model.evidence, re.I)
-                    or re.fullmatch(r".*(?:404|timeout|таймер|таймаут).*",
-                                    model.evidence, re.I)):
-                raise HTTPException(422, "terminal_server_evidence_required")
-            status, operation_id = model.terminal_status, None
-            phase = "verifying_final" if is_move else "verifying"
-        value.store.resolve_attempt(
-            job_id, attempt["id"], model.revision,
-            phase="failed" if status == "failed" else phase,
-            operation_id=operation_id,
-            entry_state="failed" if status == "failed" else (
-                "committing" if is_move else "verifying"
-            ),
-            error="remote_operation_failed" if status == "failed" else None,
-            status=status,
-            evidence_kind="operation_reference" if operation_id
-            else "administrator_terminal_server_evidence",
-            evidence_digest=hashlib.sha256(model.evidence.encode("utf-8")).hexdigest()
-            if not operation_id else None,
-        )
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches is not None:
+        batches.activate_child_retry(job_id)
+    value.notify()
     return value.store.get(job_id)
 
 
 @router.post("/jobs/{job_id}/cleanup")
 def cleanup(job_id: str, request: Request):
     value = service(request)
-    with guarded(value):
+    with guarded(value, job_id):
         job_of(value, job_id)
         return value.runner.cleanup(job_id)
 
 
+@router.post("/cache/cleanup")
+def cleanup_cache(request: Request):
+    value = service(request)
+    if not value.guard.acquire(blocking=False):
+        raise HTTPException(409, "cache_in_use")
+    try:
+        if any(owner.startswith("onprem:") for owner in value.slots.active_owners):
+            raise HTTPException(409, "cache_in_use")
+        return value.runner.cleanup_cache()
+    finally:
+        value.guard.release()
+
+
 @router.get("/jobs/{job_id}/events")
-async def events(job_id: str, request: Request, after: int = 0, format: str = "sse"):
+async def events(job_id: str, request: Request, after: int = 0, format: str = "sse",
+                 tail: int = Query(0, ge=0, le=500)):
     value = service(request)
     job_of(value, job_id)
     if format == "json":
-        return {"events": value.store.events(job_id, after=max(0, after))}
+        if after <= 0 and tail:
+            cutoff = value.store.last_sequence(job_id)
+            cursor = value.store.tail_cursor(job_id, tail, cutoff)
+            return {"events": value.store.events(
+                job_id, after=cursor, limit=tail, through=cutoff, journal=True,
+            )}
+        return {"events": value.store.events(job_id, after=max(0, after), journal=True)}
     try:
         cursor = max(0, after, int(request.headers.get("Last-Event-ID", "0")))
     except ValueError:
@@ -441,7 +567,7 @@ async def events(job_id: str, request: Request, after: int = 0, format: str = "s
     async def stream():
         nonlocal cursor
         while not await request.is_disconnected():
-            batch = value.store.events(job_id, after=cursor)
+            batch = value.store.events(job_id, after=cursor, journal=True)
             for event in batch:
                 cursor = event["sequence"]
                 yield f"id: {cursor}\ndata: {json.dumps(event, ensure_ascii=True)}\n\n"
@@ -458,6 +584,66 @@ def csv_cell(value):
     return "'" + text if text.startswith(("=", "+", "-", "@", "\t", "\r")) else text
 
 
+@router.get("/jobs/{job_id}/journal")
+def journal(job_id: str, request: Request):
+    value = service(request)
+    job_of(value, job_id)
+    cutoff = value.store.last_sequence(job_id)
+
+    def stream():
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "timestamp_utc", "sequence", "job_id", "event_type", "stage",
+            "stage_label", "status", "status_label", "source", "destination",
+            "kind", "size", "strategy", "attempt_id", "operation_id",
+            "remote_path", "http_status", "error", "error_message", "duration_ms",
+            "remote_status", "download_attempts", "max_download_attempts",
+            "retry_delay_ms", "retry_at_ms", "point_retry_attempts",
+            "max_point_retry_attempts",
+            "error_side", "api_error", "api_reason", "transport_error",
+            "request_host", "request_id", "diagnostic_message",
+        ])
+        yield "\ufeff" + output.getvalue()
+        cursor = 0
+        while cursor < cutoff:
+            batch = value.store.events(job_id, after=cursor, limit=200,
+                                       through=cutoff, journal=True)
+            if not batch:
+                break
+            output.seek(0)
+            output.truncate(0)
+            for event in batch:
+                payload, context = event["payload"], event["context"]
+                writer.writerow([csv_cell(item) for item in (
+                    event["created_at"], event["sequence"], job_id, event["type"],
+                    payload.get("stage", payload.get("phase")), event["stage_label"],
+                    payload.get("status", payload.get("state")), event["status_label"],
+                    context["source"], context["destination"], context["kind"],
+                    context["size"], context["strategy"], payload.get("attempt_id"),
+                    payload.get("operation_id"), context["remote_path"],
+                    payload.get("http_status"), payload.get("error"),
+                    event["error_message"], payload.get("duration_ms"),
+                    payload.get("remote_status"),
+                    payload.get("download_attempts"),
+                    payload.get("max_download_attempts"),
+                    payload.get("retry_delay_ms"), payload.get("retry_at_ms"),
+                    payload.get("point_retry_attempts"),
+                    payload.get("max_point_retry_attempts"),
+                    payload.get("error_side"), payload.get("api_error"),
+                    payload.get("api_reason"), payload.get("transport_error"),
+                    payload.get("request_host"), payload.get("request_id"),
+                    event["diagnostic_message"],
+                )])
+            cursor = batch[-1]["sequence"]
+            yield output.getvalue()
+
+    return StreamingResponse(stream(), media_type="text/csv; charset=utf-8", headers={
+        "Content-Disposition": f'attachment; filename="migration-journal-{job_id}.csv"',
+        "Cache-Control": "no-store",
+    })
+
+
 @router.get("/jobs/{job_id}/report")
 def report(job_id: str, request: Request):
     value = service(request)
@@ -466,16 +652,22 @@ def report(job_id: str, request: Request):
     writer = csv.writer(output)
     writer.writerow(["source", "destination", "kind", "size", "md5", "modified",
                      "strategy", "state", "verification", "error", "remote_path",
-                     "remote_phase"])
+                     "remote_phase", "download_attempts", "retry_at_ms",
+                     "point_retry_attempts", "max_point_retry_attempts"])
     for entry in value.store.entries(job_id, limit=1000000):
         attempt = (value.store.attempt(entry["attempt_id"])
                    if entry.get("attempt_id") else {})
         writer.writerow([csv_cell(v) for v in (
-            entry["source_path"], entry["destination_path"], entry["kind"],
+            entry["source_path"],
+            destination_path(job["config"], entry["destination_path"]),
+            entry["kind"],
             entry["size"], entry.get("md5"), entry.get("modified"),
             attempt.get("strategy", job["config"]["strategy"]), entry["state"],
             entry.get("verification"), entry.get("error"),
-            attempt.get("remote_path"), attempt.get("phase"),
+            (destination_path(job["config"], attempt["remote_path"])
+             if attempt.get("remote_path") else None), attempt.get("phase"),
+            entry.get("download_attempts", 0), entry.get("retry_at_ms"),
+            entry.get("point_retry_attempts", 0), 3,
         )])
     return Response("\ufeff" + output.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition":

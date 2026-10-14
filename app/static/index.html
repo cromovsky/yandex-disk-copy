@@ -263,13 +263,20 @@
     .status.running { color: #c2410c; }
     .status.done { color: #15803d; }
     .status.error { color: #dc2626; }
-    #log {
+    #log, #onprem-log {
       grid-column: 1 / -1; background: #fff; color: #2b2f36;
       border: 1px solid #eceef1;
       border-radius: 20px; padding: 18px 20px; height: 380px; overflow-y: auto;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
       white-space: pre-wrap; line-height: 1.55; box-shadow: 0 4px 20px rgba(52,52,60,.05);
     }
+    #run-start-recovery[hidden] { display: none !important; }
+    #run-journal-cleanup-panel { text-align: center; }
+    #run-journal-cleanup-panel .onprem-actions { justify-content: center; }
+    #run-history { min-width: 0; width: 100%; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: #fbfbfc; color: var(--ink); font: inherit; font-size: 14px; }
+    [data-theme="dark"] #run-history { background: #23272f; border-color: #2b303a; }
+    #run-journal-notice { color: #c2410c; }
+    [data-theme="dark"] #run-journal-notice { color: #f1cf7e; }
     #log:empty::before { content: attr(data-empty); color: #9a9ba6;
                          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
                          font-size: 13px; line-height: 1.6; }
@@ -311,9 +318,11 @@
     [data-theme="dark"] .hero,
     [data-theme="dark"] .card,
     [data-theme="dark"] .modal,
-    [data-theme="dark"] #log { background: #1c1f26; border-color: #2b303a; }
+    [data-theme="dark"] #log,
+    [data-theme="dark"] #onprem-log { background: #1c1f26; border-color: #2b303a; }
     [data-theme="dark"] .modal { color: var(--ink); }
-    [data-theme="dark"] #log { color: #cfd2d8; }
+    [data-theme="dark"] #log,
+    [data-theme="dark"] #onprem-log { color: #cfd2d8; }
     /* заголовки и текст */
     [data-theme="dark"] .modal h2,
     [data-theme="dark"] .modal h3,
@@ -420,6 +429,15 @@
       margin: 12px 0; }
     .onprem-actions .secondary-btn { flex: 0 1 auto; min-width: 0; padding: 8px 14px; }
     .onprem-actions select { width: auto !important; max-width: 100%; min-height: 42px; }
+    #onprem-run-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 20px; }
+    #onprem-run-actions .run-btn { width: 100%; min-width: 0; }
+    #onprem-transfer-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 20px; }
+    @media (max-width: 800px) {
+      #onprem-run-actions { grid-template-columns: minmax(0, 1fr); }
+      #onprem-transfer-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     .onprem-history { display: flex; flex-direction: column; gap: 8px; }
     .onprem-history > div { min-width: 0; width: 100%; }
     .onprem-history-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
@@ -450,10 +468,11 @@
     .onprem-result.attention { color: #996200; }
     #onprem-notice, #onprem-poll-notice { margin: 0; min-height: 22px; font-size: 13px; line-height: 1.5; }
     #onprem-notice.error, #onprem-poll-notice.error { color: #dc2626; }
-    #onprem-log { min-height: 100px; max-height: 260px; overflow: auto;
-      margin: 0; padding: 12px 0; white-space: pre-wrap; overflow-wrap: anywhere;
+    #onprem-log { height: auto; min-height: 100px; max-height: 260px; overflow: auto;
+      margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
       font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.6; }
-    #onprem-remote-attempts { margin: 8px 0; }
+    #onprem-cleanup-panel { text-align: center; }
+    #onprem-cleanup-panel .onprem-actions { justify-content: center; }
     [data-theme="dark"] #mode-onprem select,
     [data-theme="dark"] #mode-onprem textarea { background: #23272f; color: var(--ink); }
     [data-theme="dark"] .onprem-warning { background: #332b17; color: #f1cf7e; }
@@ -478,6 +497,59 @@
       .onprem-actions .secondary-btn { flex: 1 1 auto; }
       .onprem-summary { gap: 12px; }
     }
+    .source-input-choice { margin: 0 0 18px; }
+    .source-input-choice select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font: inherit; }
+    .source-batches[hidden], .source-batches [hidden], #mode-local [hidden], [data-source-single][hidden] { display: none !important; }
+    .source-batches { margin-top: 18px; }
+    .source-batches textarea { width: 100%; min-height: 150px; box-sizing: border-box; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font: 13px/1.5 ui-monospace, monospace; }
+    .source-batches .batch-run-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 18px 0 8px; }
+    .source-batches .batch-transfer-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .source-batches .batch-run-actions button, .source-batches .batch-transfer-actions button { width: 100%; min-width: 0; }
+    .source-batches .onprem-table-wrap { overflow: visible; }
+    .source-batches .onprem-table { min-width: 0; line-height: 1.35; }
+    .source-batches .onprem-table th, .source-batches .onprem-table td { padding: 7px 6px; }
+    .source-batches .batch-sources-table th:nth-child(1) { width: 5%; }
+    .source-batches .batch-sources-table th:nth-child(2) { width: 24%; }
+    .source-batches .batch-sources-table th:nth-child(3) { width: 12%; }
+    .source-batches .batch-sources-table th:nth-child(4) { width: 8%; }
+    .source-batches .batch-sources-table th:nth-child(5) { width: 13%; }
+    .source-batches .batch-sources-table th:nth-child(6) { width: 10%; }
+    .source-batches .batch-sources-table th:nth-child(7) { width: 12%; }
+    .source-batches .batch-sources-table th:nth-child(8) { width: 16%; }
+    .source-batches .batch-sources-table th:first-child,
+    .source-batches .batch-sources-table td:first-child { text-align: center; }
+    .source-batches .batch-sources-table td:nth-child(2) { white-space: pre-line; }
+    .source-batches .batch-entries-table th:nth-child(1),
+    .source-batches .batch-entries-table th:nth-child(2) { width: 36%; }
+    .source-batches td input[type="checkbox"] { width: 18px; height: 18px; margin: 0; padding: 0; }
+    .source-batches td button { display: block; width: 100%; min-width: 0;
+      min-height: 30px; padding: 5px 6px; margin: 0 0 5px; border-radius: 7px;
+      font-size: 12px; line-height: 1.3; white-space: normal; overflow-wrap: anywhere; }
+    .source-batches td button:last-child { margin-bottom: 0; }
+    .source-batches .batch-notice { margin: 12px 0; min-height: 22px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .source-batches .batch-notice.error { color: #dc2626; }
+    [data-theme="dark"] .source-input-choice select, [data-theme="dark"] .source-batches textarea { background: #23272f; }
+    .source-batches [data-batch-details] { margin-top: 20px; }
+    @media (max-width: 760px) {
+      .source-batches .onprem-table, .source-batches .onprem-table tbody { display: block; }
+      .source-batches .onprem-table thead { display: none; }
+      .source-batches .onprem-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 12px; padding: 6px; border-bottom: 1px solid var(--line); }
+      .source-batches .onprem-table tr:last-child { border-bottom: 0; }
+      .source-batches .onprem-table td { display: block; min-width: 0; border: 0; padding: 5px; }
+      .source-batches .onprem-table td::before { content: attr(data-label); display: block;
+        margin-bottom: 3px; color: var(--ink-soft); font-size: 11px; font-weight: 600; white-space: normal; }
+      .source-batches .batch-sources-table td:first-child { display: flex; align-items: center; gap: 8px; }
+      .source-batches .batch-sources-table td:first-child::before { margin: 0; }
+      .source-batches .batch-sources-table td:nth-child(2),
+      .source-batches .batch-sources-table td:nth-child(8) { grid-column: 1 / -1; }
+      .source-batches .batch-entries-table td:nth-child(1),
+      .source-batches .batch-entries-table td:nth-child(2) { grid-column: 1 / -1; }
+    }
+    @media (max-width: 640px) {
+      .source-batches .batch-run-actions { grid-template-columns: minmax(0, 1fr); }
+      .source-batches .batch-transfer-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -500,7 +572,7 @@
       <button class="mode-tab active" data-mode="single">Одна организация</button>
       <button class="mode-tab" data-mode="cross">Между организациями</button>
       <button class="mode-tab" data-mode="local">Сохранить локально</button>
-      <button class="mode-tab" data-mode="onprem" disabled title="В разработке">SaaS → On-premises</button>
+      <button class="mode-tab" data-mode="onprem" disabled title="SaaS → On-premises">SaaS → On-premises</button>
     </div>
 
     <div id="mode-single" class="mode-panel active">
@@ -758,6 +830,13 @@
     </div>
 
     <div id="mode-local" class="mode-panel">
+      <div class="source-input-choice">
+        <label for="local-source-input">Источники</label>
+        <select id="local-source-input">
+          <option value="single" selected>Один диск</option>
+          <option value="list">Список дисков из CSV</option>
+        </select>
+      </div>
       <div class="forms">
         <div class="card">
           <div class="card-title">Организация источника</div>
@@ -765,18 +844,22 @@
           <input id="local_client_id" autocomplete="off" placeholder="id сервисного приложения">
           <label for="local_client_secret">CLIENT_SECRET</label>
           <input id="local_client_secret" type="password" autocomplete="off">
-          <label for="local_orgid">ORGID</label>
+          <label for="local_orgid">ID организации (ORGID)</label>
           <input id="local_orgid" autocomplete="off" placeholder="ID организации источника">
-          <label for="local_admin_token">ADMIN_TOKEN</label>
+          <div id="local-single-admin">
+          <label for="local_admin_token">Токен администратора (ADMIN_TOKEN)</label>
           <input id="local_admin_token" type="password" autocomplete="off"
                  placeholder="токен с правами на сотрудников">
+          <p id="local-admin-note" class="field-note">Для одного диска обязателен: проверяет сотрудника и при необходимости временно снимает блокировку.</p>
+          </div>
           <p class="field-note">
-            Укажите доступы организации, с Диска которой нужно сохранить файлы.
+            Доступ к Диску утилита получает по email через сервисное приложение — нужны его CLIENT_ID и CLIENT_SECRET.
           </p>
         </div>
 
         <div class="card">
           <div class="card-title">Что сохраняем</div>
+          <div id="local-single-source" data-source-single="local">
           <label>Тип диска</label>
           <div class="dest-type" role="radiogroup" aria-label="Тип диска для локального сохранения">
             <label class="chip">
@@ -808,17 +891,16 @@
           <p class="field-note">
             Путь внутри выбранного диска. <code>/</code> сохраняет весь диск.
           </p>
-          <details>
-            <summary>Дополнительные настройки</summary>
-            <label for="local_page_limit">PAGE_LIMIT</label>
-            <input id="local_page_limit" type="number" min="1" max="1000" value="1000">
-            <p class="field-note">
-              Число элементов в одном запросе при обходе папок.
-              Все файлы сохраняются независимо от размера страницы.
-            </p>
-          </details>
+          </div>
+          <label for="local_page_limit">PAGE_LIMIT</label>
+          <input id="local_page_limit" type="number" min="1" max="1000" value="1000">
+          <p class="field-note">
+            Число элементов в одном запросе при обходе папок.
+            Все файлы сохраняются независимо от размера страницы.
+          </p>
         </div>
       </div>
+      <div id="local-single-run" data-source-single="local">
       <p class="hint">
         Файлы сохраняются на машине, где запущена утилита.
         Личный Диск — в <code data-local-hint>./downloads</code>/<code>&lt;email&gt;</code>,
@@ -830,59 +912,214 @@
       <div class="run-row">
         <button id="run-local" class="run-btn" type="button">Сохранить локально</button>
       </div>
+      </div>
+      <section id="local-source-batches" class="source-batches onprem-section" hidden>
+        <h2>Список источников</h2>
+        <label for="local-batch-file">Загрузить CSV</label>
+        <input id="local-batch-file" type="file" accept=".csv,text/csv">
+        <p class="field-note"><a href="/static/source-list-template.csv" download>Скачать шаблон</a>. Один источник на строку, до 1000 строк; секреты в CSV не нужны.</p>
+        <label for="local-batch-csv">Список дисков</label>
+        <textarea id="local-batch-csv" autocomplete="off" spellcheck="false" placeholder="type,email,vd_hash,path&#10;personal,user@company.ru,,/&#10;shared,reader@company.ru,disk-hash,/"></textarea>
+        <p class="field-note">Для личного Диска email — владелец; для общего — сотрудник с доступом, vd_hash — метка из адреса /vd/. Папка назначения: email либо название общего диска + его ID. Общие настройки доступа берутся из полей выше.</p>
+        <div class="batch-run-actions">
+          <button id="local-batch-plan" class="run-btn" type="button" disabled>Dry Run</button>
+          <button id="local-batch-start" class="run-btn" type="button" disabled>Начать сохранение</button>
+        </div>
+        <div class="batch-transfer-actions">
+          <button id="local-batch-pause" class="secondary-btn" type="button" disabled>Пауза</button>
+          <button id="local-batch-resume" class="secondary-btn" type="button" disabled>Продолжить</button>
+          <button id="local-batch-stop" class="secondary-btn" type="button" disabled>Остановить полностью</button>
+          <button id="local-batch-restart" class="secondary-btn" type="button" disabled>Начать заново</button>
+        </div>
+        <p class="field-note">Dry Run сначала проверяет доступ, затем составляет полный план без публикации, скачивания и создания папок. Ошибочный источник можно исключить галочкой или проверить повторно. Начало доступно после готовности всех выбранных источников. Одновременно работают не более четырёх источников во всей утилите.</p>
+        <p id="local-batch-notice" class="batch-notice" role="status" aria-live="polite"></p>
+        <label for="local-batch-history">История списков</label>
+        <div class="onprem-actions">
+          <select id="local-batch-history"><option value="">Выберите список</option></select>
+          <button id="local-batch-refresh" class="secondary-btn" type="button">Обновить</button>
+          <button id="local-batch-history-previous" class="secondary-btn" type="button" aria-label="Более новые списки" disabled>←</button>
+          <button id="local-batch-history-next" class="secondary-btn" type="button" aria-label="Более старые списки" disabled>→</button>
+        </div>
+        <section id="local-batch-result" hidden>
+          <h2>Список от <span id="local-batch-date"></span></h2>
+          <dl class="onprem-summary">
+            <div><dt>Состояние</dt><dd id="local-batch-state"></dd></div>
+            <div><dt>Источники</dt><dd id="local-batch-count"></dd></div>
+            <div><dt>Всего данных</dt><dd id="local-batch-bytes"></dd></div>
+            <div><dt>Нужно перенести</dt><dd id="local-batch-required"></dd></div>
+            <div><dt>Проверено</dt><dd id="local-batch-verified"></dd></div>
+            <div><dt>Скачивание</dt><dd id="local-batch-download-rate">—</dd></div>
+            <div><dt>Загрузка на диск</dt><dd id="local-batch-upload-rate">—</dd></div>
+          </dl>
+          <div class="onprem-actions">
+            <button id="local-batch-report" class="secondary-btn" type="button" disabled>Скачать план CSV</button>
+            <button id="local-batch-journal" class="secondary-btn" type="button" disabled>Скачать журнал CSV</button>
+          </div>
+          <p id="local-batch-error" class="batch-notice error" hidden></p>
+          <div class="onprem-table-wrap">
+            <table class="onprem-table batch-sources-table">
+              <thead><tr><th>Вкл.</th><th>Источник → папка</th><th>Состояние</th><th>Файлы / папки</th><th>Всего / к переносу</th><th>Крупнейший файл</th><th>Скачивание / загрузка</th><th>Действия и ошибка</th></tr></thead>
+              <tbody id="local-batch-sources"></tbody>
+            </table>
+          </div>
+          <section id="local-batch-details" data-batch-details hidden>
+            <h2>Файлы источника <span id="local-batch-details-name"></span></h2>
+            <div class="onprem-table-wrap"><table class="onprem-table batch-entries-table">
+              <thead><tr><th>Источник</th><th>Назначение</th><th>Размер</th><th>Результат</th></tr></thead>
+              <tbody id="local-batch-entries"></tbody>
+            </table></div>
+            <div class="onprem-actions">
+              <button id="local-batch-entries-previous" class="secondary-btn" type="button" disabled>←</button>
+              <span id="local-batch-entries-page" class="field-note"></span>
+              <button id="local-batch-entries-next" class="secondary-btn" type="button" disabled>→</button>
+            </div>
+          </section>
+        </section>
+      </section>
     </div>
 
     <div id="mode-onprem" class="mode-panel" hidden>
-      <p class="onprem-warning">Пилотный режим. Совместимость и безопасная финализация должны быть подтверждены на стенде.</p>
-
       <div id="onprem-access" class="onprem-section" hidden>
         <label for="onprem-access-key">Ключ доступа к режиму on-premises</label>
         <input id="onprem-access-key" type="password" autocomplete="new-password">
       </div>
 
       <form id="onprem-form" autocomplete="off">
+      <div class="source-input-choice">
+        <label for="onprem-source-input">Источники</label>
+        <select id="onprem-source-input">
+          <option value="single" selected>Один диск</option>
+          <option value="list">Список дисков из CSV</option>
+        </select>
+      </div>
+
         <div class="forms">
           <div class="card">
             <div class="card-title">Источник — SaaS</div>
-            <label for="onprem-source-org">ID организации</label>
+            <label for="onprem-source-org">ID организации (ORGID)</label>
             <input id="onprem-source-org" data-onprem-config="source_org_id" required autocomplete="off">
             <label for="onprem-source-client">Client ID сервисного приложения</label>
             <input id="onprem-source-client" data-onprem-config="source_client_id" required autocomplete="off">
             <label for="onprem-source-secret">Client secret</label>
             <input id="onprem-source-secret" type="password" required autocomplete="new-password">
-            <label for="onprem-source-email">Email сотрудника</label>
+            <label for="onprem-source-admin-token">Токен администратора (ADMIN_TOKEN, необязательно)</label>
+            <input id="onprem-source-admin-token" type="password" autocomplete="new-password" placeholder="токен с правом directory:read_users">
+            <p class="field-note">Доступ к Диску даёт сервисное приложение. Админский токен дополнительно проверяет email в указанной организации и блокировку сотрудника, без изменения его статуса.</p>
+            <div id="onprem-single-source" data-source-single="onprem">
+            <label id="onprem-source-email-label" for="onprem-source-email">Email владельца личного Диска SaaS</label>
             <input id="onprem-source-email" data-onprem-config="source_email" type="email" required autocomplete="off">
+            <p id="onprem-source-folder-note" class="field-note">Для каждого email создаётся собственная папка на общем диске; структура исходных папок сохраняется.</p>
             <label for="onprem-source-path">Исходный путь</label>
             <input id="onprem-source-path" data-onprem-config="source_path" value="/" required autocomplete="off">
+            </div>
           </div>
           <div class="card">
-            <div class="card-title">Получатель — On-premises</div>
+            <div class="card-title">Общий диск — On-premises</div>
             <label for="onprem-destination-url">Адрес API</label>
             <input id="onprem-destination-url" data-onprem-config="destination_url" type="url" required autocomplete="off" placeholder="https://disk-api.company.ru">
             <label for="onprem-destination-identity">Владелец токена назначения</label>
-            <input id="onprem-destination-identity" data-onprem-config="destination_identity" required autocomplete="off" placeholder="Логин или email получателя">
-            <label for="onprem-destination-token">OAuth-токен получателя</label>
+            <input id="onprem-destination-identity" data-onprem-config="destination_identity" required autocomplete="off" placeholder="Логин или email владельца токена">
+            <label for="onprem-destination-token">Токен сотрудника с доступом к общему диску</label>
             <input id="onprem-destination-token" type="password" required autocomplete="new-password">
-            <label for="onprem-destination-root">Папка назначения</label>
-            <input id="onprem-destination-root" data-onprem-config="destination_root" required autocomplete="off" placeholder="disk:/source@company.ru">
+            <p class="field-note">Нужны права чтения и записи на общий диск и OAuth-права чтения и записи Диска.</p>
+            <label for="onprem-destination-vd-hash">Метка существующего общего диска</label>
+            <input id="onprem-destination-vd-hash" data-onprem-config="destination_vd_hash" required autocomplete="off" placeholder="Метка после vd/ в адресе диска">
+            <p class="field-note">Возьмите метку из адреса <code>.../vd/&lt;метка&gt;/...</code>. Это не email и не ID ресурса. Утилита использует уже созданный общий диск.</p>
+            <p id="onprem-destination-preview" class="field-note" aria-live="polite"></p>
+            <p id="onprem-destination-check" class="field-note" role="status" hidden></p>
             <label for="onprem-strategy">Способ переноса</label>
-            <select id="onprem-strategy" data-onprem-config="strategy">
-              <option value="url" selected>Напрямую по ссылке</option>
-              <option value="staged">С временным сохранением</option>
-            </select>
+            <input id="onprem-strategy" data-onprem-config="strategy" type="hidden" value="staged" readonly>
+            <p class="field-note">С временным сохранением в кэш</p>
+            <p class="field-note">После «Начать перенос» утилита публикует папку или файл личного источника; для всего Диска — папки верхнего уровня и файлы в корне. Ссылки остаются публичными после завершения и остановки.</p>
           </div>
         </div>
         <label class="onprem-check" for="onprem-identity-confirmed">
           <input id="onprem-identity-confirmed" type="checkbox" required>
-          <span>Подтверждаю привязку токена к указанному получателю. При повторном предоставлении доступа владелец токена проверен заново.</span>
+          <span>Подтверждаю, что токен принадлежит указанному сотруднику. При повторном предоставлении доступа владелец токена проверен заново.</span>
         </label>
-        <div class="run-row">
-          <button id="onprem-plan" class="run-btn" type="submit" disabled>Подготовить план</button>
+        <div id="onprem-single-run" data-source-single="onprem">
+        <div id="onprem-run-actions" class="run-row">
+          <button id="onprem-plan" class="run-btn" type="submit" disabled>Dry Run</button>
+          <button id="onprem-start" class="run-btn" type="button" disabled>Начать перенос</button>
         </div>
+        <div id="onprem-transfer-actions" class="onprem-actions">
+          <button id="onprem-pause" class="secondary-btn" type="button" disabled>Пауза</button>
+          <button id="onprem-resume" class="secondary-btn" type="button" disabled>Продолжить</button>
+          <button id="onprem-stop" class="secondary-btn" type="button" disabled>Остановить полностью</button>
+          <button id="onprem-restart" class="secondary-btn" type="button" disabled>Начать заново</button>
+        </div>
+        <p class="field-note">Dry Run проверяет доступ к дискам и готовит план без переноса файлов. После готовности плана проверьте итоговые пути и нажмите «Начать перенос». «Продолжить» возобновляет перенос или повторяет ошибочные объекты. «Начать заново» создаёт новый план; прежняя история сохраняется. «Остановить полностью» отменяет все незавершённые локальные действия и фоновые проверки. После подтверждённой остановки общая очередь свободна, пути не блокируются. Принятая сервером операция может продолжаться: API не предоставляет её отмену.</p>
+        <p class="field-note">В новых заданиях файл загружается сразу под исходным именем в целевую папку. Он может быть виден до завершения загрузки; результат «Перенесено» подтверждается проверкой размера и MD5.</p>
+        </div>
+      <section id="onprem-source-batches" class="source-batches onprem-section" hidden>
+        <h2>Список источников</h2>
+        <label for="onprem-batch-file">Загрузить CSV</label>
+        <input id="onprem-batch-file" type="file" accept=".csv,text/csv">
+        <p class="field-note"><a href="/static/source-list-template.csv" download>Скачать шаблон</a>. Один источник на строку, до 1000 строк; секреты в CSV не нужны.</p>
+        <label for="onprem-batch-csv">Список дисков</label>
+        <textarea id="onprem-batch-csv" autocomplete="off" spellcheck="false" placeholder="type,email,vd_hash,path&#10;personal,user@company.ru,,/&#10;shared,reader@company.ru,disk-hash,/"></textarea>
+        <p class="field-note">Для личного Диска email — владелец; для общего — сотрудник с доступом, vd_hash — метка из адреса /vd/. Папка назначения: email либо название общего диска + его ID. Общие настройки доступа берутся из полей выше.</p>
+        <div class="batch-run-actions">
+          <button id="onprem-batch-plan" class="run-btn" type="button" disabled>Dry Run</button>
+          <button id="onprem-batch-start" class="run-btn" type="button" disabled>Начать перенос</button>
+        </div>
+        <div class="batch-transfer-actions">
+          <button id="onprem-batch-pause" class="secondary-btn" type="button" disabled>Пауза</button>
+          <button id="onprem-batch-resume" class="secondary-btn" type="button" disabled>Продолжить</button>
+          <button id="onprem-batch-stop" class="secondary-btn" type="button" disabled>Остановить полностью</button>
+          <button id="onprem-batch-restart" class="secondary-btn" type="button" disabled>Начать заново</button>
+        </div>
+        <p class="field-note">Dry Run сначала проверяет доступ, затем составляет полный план без публикации, скачивания и создания папок. Ошибочный источник можно исключить галочкой или проверить повторно. Начало доступно после готовности всех выбранных источников. Одновременно работают не более четырёх источников во всей утилите.</p>
+        <p id="onprem-batch-notice" class="batch-notice" role="status" aria-live="polite"></p>
+        <label for="onprem-batch-history">История списков</label>
+        <div class="onprem-actions">
+          <select id="onprem-batch-history"><option value="">Выберите список</option></select>
+          <button id="onprem-batch-refresh" class="secondary-btn" type="button">Обновить</button>
+          <button id="onprem-batch-history-previous" class="secondary-btn" type="button" aria-label="Более новые списки" disabled>←</button>
+          <button id="onprem-batch-history-next" class="secondary-btn" type="button" aria-label="Более старые списки" disabled>→</button>
+        </div>
+        <section id="onprem-batch-result" hidden>
+          <h2>Список от <span id="onprem-batch-date"></span></h2>
+          <dl class="onprem-summary">
+            <div><dt>Состояние</dt><dd id="onprem-batch-state"></dd></div>
+            <div><dt>Источники</dt><dd id="onprem-batch-count"></dd></div>
+            <div><dt>Всего данных</dt><dd id="onprem-batch-bytes"></dd></div>
+            <div><dt>Нужно перенести</dt><dd id="onprem-batch-required"></dd></div>
+            <div><dt>Проверено</dt><dd id="onprem-batch-verified"></dd></div>
+            <div><dt>Скачивание</dt><dd id="onprem-batch-download-rate">—</dd></div>
+            <div><dt>Загрузка на диск</dt><dd id="onprem-batch-upload-rate">—</dd></div>
+          </dl>
+          <div class="onprem-actions">
+            <button id="onprem-batch-report" class="secondary-btn" type="button" disabled>Скачать план CSV</button>
+            <button id="onprem-batch-journal" class="secondary-btn" type="button" disabled>Скачать журнал CSV</button>
+          </div>
+          <p id="onprem-batch-error" class="batch-notice error" hidden></p>
+          <div class="onprem-table-wrap">
+            <table class="onprem-table batch-sources-table">
+              <thead><tr><th>Вкл.</th><th>Источник → папка</th><th>Состояние</th><th>Файлы / папки</th><th>Всего / к переносу</th><th>Крупнейший файл</th><th>Скачивание / загрузка</th><th>Действия и ошибка</th></tr></thead>
+              <tbody id="onprem-batch-sources"></tbody>
+            </table>
+          </div>
+          <section id="onprem-batch-details" data-batch-details hidden>
+            <h2>Файлы источника <span id="onprem-batch-details-name"></span></h2>
+            <div class="onprem-table-wrap"><table class="onprem-table batch-entries-table">
+              <thead><tr><th>Источник</th><th>Назначение</th><th>Размер</th><th>Результат</th></tr></thead>
+              <tbody id="onprem-batch-entries"></tbody>
+            </table></div>
+            <div class="onprem-actions">
+              <button id="onprem-batch-entries-previous" class="secondary-btn" type="button" disabled>←</button>
+              <span id="onprem-batch-entries-page" class="field-note"></span>
+              <button id="onprem-batch-entries-next" class="secondary-btn" type="button" disabled>→</button>
+            </div>
+          </section>
+        </section>
+      </section>
       </form>
 
+      <div id="onprem-single-output" data-source-single="onprem">
       <p id="onprem-notice" role="status" aria-live="polite"></p>
       <p id="onprem-poll-notice" class="error" role="status" aria-live="polite" hidden></p>
+      <p id="onprem-legacy-note" class="onprem-warning" role="status" hidden></p>
 
       <section class="onprem-section">
         <div class="onprem-history">
@@ -900,11 +1137,14 @@
       </section>
 
       <section id="onprem-job" class="onprem-section" hidden>
-        <h2>Задание <span id="onprem-job-id" class="onprem-path"></span></h2>
+        <h2>Задание <span id="onprem-job-id" title="Дата создания задания при Dry Run, в часовом поясе браузера"></span></h2>
         <dl class="onprem-summary">
           <div><dt>Состояние</dt><dd id="onprem-job-state"></dd></div>
           <div><dt>Объекты</dt><dd id="onprem-job-counts"></dd></div>
           <div><dt>Проверено байтов</dt><dd id="onprem-job-bytes"></dd></div>
+          <div id="onprem-download-rate-row" hidden><dt>Скачивание в кеш</dt><dd id="onprem-download-rate" aria-live="polite">—</dd></div>
+          <div><dt>Загрузка в общий диск</dt><dd id="onprem-upload-rate" aria-live="polite">—</dd></div>
+          <div><dt>Направление</dt><dd id="onprem-job-destination" class="onprem-path"></dd></div>
         </dl>
         <div id="onprem-job-blocked" role="status" hidden>
           <p id="onprem-job-blocked-reason" class="onprem-result attention"></p>
@@ -916,24 +1156,8 @@
         <p id="onprem-job-error" class="onprem-warning" hidden></p>
         <p id="onprem-job-pause" class="field-note" hidden>Пауза запрошена. Текущая операция ещё выполняется.</p>
         <p id="onprem-job-stop" class="onprem-warning" role="status" hidden></p>
-        <p class="field-note">Каталог технических попыток</p>
-        <div id="onprem-remote-root" class="onprem-path"></div>
         <div class="onprem-actions">
-          <button id="onprem-start" class="secondary-btn" type="button" disabled>Начать перенос</button>
-          <button id="onprem-pause" class="secondary-btn" type="button" disabled>Пауза</button>
-          <button id="onprem-resume" class="secondary-btn" type="button" disabled>Продолжить</button>
-          <button id="onprem-stop" class="secondary-btn" type="button" disabled>Остановить</button>
-          <button id="onprem-restart" class="secondary-btn" type="button" disabled>Повторить перенос заново</button>
-          <button id="onprem-credentials" class="secondary-btn" type="button" disabled>Предоставить доступ</button>
-          <button id="onprem-report" class="secondary-btn" type="button" disabled>Скачать CSV</button>
-        </div>
-        <div class="onprem-actions">
-          <label for="onprem-retry-strategy">Повтор ошибок</label>
-          <select id="onprem-retry-strategy" aria-label="Способ повтора ошибок">
-            <option value="url">Напрямую по ссылке</option>
-            <option value="staged">С временным сохранением</option>
-          </select>
-          <button id="onprem-retry" class="secondary-btn" type="button" disabled>Повторить ошибки</button>
+          <button id="onprem-report" class="secondary-btn" type="button" disabled>Скачать отчёт CSV</button>
         </div>
         <div class="onprem-table-wrap">
           <table class="onprem-table">
@@ -949,57 +1173,56 @@
         </div>
       </section>
 
-      <section id="onprem-resolve-panel" class="onprem-section" hidden>
-        <h2 id="onprem-resolve-title">Неопределённый исход операции</h2>
-        <p id="onprem-resolve-warning" class="onprem-warning">Повтор этой попытки заблокирован. Укажите восстановленный ID операции или терминальный результат по серверным журналам администратора. Таймаут и отсутствие файла не подтверждают завершение.</p>
-        <label for="onprem-resolve-attempt">Попытка</label>
-        <select id="onprem-resolve-attempt"></select>
-        <div class="row">
-          <div>
-            <label for="onprem-resolve-operation">Восстановленный ID операции</label>
-            <input id="onprem-resolve-operation" autocomplete="off" placeholder="ID или ?id=ID" maxlength="260">
-          </div>
-          <div>
-            <label for="onprem-resolve-status">Результат по журналам администратора</label>
-            <select id="onprem-resolve-status">
-              <option value="">Не установлен</option>
-              <option value="success">Успешно завершена</option>
-              <option value="failed">Завершилась ошибкой</option>
-            </select>
-          </div>
-        </div>
-        <label for="onprem-resolve-evidence">Подтверждение по серверным журналам, минимум 20 символов, без токенов и ссылок</label>
-        <textarea id="onprem-resolve-evidence" autocomplete="off" minlength="20" maxlength="1000"></textarea>
-        <label class="onprem-check" for="onprem-resolve-confirmed">
-          <input id="onprem-resolve-confirmed" type="checkbox">
-          <span>Подтверждаю установленный исход и отсутствие продолжающейся операции для терминального решения.</span>
-        </label>
-        <div class="onprem-actions">
-          <button id="onprem-resolve" class="secondary-btn" type="button" disabled>Сохранить проверенный исход</button>
-        </div>
-      </section>
-
-      <section id="onprem-cleanup-panel" class="onprem-section" hidden>
-        <h2>Временные файлы</h2>
-        <div class="onprem-actions">
-          <button id="onprem-cleanup" class="secondary-btn" type="button" disabled>Очистить локальные файлы</button>
-        </div>
-        <p id="onprem-cleanup-result" class="field-note"></p>
-        <div id="onprem-remote-attempts" class="onprem-path"></div>
-      </section>
-
       <section id="onprem-log-panel" class="onprem-section" hidden>
         <h2>Журнал задания</h2>
+        <div class="onprem-actions">
+          <button id="onprem-journal" class="secondary-btn" type="button" disabled>Скачать журнал CSV</button>
+        </div>
+        <p class="field-note">Время указано в часовом поясе браузера. На экране — последние 500 загруженных событий; CSV содержит всю сохранённую историю задания.</p>
         <pre id="onprem-log" aria-live="polite"></pre>
+      </section>
+
+      </div>
+      <section id="onprem-cleanup-panel" class="onprem-section">
+        <h2>Локальный кеш</h2>
+        <div class="onprem-actions">
+          <button id="onprem-cleanup" class="secondary-btn" type="button" disabled>Очистить локальный кеш</button>
+        </div>
+        <p class="field-note">Удаляет весь временный кеш всех заданий. При продолжении нужные файлы скачаются заново. Во время переноса сначала дождитесь состояния «Приостановлено» после нажатия «Пауза» или полностью остановите задание.</p>
+        <p id="onprem-cleanup-result" class="field-note" role="status" aria-live="polite"></p>
       </section>
     </div>
 
-    <div class="log-head" data-legacy-output>
-      <span class="log-title">Журнал выполнения</span>
-      <span class="log-sub">пошаговый лог появится здесь после запуска</span>
-    </div>
+    <section data-legacy-output>
+      <h2 id="run-journal-mode" class="log-title">Журнал выполнения</h2>
+      <label for="run-history">История заданий</label>
+      <select id="run-history"><option value="">Заданий пока нет</option></select>
+      <div class="onprem-actions">
+        <button id="run-history-previous" class="secondary-btn" type="button" aria-label="Более новые задания" disabled>←</button>
+        <span id="run-history-page" class="field-note">Страница 1</span>
+        <button id="run-history-next" class="secondary-btn" type="button" aria-label="Более старые задания" disabled>→</button>
+        <button id="run-history-refresh" class="secondary-btn" type="button">Обновить</button>
+        <button id="run-journal-csv" class="secondary-btn" type="button" disabled>Скачать журнал CSV</button>
+      </div>
+      <p id="run-active-note" class="field-note" role="status"></p>
+      <p id="run-journal-notice" class="field-note" role="status" aria-live="polite"></p>
+      <div id="run-start-recovery" class="onprem-actions" hidden>
+        <button id="run-start-unlock" class="secondary-btn" type="button" disabled>Разрешить новый запуск</button>
+      </div>
+      <p id="run-journal-direction" class="field-note"></p>
+      <p id="run-journal-summary" class="field-note"></p>
+      <p id="run-journal-error" class="field-note onprem-result bad"></p>
+      <p class="field-note">Время — в часовом поясе браузера. Здесь последние 500 событий, в CSV — весь сохранённый журнал. Журналы старых запусков, выполненных до этого обновления, недоступны.</p>
+    </section>
     <div id="status" class="status" data-legacy-output></div>
-    <div id="log" data-legacy-output data-empty="Здесь появится лог: получение токенов → проверка статуса сотрудника → сверка свободного места → публикация и сохранение файлов. Запустите копирование, чтобы начать."></div>
+    <div id="log" data-legacy-output role="log" aria-live="polite" data-empty="Выберите задание в истории или запустите перенос."></div>
+    <section id="run-journal-cleanup-panel" data-legacy-output>
+      <div class="onprem-actions">
+        <button id="run-journal-cleanup" class="secondary-btn" type="button">Очистить журнальный кеш</button>
+      </div>
+      <p id="run-journal-cleanup-note" class="field-note"></p>
+      <p id="run-journal-cleanup-result" class="field-note" role="status" aria-live="polite"></p>
+    </section>
   </div>
 
   <div id="help-overlay" class="overlay">
@@ -1013,15 +1236,17 @@
       <div id="tab-tokens" class="tab-panel active">
       <h2>Токены, права и доступы</h2>
       <h3>SaaS → On-premises</h3>
-      <p>Для источника нужны ID SaaS-организации, Client ID и Client secret
-         зарегистрированного сервисного приложения с правом
-         <code>cloud_api:disk.read</code>, а также email сотрудника.
-         Для назначения нужны HTTPS-адрес API установки и
-         <strong>пользовательский OAuth-токен получателя из паспорта on-premises</strong>.
-         Админ-токен API&nbsp;360 и SCIM-токен здесь не используются.</p>
-      <p>Где получить каждый доступ, как заполнить форму и выполнить перенос:
+      <p><strong>Источник:</strong> ID SaaS-организации, email владельца Диска,
+         Client ID и Client secret сервисного приложения. Нужны права
+         <code>cloud_api:disk.read</code> и, для публикации источника,
+         <code>cloud_api:disk.write</code>. Токен сотрудника утилита получает сама.</p>
+      <p><strong>Назначение:</strong> HTTPS-адрес Disk API, метка общего диска
+         из адреса <code>…/vd/&lt;метка&gt;/…</code>, логин оператора и его
+         OAuth-токен из Passport вашей установки. Оператору нужны чтение и запись
+         на общий диск. Админ-токен API&nbsp;360 и SCIM-токен сюда не подходят.</p>
+      <p>Где взять эти данные, что делают кнопки и как исправить ошибки:
          вкладка <strong>«Инструкция»</strong>, раздел
-         <strong>«SaaS → On-premises: инструкция миграции»</strong>.</p>
+         <strong>«SaaS → On-premises: краткая инструкция»</strong>.</p>
       <h3>Перенос между SaaS-Дисками</h3>
       <p>Для этих режимов нужны два независимых набора данных:
          <strong>сервисное приложение</strong> (доступ к Дискам сотрудников) и
@@ -1039,6 +1264,11 @@
          с доступом и отдельная метка SOURCE_VD_HASH. PATH задаёт папку,
          <code>/</code> — весь диск. Файлы сохраняются в папке downloads на машине
          запуска. Подробные шаги есть во вкладке <strong>«Инструкция»</strong>.</p>
+      <p>Для списка выберите <strong>«Список дисков из CSV»</strong> и выполните
+         Dry Run. <code>CLIENT_ID</code>/<code>CLIENT_SECRET</code> дают доступ
+         к Дискам по email; <code>ORGID</code> — ID организации.
+         <code>ADMIN_TOKEN</code> для списка необязателен: проверяет сотрудника
+         в организации без снятия блокировки. Для одного диска он обязателен.</p>
       <p class="copy-hint">
          💡 Текст, выделенный <span class="copyable">пунктиром</span>, копируется
          по клику — ссылки, права (scopes), эндпоинты и тела запросов.</p>
@@ -1250,7 +1480,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const logEl = $("log"), statusEl = $("status");
+    const statusEl = $("status");
 
     // переключатель темы (начальная тема уже выставлена inline-скриптом в <head>)
     const themeBtn = $("theme-btn");
@@ -1374,10 +1604,6 @@
       });
     });
 
-    function addLine(text) {
-      logEl.textContent += text + "\n";
-      logEl.scrollTop = logEl.scrollHeight;
-    }
     function setStatus(text, cls) {
       statusEl.textContent = text;
       statusEl.className = "status " + (cls || "");
@@ -1386,8 +1612,9 @@
     // режим 2 может быть отключён на уровне образа (v1); лимиты пакета с бэкенда
     let BATCH_MAX = 25;
     let BATCH_CONCURRENCY = 5;
-    let READ_RPS = 40;
-    let WRITE_RPS = 5;
+    let READ_RPS = 30;
+    let WRITE_RPS = 3;
+    let TOTAL_RPS = 30;
     window.diskCopyConfigPromise = fetch("/api/config").then((r) => r.json()).then((cfg) => {
       if (!cfg.cross_org) {
         const tab = document.querySelector('.mode-tab[data-mode="cross"]');
@@ -1406,6 +1633,7 @@
       if (cfg.read_rps) READ_RPS = cfg.read_rps;
       else if (cfg.target_rps) READ_RPS = cfg.target_rps;
       if (cfg.write_rps) WRITE_RPS = cfg.write_rps;
+      if (cfg.total_rps) TOTAL_RPS = cfg.total_rps;
       if (cfg.local_save_host_dir) {
         document.querySelectorAll("[data-local-hint]").forEach((el) => {
           el.textContent = cfg.local_save_host_dir;
@@ -1430,6 +1658,7 @@
           t.classList.toggle("active", t === tab));
         document.querySelectorAll(".mode-panel").forEach((p) =>
           p.classList.toggle("active", p.id === "mode-" + m));
+        return window.runJournal?.selectMode(m);
       });
     });
 
@@ -1587,7 +1816,7 @@
         }
         if (helpNote) {
           // темп указан намеренно: иначе плавный пакетный перенос читается как «зависло»
-          const pace = ` Чтение Диска — не быстрее ~${READ_RPS} запросов/с, изменение — не быстрее ~${WRITE_RPS}. Большой пакет из-за этого идёт постепенно.`;
+          const pace = ` Общий темп SaaS — до ~${TOTAL_RPS} запросов/с; чтение — до ~${READ_RPS}, изменение — до ~${WRITE_RPS}. Большой пакет из-за этого идёт постепенно.`;
           helpNote.innerHTML = (shared
             ? "Заполните шаблон списком email источников (по одному на строку) " +
               "и загрузите кнопкой-скрепкой. Все источники переносятся на выбранный " +
@@ -1740,7 +1969,7 @@
     // общий запуск: собираем body по карте {ключ_API: id_поля}, шлём и стримим лог
     async function startCopy(endpoint, fieldMap, button, extras, batchCtrl, options) {
       const local = !!(options && options.local);
-      const lock = [$("run"), $("run-cross"), $("run-local")].filter(Boolean);
+      if (button.disabled) return;
       if (!consentAccepted()) { showConsent(); return; }
       const body = {};
       for (const [key, id] of Object.entries(fieldMap)) {
@@ -1801,57 +2030,11 @@
         return;
       }
 
-      logEl.textContent = "";
-      lock.forEach((b) => { b.disabled = true; });
-      setStatus(
-        local ? "Запуск локального сохранения…"
-          : (useBatch ? `Запуск пакета (${body.pairs.length})…` : "Запуск…"),
-        "running"
-      );
-
-      let res;
-      try {
-        res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-      } catch (e) {
-        setStatus("Сеть недоступна: " + e, "error");
-        lock.forEach((b) => { b.disabled = false; }); return;
+      if (!window.runJournal) {
+        setStatus("Журнал недоступен. Обновите страницу перед запуском.", "error");
+        return;
       }
-      if (!res.ok) {
-        let detail = res.status;
-        try {
-          const err = await res.json();
-          if (err && err.detail) detail = typeof err.detail === "string"
-            ? err.detail : JSON.stringify(err.detail);
-        } catch (e) {}
-        setStatus("Ошибка запуска: " + detail, "error");
-        lock.forEach((b) => { b.disabled = false; }); return;
-      }
-      const { job_id } = await res.json();
-      setStatus(
-        local ? "Сохраняю на машину запуска…"
-          : (useBatch ? "Пакет выполняется…" : "Выполняется…"),
-        "running"
-      );
-
-      const es = new EventSource(`/api/run/${job_id}/stream`);
-      es.onmessage = (e) => addLine(e.data);
-      es.addEventListener("done", (e) => {
-        if (e && e.data && e.data !== "ok") {
-          setStatus(e.data, "done");
-          addLine("SUMMARY | " + e.data);
-        } else {
-          setStatus("Готово ✓", "done");
-        }
-        es.close(); lock.forEach((b) => { b.disabled = false; });
-      });
-      es.addEventListener("error", (e) => {
-        if (e && e.data) { setStatus("Ошибка: " + e.data, "error"); es.close(); }
-        lock.forEach((b) => { b.disabled = false; });
-      });
+      await window.runJournal.start({endpoint: url, body, mode: local ? "local" : endpoint === "/api/run-cross" ? "cross" : "single"});
     }
 
     // режим 1 — одна организация
@@ -1883,6 +2066,8 @@
     }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross));
 
   </script>
-  <script src="/static/onprem.js"></script>
+  <script src="/static/run-journal.js?v=c3f3f63da74e"></script>
+  <script src="/static/onprem.js?v=95c00cc0e7d5"></script>
+  <script src="/static/source-batches.js?v=f855e7d7af22"></script>
 </body>
 </html>

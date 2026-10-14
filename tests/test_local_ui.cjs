@@ -1,148 +1,6 @@
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
 const { test } = require("node:test");
-
-class Element {
-  constructor(tag, attributes = {}) {
-    this.tagName = tag.toUpperCase();
-    this.attributes = attributes;
-    this.id = attributes.id || "";
-    this.value = attributes.value || "";
-    this.checked = "checked" in attributes;
-    this.hidden = "hidden" in attributes;
-    this.disabled = "disabled" in attributes;
-    this.className = attributes.class || "";
-    this.children = [];
-    this.listeners = {};
-    this.style = {};
-    this.dataset = {};
-    this.textContent = "";
-    for (const [key, value] of Object.entries(attributes)) {
-      if (key.startsWith("data-")) {
-        this.dataset[key.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value;
-      }
-    }
-    this.classList = {
-      contains: (value) => this.className.split(/\s+/).includes(value),
-      add: (value) => { if (!this.classList.contains(value)) this.className += " " + value; },
-      remove: (value) => { this.className = this.className.split(/\s+/).filter((part) => part !== value).join(" "); },
-      toggle: (value, enabled) => {
-        const show = enabled === undefined ? !this.classList.contains(value) : enabled;
-        if (show) this.classList.add(value); else this.classList.remove(value);
-      },
-    };
-  }
-  addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
-  async fire(name) {
-    if (name === "click" && this.disabled) return;
-    await this.dispatch(name);
-  }
-  async dispatch(name) {
-    for (const handler of this.listeners[name] || []) await handler({ target: this });
-  }
-  get title() { return this.attributes.title || ""; }
-  set title(value) { this.attributes.title = String(value); }
-  appendChild(node) { this.children.push(node); node.parent = this; return node; }
-  setAttribute(name, value) { this.attributes[name] = value; }
-  getAttribute(name) { return this.attributes[name] ?? null; }
-  remove() {
-    if (this.parent) this.parent.children = this.parent.children.filter((node) => node !== this);
-    this.parent = null;
-  }
-  querySelectorAll(selector) {
-    return this.children.flatMap((node) => [node, ...node.querySelectorAll("*")])
-      .filter((node) => matches(node, selector));
-  }
-  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-  closest(selector) {
-    for (let node = this; node; node = node.parent) if (matches(node, selector)) return node;
-    return null;
-  }
-}
-
-function matches(node, selector) {
-  if (selector.includes(",")) return selector.split(",").some((part) => matches(node, part.trim()));
-  if (selector === "*") return true;
-  for (const attr of selector.matchAll(/\[([\w-]+)(?:="([^"]*)")?\]/g)) {
-    if (!(attr[1] in node.attributes) || (attr[2] !== undefined && node.attributes[attr[1]] !== attr[2])) return false;
-  }
-  if (selector.endsWith(":checked") && !node.checked) return false;
-  const plain = selector.replace(/\[[^\]]*\]/g, "");
-  const id = plain.match(/#([\w-]+)/);
-  if (id && node.id !== id[1]) return false;
-  for (const className of plain.matchAll(/\.([\w-]+)/g)) {
-    if (!node.classList.contains(className[1])) return false;
-  }
-  const tag = selector.match(/^([a-z][\w-]*)/i);
-  return !tag || node.tagName === tag[1].toUpperCase();
-}
-
-async function loadUi(config = { cross_org: true }, { delayConfig = false, failConfig = false } = {}) {
-  const html = fs.readFileSync(path.resolve(__dirname, "../app/static/index.html"), "utf8");
-  const root = new Element("document");
-  const byId = new Map();
-  const stack = [root];
-  const markup = html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
-  for (const match of markup.matchAll(/<\/?([a-z][\w-]*)\b([^>]*)>/gi)) {
-    const tag = match[1].toLowerCase();
-    if (match[0].startsWith("</")) {
-      while (stack.length > 1 && stack.pop().tagName !== tag.toUpperCase()) {}
-      continue;
-    }
-    const attributes = {};
-    for (const attr of match[2].matchAll(/([\w:-]+)(?:="([^"]*)")?/g)) attributes[attr[1]] = attr[2] || "";
-    const node = stack.at(-1).appendChild(new Element(tag, attributes));
-    if (node.id) byId.set(node.id, node);
-    if (!["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"].includes(tag)) stack.push(node);
-  }
-  const requests = [];
-  const streams = [];
-  let releaseConfig;
-  const configReady = new Promise((resolve) => { releaseConfig = resolve; });
-  const documentListeners = {};
-  const document = {
-    body: root.querySelector("body"), documentElement: root.querySelector("html"),
-    getElementById: (id) => root.querySelector(`#${id}`),
-    querySelector: (selector) => root.querySelector(selector),
-    querySelectorAll: (selector) => root.querySelectorAll(selector),
-    createElement: (tag) => new Element(tag),
-    addEventListener: (name, handler) => { (documentListeners[name] ||= []).push(handler); },
-    dispatchEvent: (event) => {
-      for (const handler of documentListeners[event.type] || []) handler(event);
-    },
-  };
-  const context = {
-    document, window: {}, navigator: {}, Event: class { constructor(type) { this.type = type; } },
-    localStorage: { getItem: (key) => key === "ydc_disclaimer_accepted_v1" ? "1" : null, setItem() {} },
-    setTimeout, clearTimeout,
-    fetch: async (url, options) => {
-      if (url === "/api/config") {
-        if (failConfig) throw new Error("Configuration unavailable");
-        return { json: async () => { if (delayConfig) await configReady; return config; } };
-      }
-      assert.equal(options?.method, "POST", "unexpected request from the UI");
-      requests.push({ url, body: JSON.parse(options.body) });
-      return { ok: true, json: async () => ({ job_id: "local-test" }) };
-    },
-    EventSource: class {
-      constructor(url) { this.url = url; this.listeners = {}; streams.push(this); }
-      addEventListener(name, handler) { this.listeners[name] = handler; }
-      close() {}
-    },
-  };
-  vm.createContext(context);
-  for (const script of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
-    if (script[1].trim()) vm.runInContext(script[1], context);
-  }
-  if (!delayConfig) {
-    const result = await context.window.diskCopyConfigPromise;
-    if (failConfig) assert.equal(result, null);
-    else assert.ok(result, "configuration must finish successfully");
-  }
-  return { byId, document, requests, streams, releaseConfig, configPromise: context.window.diskCopyConfigPromise };
-}
+const { loadUi } = require("./helpers/legacy_ui.cjs");
 
 function fillTransfer(ui, cross = false) {
   const values = cross
@@ -194,7 +52,8 @@ function assertLocalRequest(ui, type = "personal") {
   assert.equal(request.body.path, "/Finance");
   assert.equal(request.body.page_limit, 1000);
   assert.equal(request.body.source_type, type);
-  assert.equal(ui.streams[0].url, "/api/run/local-test/stream");
+  assert.equal(ui.jobs[0].id, "local-test", "a successful start creates a persistent job");
+  assert.ok(ui.reads.some((read) => read.url.startsWith("/api/history?mode=local")), "local history is refreshed independently of the selected mode");
 }
 
 function assertSharedLogLock(ui, disabled) {
@@ -209,11 +68,11 @@ for (const failConfig of [false, true]) {
     const ui = await loadUi({ cross_org: true, onprem_enabled: false }, { failConfig });
     const tab = ui.document.querySelector('.mode-tab[data-mode="onprem"]');
     assert.ok(tab);
-    assert.equal(tab.hidden, false, "unreleased mode stays discoverable");
+    assert.equal(tab.hidden, false, "mode stays discoverable while configuration is unavailable");
     assert.equal("hidden" in tab.attributes, false);
     assert.equal(tab.disabled, true);
     assert.equal("disabled" in tab.attributes, true, "HTML must disable the tab before configuration arrives");
-    assert.equal(tab.title, "В разработке");
+    assert.equal(tab.title, "SaaS → On-premises");
     assert.equal(ui.byId.get("mode-onprem").hidden, true);
     await selectMode(ui, "local");
     await tab.fire("click");
@@ -223,7 +82,7 @@ for (const failConfig of [false, true]) {
     fillLocal(ui);
     await ui.byId.get("run-local").fire("click");
     assertLocalRequest(ui);
-    ui.streams[0].listeners.done({ data: "ok" });
+    await ui.finishRun("done");
     await selectMode(ui, "single");
     fillTransfer(ui);
     ui.byId.get("destination_disk_id").value = "receiver@example.test";
@@ -241,7 +100,7 @@ test("local saving has its own main tab with source-only fields", async () => {
   assert.deepEqual(panel.querySelectorAll("input").map((field) => field.id || field.attributes.name).sort(), [
     "local_client_id", "local_client_secret", "local_orgid", "local_admin_token",
     "local_source_disk_id", "local_source_type", "local_source_type",
-    "local_source_vd_hash", "local_path", "local_page_limit",
+    "local_source_vd_hash", "local_path", "local_page_limit", "local-batch-file",
   ].sort());
   for (const id of ["run-local-cross", "source_vd_hash", "x_source_vd_hash", "source_shared_fields", "x_source_shared_fields"]) {
     assert.equal(ui.document.getElementById(id), null, `legacy field ${id} must be removed`);
@@ -277,7 +136,7 @@ for (const type of ["personal", "shared"]) {
     assertLocalRequest(ui, type);
     assert.equal(ui.requests[0].body.source_vd_hash, type === "shared" ? "https://disk.yandex.ru/client/vd/shared-hash/Finance" : "");
     assertSharedLogLock(ui, true);
-    ui.streams[0].listeners[type === "personal" ? "done" : "error"]({ data: type === "personal" ? "ok" : "test failure" });
+    await ui.finishRun(type === "personal" ? "done" : "error");
     assertSharedLogLock(ui, false);
   });
 
@@ -315,7 +174,7 @@ test("local: returning from shared to personal saves without a required hash", a
   await ui.byId.get("run-local").fire("click");
   assertLocalRequest(ui);
   assertSharedLogLock(ui, true);
-  ui.streams[0].listeners.done({ data: "ok" });
+  await ui.finishRun("done");
   assertSharedLogLock(ui, false);
 });
 
@@ -363,7 +222,7 @@ for (const cross of [false, true]) {
     assert.equal(ui.requests[0].body.destination_disk_id, "receiver@example.test");
     assert.equal(ui.requests[0].body.destination_type, "personal");
     assertSharedLogLock(ui, true);
-    ui.streams[0].listeners.done({ data: "ok" });
+    await ui.finishRun("done");
     assertSharedLogLock(ui, false);
   });
 
@@ -386,7 +245,7 @@ for (const cross of [false, true]) {
     assert.equal("source_type" in ui.requests[0].body, false);
     assert.equal("source_vd_hash" in ui.requests[0].body, false);
     assertSharedLogLock(ui, true);
-    ui.streams[0].listeners.error({ data: "test failure" });
+    await ui.finishRun("error");
     assertSharedLogLock(ui, false);
   });
 
@@ -412,7 +271,7 @@ for (const cross of [false, true]) {
     assert.equal("source_vd_hash" in ui.requests[0].body, false);
     assert.equal(ui.byId.get("run-local").hidden, false);
     assertSharedLogLock(ui, true);
-    ui.streams[0].listeners.done({ data: "ok" });
+    await ui.finishRun("done");
     assertSharedLogLock(ui, false);
     await selectMode(ui, "local");
     fillLocal(ui);
@@ -447,7 +306,7 @@ for (const cross of [false, true]) {
     assert.equal("source_vd_hash" in ui.requests[0].body, false);
     assert.equal(ui.byId.get("run-local").hidden, false);
     assertSharedLogLock(ui, true);
-    ui.streams[0].listeners.done({ data: "ok" });
+    await ui.finishRun("done");
     assertSharedLogLock(ui, false);
   });
 }

@@ -1124,7 +1124,8 @@ def test_shared_local_preserves_subfolder_and_skips_same_size(tmp_path, path):
     result = copier.run()
 
     assert result["fails"] == []
-    assert len(result["saved"]) == 1
+    assert result["saved"] == []
+    assert len(result["skipped"]) == 1
     assert dest.read_bytes() == b"same"
     assert session.calls[0].params["path"] == prefix + "/Docs"
     assert session.calls_to(VD_DOWNLOAD_URL) == []

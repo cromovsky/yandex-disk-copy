@@ -28,12 +28,13 @@ services:
       # темп запросов к API Диска; значения берутся из .env, дефолты — как в образе.
       # Пробрасываем поимённо, а не env_file, чтобы basic-auth хеш не утекал в
       # окружение приложения.
-      DISK_API_READ_RPS: ${DISK_API_READ_RPS:-40}
-      DISK_API_WRITE_RPS: ${DISK_API_WRITE_RPS:-5}
+      DISK_API_TOTAL_RPS: ${DISK_API_TOTAL_RPS:-30}
+      DISK_API_READ_RPS: ${DISK_API_READ_RPS:-30}
+      DISK_API_WRITE_RPS: ${DISK_API_WRITE_RPS:-3}
       HTTP_TIMEOUT_SEC: ${HTTP_TIMEOUT_SEC:-120}
       LOCAL_SAVE_DIR: /downloads
       LOCAL_SAVE_HOST_DIR: ./downloads
-      ONPREM_ENABLED: ${ONPREM_ENABLED:-0}
+      ONPREM_ENABLED: ${ONPREM_ENABLED:-1}
       ONPREM_DATA_DIR: /var/lib/disk-copy
       ONPREM_ADMIN_TOKEN: ${ONPREM_ADMIN_TOKEN:-}
       ONPREM_STAGING_MAX_BYTES: ${ONPREM_STAGING_MAX_BYTES:-21474836480}

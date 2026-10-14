@@ -12,8 +12,8 @@ services:
     environment:
       LOCAL_SAVE_DIR: /downloads
       LOCAL_SAVE_HOST_DIR: ./downloads
-      # Пилотный режим включается отдельно для локальной разработки.
-      ONPREM_ENABLED: ${ONPREM_ENABLED:-0}
+      # SaaS → On-premises включён; HTTP допускается только на локальном стенде.
+      ONPREM_ENABLED: ${ONPREM_ENABLED:-1}
       ONPREM_ALLOW_INSECURE_HTTP: ${ONPREM_ALLOW_INSECURE_HTTP:-0}
       ONPREM_DATA_DIR: /var/lib/disk-copy
       ONPREM_ADMIN_TOKEN: ${ONPREM_ADMIN_TOKEN:-}

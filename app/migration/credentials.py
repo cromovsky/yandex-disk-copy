@@ -15,9 +15,10 @@ class CredentialRegistry:
 
     def put(self, job_id, config, credentials):
         binding = canonical_config(config)
-        if not isinstance(credentials, dict) or set(credentials) != {
-            "source_client_secret", "destination_token",
-        }:
+        required = {"source_client_secret", "destination_token"}
+        if (not isinstance(credentials, dict)
+                or not required <= set(credentials)
+                or set(credentials) - required - {"source_admin_token"}):
             raise ValueError("invalid_credential_fields")
         if any(
             not isinstance(value, str) or not value or len(value) > 16384

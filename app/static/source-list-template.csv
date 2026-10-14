@@ -1,0 +1,3 @@
+type,email,vd_hash,path
+personal,user@company.ru,,/
+shared,reader@company.ru,disk-hash,/
