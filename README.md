@@ -61,10 +61,6 @@ docker compose up -d
 - **«Несколько дисков» между SaaS-Дисками:** прежний шаблон принимает до 25
   пар, одновременно идут 5 переносов. Назначение — личный или общий Диск.
 
-SaaS API использует общий бюджет **30 запросов/с**, не более **30 чтений/с**
-и **3 изменений/с** на весь процесс. Лимиты On-premises — **10 чтений/с**
-и **2 изменения/с**. [Настройка лимитов](docs/INSTRUCTION.md#saas-errors).
-
 ## SaaS → On-premises
 
 Личный SaaS-Диск переносится на существующий общий Диск On-premises в папку
@@ -113,7 +109,7 @@ SaaS API использует общий бюджет **30 запросов/с**
 Схема базы On-premises — **8**; для отката нужны предыдущий образ и резервная
 копия до обновления. [Порядок обновления](docs/UPDATE.md).
 
-## Запуск из исходников и проверки
+## Запуск из исходников
 
 Для локального HTTP используйте override разработки:
 
@@ -121,7 +117,7 @@ SaaS API использует общий бюджет **30 запросов/с**
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
 ```
 
-Он разрешает HTTP для локальной проверки. Ограничьте порт приложения
+Он разрешает HTTP для локального запуска. Ограничьте порт приложения
 `127.0.0.1:8000:8000` либо firewall. Для HTTPS см.
 [руководство администратора](docs/ONPREM.md#onprem-admin).
 
@@ -132,14 +128,6 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-Проверки (сетевые запросы в тестах подменены):
-
-```bash
-pip install -r requirements-dev.txt
-python3 -m pytest tests -q
-node --test tests/test_*.cjs
-```
-
 Основные файлы: `app/disk_copy.py` — SaaS и локальное сохранение;
 `app/migration/` — SaaS → On-premises; `app/main.py` — API;
-`app/static/` — интерфейс; `tests/` — проверки.
+`app/static/` — интерфейс.
