@@ -483,3 +483,60 @@ def test_log_marks_clamped_retry_after():
     session.get(URL)
 
     assert any("урезан" in line for line in lines)
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_disabled_retry_policy_returns_first_status_and_keeps_shared_cooldown(status):
+    from app.retry_policy import RetryPolicy
+    session, adapter, limiter, clock = make_session([(status, {"Retry-After": "7"}), (200, {})])
+    session.set_retry_policy(RetryPolicy(False))
+    assert session.get(URL).status_code == status
+    assert adapter.sends == 1
+    assert limiter.cooldowns == (1 if status == 429 else 0)
+    if status == 429:
+        limiter.acquire()
+        assert 7.0 in clock.sleeps
+
+
+def test_disabling_during_status_backoff_returns_original_failure_without_resend():
+    from app.retry_policy import RetryPolicy
+    policy = RetryPolicy()
+    session, adapter, limiter, clock = make_session([(503, {"Retry-After": "30"}), (200, {})])
+    session.set_retry_policy(policy)
+    waiting = threading.Event()
+    events, responses = [], []
+    def observe(event):
+        events.append(event)
+        if event.get("event_type") == "retry" and event.get("status") == "waiting":
+            waiting.set()
+    session.set_observer(observe)
+    thread = threading.Thread(target=lambda: responses.append(session.get(URL)), daemon=True)
+    thread.start()
+    assert waiting.wait(1)
+    policy.set_enabled(False)
+    thread.join(1)
+    assert not thread.is_alive()
+    assert [r.status_code for r in responses] == [503]
+    assert adapter.sends == 1
+    assert any(e.get("retry_enabled") is False and e.get("error") == "http_error" for e in events)
+
+
+def test_disable_while_waiting_for_another_requests_429_barrier_cancels_retry():
+    from app.retry_policy import RetryPolicy
+    clock = FakeClock(start=0)
+    policy = RetryPolicy(monotonic=clock.monotonic, sleep=clock.sleep)
+    session, adapter, limiter, _ = make_session([(503, {}), (200, {})], clock=clock)
+    session.set_retry_policy(policy)
+    def observe(event):
+        if event.get("event_type") == "retry" and event.get("status") == "waiting":
+            limiter.penalize(10)
+    session.set_observer(observe)
+    def disable_during_shared_wait(seconds):
+        clock.sleep(seconds)
+        policy.set_enabled(False)
+    limiter._sleep = disable_during_shared_wait
+    assert session.get(URL).status_code == 503
+    assert adapter.sends == 1
+    assert clock.monotonic() < 2
+    # Cancelling this file's retry must leave the global server cooldown intact.
+    assert limiter._blocked_until == 10

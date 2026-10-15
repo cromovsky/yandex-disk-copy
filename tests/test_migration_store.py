@@ -1415,7 +1415,7 @@ def test_restart_creates_idempotent_linked_fresh_plan_and_namespace(tmp_path, st
         "restart_job_id": child["id"],
     }
     assert store.events(child["id"])[0]["payload"] == {
-        "state": "queued", "restart_of": parent["id"],
+        "state": "queued", "restart_of": parent["id"], "retry_enabled": True,
     }
     store.close()
     reopened = MigrationStore(tmp_path)

@@ -330,6 +330,10 @@ def _safe_host(url: str) -> str:
     return response_details(response, "saas").get("request_host", "неизвестный сервер")
 
 
+class _RetryCancelled(Exception):
+    pass
+
+
 class ThrottledSession(requests.Session):
     """Session, которая пропускает каждый запрос через общий лимитер, сама
     ретраит 429/5xx и подставляет таймаут.
@@ -346,6 +350,7 @@ class ThrottledSession(requests.Session):
         timeout=DEFAULT_TIMEOUT,
         max_attempts: int = MAX_ATTEMPTS,
         log: Optional[Callable[[str], None]] = None,
+        retry_policy=None,
     ):
         super().__init__()
         self._limiter = limiter
@@ -353,6 +358,21 @@ class ThrottledSession(requests.Session):
         self._max_attempts = max_attempts
         self._log = log or (lambda _msg: None)
         self._observer: Optional[Callable[[dict], None]] = None
+        self._retry_policy = retry_policy
+
+    def set_retry_policy(self, policy):
+        self._retry_policy = policy
+        for adapter in self.adapters.values():
+            adapter.max_retries.retry_policy = policy
+
+    def _retry_disabled(self, request, attempt, payload=None):
+        message = "Автоматические повторы отключены; ошибка возвращена после текущей попытки."
+        if self._observer is not None:
+            self._notify(dict(payload or {}, event_type="retry", status="skipped",
+                              error=(payload or {}).get("error", "http_error"), attempt=attempt,
+                              retry_enabled=False, message=message))
+        else:
+            self._log(message)
 
     def set_log(self, log: Callable[[str], None]) -> None:
         """Подключить лог копира, чтобы 429 были видны в SSE-логе браузера."""
@@ -376,7 +396,8 @@ class ThrottledSession(requests.Session):
 
         payload = {
             "event_type": "http", "attempt": attempt,
-            "max_attempts": self._max_attempts,
+            "max_attempts": self._max_attempts if self._retry_policy is None
+            or self._retry_policy.enabled else 1,
             "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
         }
         mutation = request_lane(request.method) == "write"
@@ -419,9 +440,25 @@ class ThrottledSession(requests.Session):
             kwargs["timeout"] = self._timeout
 
         attempt = 0
+        generation = None
+        response = payload = None
+
+        def retry_checkpoint():
+            if not self._retry_policy.wait(0, generation=generation):
+                raise _RetryCancelled()
+
         while True:
+            if attempt and self._retry_policy is not None:
+                try:
+                    self._limiter.acquire(request.method, checkpoint=retry_checkpoint)
+                    retry_checkpoint()
+                except _RetryCancelled:
+                    self._retry_disabled(request, attempt, payload)
+                    return response
+                response.close()
+            else:
+                self._limiter.acquire(request.method)
             attempt += 1
-            self._limiter.acquire(request.method)
             started = time.monotonic()
             try:
                 response = super().send(request, **kwargs)
@@ -442,6 +479,21 @@ class ThrottledSession(requests.Session):
             delay = retry_after_seconds(response.headers.get("Retry-After"))
             if delay is None:
                 delay = backoff_delay(attempt)
+
+            if self._retry_policy is not None:
+                actual = self._limiter.penalize(delay) if response.status_code == 429 else delay
+                if not self._retry_policy.enabled:
+                    self._retry_disabled(request, attempt, payload)
+                    return response
+                if last:
+                    return response
+                generation = self._retry_policy.cancellation_generation
+                self._notify(dict(payload or {}, event_type="retry", status="waiting",
+                                  attempt=attempt, retry_delay_ms=int(actual * 1000)))
+                if not self._retry_policy.wait(actual, generation=generation):
+                    self._retry_disabled(request, attempt, payload)
+                    return response
+                continue
 
             if response.status_code == 429:
                 # тормозим ВСЕ потоки: иначе остальные продолжают долбить и

@@ -96,3 +96,85 @@ def test_build_session_keeps_existing_retry_settings():
         assert policy.observer is None
     finally:
         session.close()
+
+
+
+def test_transport_retries_obey_disabled_policy_even_for_existing_clone():
+    from app.retry_policy import RetryPolicy
+    from urllib3.exceptions import MaxRetryError
+    switch = RetryPolicy()
+    session = _build_session(retry_policy=switch)
+    try:
+        retry = session.get_adapter(URL).max_retries
+        clone = retry.increment("GET", URL, error=ConnectTimeoutError("connection failed"))
+        switch.set_enabled(False)
+        with pytest.raises(MaxRetryError):
+            clone.increment("GET", URL, error=ConnectTimeoutError("connection failed"))
+    finally:
+        session.close()
+
+
+def test_transport_sleep_is_cancelled_when_retries_are_disabled():
+    import threading
+    from app.retry_policy import RetryPolicy
+    from urllib3.exceptions import MaxRetryError
+    switch = RetryPolicy()
+    session = _build_session(retry_policy=switch)
+    try:
+        retry = session.get_adapter(URL).max_retries
+        retry = retry.increment("GET", URL, error=ConnectTimeoutError("failed"))
+        retry = retry.increment("GET", URL, error=ConnectTimeoutError("failed"))
+        waiting = threading.Event()
+        retry.observer = lambda event: waiting.set()
+        outcomes = []
+        def run():
+            try:
+                retry.sleep(SimpleNamespace(headers={"Retry-After": "30"}))
+                outcomes.append("resent")
+            except MaxRetryError:
+                outcomes.append("cancelled")
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        assert waiting.wait(1)
+        switch.set_enabled(False)
+        thread.join(1)
+        assert outcomes == ["cancelled"]
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("enabled,expected", [(False, 1), (True, 3)])
+def test_real_requests_adapter_stops_hidden_transport_retries(enabled, expected):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from app.retry_policy import RetryPolicy
+    from app.throttle import RateLimiter
+    import requests
+    class Disconnect(BaseHTTPRequestHandler):
+        attempts = 0
+        def do_GET(self):
+            type(self).attempts += 1
+            self.close_connection = True
+        def log_message(self, *_args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Disconnect)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    from tests.fake_clock import FakeClock
+    clock = FakeClock()
+    switch = RetryPolicy(enabled, monotonic=clock.monotonic, sleep=clock.sleep)
+    session = _build_session(retry_policy=switch)
+    adapter = session.get_adapter("https://")
+    session.mount("http://", adapter)
+    # The server is local; remove unrelated process RPS sleeps from this regression.
+    session._limiter = RateLimiter(1_000_000)
+    adapter.max_retries.limiter = session._limiter
+    try:
+        with pytest.raises(requests.ConnectionError):
+            session.get("http://127.0.0.1:%s/file" % server.server_port, timeout=1)
+        assert Disconnect.attempts == expected
+    finally:
+        session.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(1)

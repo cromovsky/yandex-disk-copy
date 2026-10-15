@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /srv
 
-ARG VERSION=3.0.0
+ARG VERSION=3.1.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Yandex Disk Copy" \
     org.opencontainers.image.version="${VERSION}" \

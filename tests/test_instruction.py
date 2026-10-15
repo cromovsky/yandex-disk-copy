@@ -110,7 +110,7 @@ def test_public_instruction_explains_staged_transfer_and_manual_start(monkeypatc
         "верхнего уровня", "публичными после завершения",
         "Существующие пароли и ограничения ссылок сохраняются",
         "скачивает файл на свою машину", "проверяет размер и MD5",
-        "доступен в обоих публичных образах", "3.0.0",
+        "доступен в обоих публичных образах", "3.1.0",
         "ONPREM_ALLOW_INSECURE_HTTP", "ONPREM_ADMIN_TOKEN",
         "21474836480", "1073741824", "107374182400", "2147483648",
         "четыре крупнейших одновременно скачиваемых файла",
@@ -151,7 +151,7 @@ def test_public_documents_only_describe_supported_staged_release():
         "README.md", "docs/INSTRUCTION.md", "docs/ONPREM.md", "docs/UPDATE.md",
     ):
         content = (root / name).read_text(encoding="utf-8")
-        assert "3.0.0" in content, name
+        assert "3.1.0" in content, name
         assert "SaaS → On-premises" in content, name
         for removed in (
             "Напрямую по ссылке", "upload-ext_shd", "ONPREM_ENABLED=0",
@@ -165,8 +165,8 @@ def test_update_guide_distinguishes_images_and_source_builds():
         encoding="utf-8",
     )
     for required in (
-        "cromovsky/yandex-disk-copy-v2:3.0.0",
-        "cromovsky/yandex-disk-copy:3.0.0",
+        "cromovsky/yandex-disk-copy-v2:3.1.0",
+        "cromovsky/yandex-disk-copy:3.1.0",
         "docker compose pull", "docker compose up -d --no-build",
         "git pull --ff-only", "docker compose up --build -d",
         "docker compose stop disk-copy", "docker cp",

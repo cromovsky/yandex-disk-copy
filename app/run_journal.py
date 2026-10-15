@@ -30,6 +30,7 @@ CSV_FIELDS = [
     "destination", "kind", "size", "pair_index", "http_status", "error", "api_error",
     "api_reason", "transport_error", "error_side", "request_host", "request_id",
     "duration_ms", "attempt", "max_attempts", "retry_delay_ms", "operation_id",
+    "retry_enabled",
 ]
 
 
@@ -102,6 +103,8 @@ def normalize_event(payload, redactor=None):
             ):
                 continue
             event[key] = value
+    if type(payload.get("retry_enabled")) is bool:
+        event["retry_enabled"] = payload["retry_enabled"]
     for key in NUMBER_FIELDS:
         value = payload.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**63:
@@ -186,11 +189,21 @@ class RunJournal:
                 raise JournalError("journal_unavailable") from None
 
     @staticmethod
-    def _job(row):
+    def _job(row, db=None):
         if row is None:
             return None
         value = dict(row)
         value["summary"] = json.loads(value["summary"])
+        value["retry_enabled"] = True
+        if db is not None:
+            setting = db.execute(
+                "SELECT payload FROM events WHERE job_id=? "
+                "AND json_type(payload, '$.retry_enabled') IN ('true','false') "
+                "AND json_extract(payload, '$.stage') = 'retry_settings' "
+                "ORDER BY sequence DESC LIMIT 1", (value["id"],),
+            ).fetchone()
+            if setting:
+                value["retry_enabled"] = json.loads(setting[0])["retry_enabled"]
         return value
 
     @staticmethod
@@ -247,7 +260,7 @@ class RunJournal:
 
     def get(self, job_id):
         with self.connection() as db:
-            return self._job(db.execute("SELECT * FROM runs WHERE id=?", (job_id,)).fetchone())
+            return self._job(db.execute("SELECT * FROM runs WHERE id=?", (job_id,)).fetchone(), db)
 
     def history(self, mode, limit=50, offset=0):
         if mode not in MODES:
@@ -257,11 +270,11 @@ class RunJournal:
                 "SELECT * FROM runs WHERE mode=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
                 (mode, limit + 1, offset),
             ).fetchall()
-            active = [self._job(row) for row in db.execute(
+            active = [self._job(row, db) for row in db.execute(
                 "SELECT * FROM runs WHERE mode=? AND status='running' ORDER BY created_at,id",
                 (mode,),
             )]
-            return {"jobs": [self._job(row) for row in rows[:limit]],
+            return {"jobs": [self._job(row, db) for row in rows[:limit]],
                     "has_more": len(rows) > limit, "running_count": len(active),
                     "active_jobs": active}
 

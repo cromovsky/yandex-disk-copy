@@ -134,7 +134,7 @@ async function loadUi(config = { cross_org: true }, { delayConfig = false, failC
       const mode = url.pathname.includes("local") ? "local" : url.pathname.includes("cross") ? "cross" : "single";
       const id = requests.length === 1 ? "local-test" : "run-" + requests.length;
       jobs.unshift({id, mode, status: "running", kind: body.pairs ? "batch" : "single", created_at: "2026-10-14T09:00:00Z",
-        source: body.source_disk_id || "Пакет", destination: body.destination_disk_id || "Локальный диск", error: null,
+        retry_enabled: body.retry_enabled !== false, source: body.source_disk_id || "Пакет", destination: body.destination_disk_id || "Локальный диск", error: null,
         summary: {saved: 0, skipped: 0, failed: 0}});
       return respond({job_id: id});
     }
@@ -172,6 +172,7 @@ async function loadUi(config = { cross_org: true }, { delayConfig = false, failC
   for (const script of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
     if (script[1].trim()) vm.runInContext(script[1], context);
   }
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../app/static/retry-controls.js"), "utf8"), context);
   vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../app/static/run-journal.js"), "utf8"), context);
   await context.window.runJournal.refresh();
   await new Promise((resolve) => setImmediate(resolve));

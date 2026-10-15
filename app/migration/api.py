@@ -22,7 +22,7 @@ from .destination import destination_path, normalize_destination_url
 from .diagnostics import describe_diagnostics
 from .errors import MigrationError
 from .runner import ACTIVE, disk_path, join_path
-from .store import canonical_config
+from .store import canonical_config, config_identity
 from .worker import enabled
 
 
@@ -102,6 +102,7 @@ class Configuration(StrictModel):
     destination_base: str = "disk:/"
     strategy: Literal["url", "staged"] = "staged"
     source_public: bool = Field(default=False, strict=True)
+    retry_enabled: bool = Field(default=True, strict=True)
     identity_confirmed: Literal[True]
 
 
@@ -126,6 +127,10 @@ class CreateRequest(AccessRequest):
 
 class RetryRequest(StrictModel):
     strategy: Literal["url", "staged"] = "staged"
+
+
+class RetryPolicyRequest(StrictModel):
+    enabled: bool = Field(strict=True)
 
 
 class PointRetryRequest(StrictModel):
@@ -358,6 +363,21 @@ def start(job_id: str, request: Request):
     return value.store.get(job_id)
 
 
+@router.post("/jobs/{job_id}/retries")
+async def retries(job_id: str, request: Request):
+    model = await body(request, RetryPolicyRequest)
+    value = service(request)
+    job = job_of(value, job_id)
+    value.runner.require_staged_job(job)
+    batches = getattr(request.app.state, "source_batches", None)
+    if batches and batches.set_child_retry_enabled(job_id, model.enabled):
+        return {"retry_enabled": model.enabled}
+    # This switch must remain responsive while a remote request owns job_guard.
+    value.runner.set_retry_enabled(job_id, model.enabled)
+    value.notify()
+    return {"retry_enabled": model.enabled}
+
+
 @router.post("/jobs/{job_id}/pause")
 def pause(job_id: str, request: Request):
     value = service(request)
@@ -380,7 +400,7 @@ async def credentials(job_id: str, request: Request):
         job = job_of(value, job_id)
         require_live_job(job)
         value.runner.require_staged_job(job)
-        if job["config"] != config:
+        if config_identity(job["config"]) != config_identity(config):
             raise HTTPException(409, "credential_binding_mismatch")
         if job["state"] not in {
             "awaiting_credentials", "ready", "paused", "needs_attention",
@@ -600,7 +620,7 @@ def journal(job_id: str, request: Request):
             "remote_path", "http_status", "error", "error_message", "duration_ms",
             "remote_status", "download_attempts", "max_download_attempts",
             "retry_delay_ms", "retry_at_ms", "point_retry_attempts",
-            "max_point_retry_attempts",
+            "max_point_retry_attempts", "retry_enabled",
             "error_side", "api_error", "api_reason", "transport_error",
             "request_host", "request_id", "diagnostic_message",
         ])
@@ -629,7 +649,7 @@ def journal(job_id: str, request: Request):
                     payload.get("max_download_attempts"),
                     payload.get("retry_delay_ms"), payload.get("retry_at_ms"),
                     payload.get("point_retry_attempts"),
-                    payload.get("max_point_retry_attempts"),
+                    payload.get("max_point_retry_attempts"), payload.get("retry_enabled"),
                     payload.get("error_side"), payload.get("api_error"),
                     payload.get("api_reason"), payload.get("transport_error"),
                     payload.get("request_host"), payload.get("request_id"),
@@ -667,7 +687,8 @@ def report(job_id: str, request: Request):
             (destination_path(job["config"], attempt["remote_path"])
              if attempt.get("remote_path") else None), attempt.get("phase"),
             entry.get("download_attempts", 0), entry.get("retry_at_ms"),
-            entry.get("point_retry_attempts", 0), 3,
+            entry.get("point_retry_attempts", 0),
+            3 if job["config"].get("retry_enabled", True) else 1,
         )])
     return Response("\ufeff" + output.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition":

@@ -28,6 +28,7 @@ from .throttle import READ_RPS, WRITE_RPS, TOTAL_RPS
 from .run_journal import JournalError, Redactor, RunJournal, normalize_event, now
 from .migration.api import router as onprem_router
 from .migration.worker import MigrationService, enabled as onprem_enabled
+from .retry_policy import RetryPolicy
 from .source_slots import SOURCE_SLOTS
 from .source_batches.api import router as source_batches_router
 from .source_batches.service import BatchService
@@ -126,6 +127,7 @@ class RunRequest(BaseModel):
     destination_disk_id: str = Field(..., min_length=1)
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
+    retry_enabled: bool = Field(True, strict=True)
     # personal — личный Диск; shared — общий диск (нужен destination_vd_hash;
     # destination_disk_id тогда — email сотрудника с правом записи).
     destination_type: str = "personal"
@@ -149,6 +151,7 @@ class RunCrossRequest(BaseModel):
     destination_disk_id: str = Field(..., min_length=1)
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
+    retry_enabled: bool = Field(True, strict=True)
     destination_type: str = "personal"
     destination_vd_hash: str = ""
 
@@ -170,6 +173,7 @@ class RunBatchRequest(BaseModel):
     pairs: list[TransferPair] = Field(..., min_length=1)
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
+    retry_enabled: bool = Field(True, strict=True)
     destination_type: str = "personal"
     destination_vd_hash: str = ""
     # Общий email с правом записи — для пакета на общий диск
@@ -189,6 +193,7 @@ class RunBatchCrossRequest(BaseModel):
     pairs: list[TransferPair] = Field(..., min_length=1)
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
+    retry_enabled: bool = Field(True, strict=True)
     destination_type: str = "personal"
     destination_vd_hash: str = ""
     destination_disk_id: str = ""
@@ -232,6 +237,7 @@ class Job:
     journal_error: Optional[str] = None
     summary: dict = field(default_factory=dict)
     redactor: Redactor = field(default_factory=Redactor, repr=False)
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy, repr=False)
 
 
 JOBS: dict[str, Job] = {}
@@ -483,8 +489,10 @@ def config() -> dict:
 
 def _create_job(job, cfgs):
     with JOBS_LOCK:
+        job.retry_policy.set_enabled(cfgs[0].retry_enabled)
         for cfg in cfgs:
             _register_config(job, cfg)
+            cfg.retry_policy = job.retry_policy
         source = (cfgs[0].source_disk_id if len(cfgs) == 1
                   else f"Источников: {len(cfgs)}")
         destination = ("Локальное сохранение" if job.mode == "local" else
@@ -496,6 +504,7 @@ def _create_job(job, cfgs):
                                    job.redactor.text(destination, context=True))
         job.created_at = saved["created_at"]
         JOBS[job.id] = job
+        _log_retry_settings(job)
 
 
 def _start_job(cfg: CopyConfig, mode="single") -> dict:
@@ -636,6 +645,7 @@ def run(req: RunRequest) -> dict:
         destination_disk_id=req.destination_disk_id,
         path=req.path or "/",
         page_limit=req.page_limit,
+        retry_enabled=req.retry_enabled,
         destination_type=dest_type,
         destination_vd_hash=vd_hash,
     )
@@ -667,6 +677,7 @@ def run_cross(req: RunCrossRequest) -> dict:
         destination_disk_id=req.destination_disk_id,
         path=req.path or "/",
         page_limit=req.page_limit,
+        retry_enabled=req.retry_enabled,
         destination_type=dest_type,
         destination_vd_hash=vd_hash,
     )
@@ -685,6 +696,7 @@ class LocalSaveRequest(BaseModel):
     source_vd_hash: str = ""
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
+    retry_enabled: bool = Field(True, strict=True)
 
 
 class LocalSaveCrossRequest(BaseModel):
@@ -699,11 +711,12 @@ class LocalSaveCrossRequest(BaseModel):
     source_vd_hash: str = ""
     path: str = "/"
     page_limit: int = Field(1000, ge=1)
+    retry_enabled: bool = Field(True, strict=True)
 
 
 def _local_cfg(
     source: OrgCreds, source_disk_id: str, path: str, page_limit: int,
-    source_type: str = "personal", source_vd_hash: str = "",
+    source_type: str = "personal", source_vd_hash: str = "", retry_enabled: bool = True,
 ) -> CopyConfig:
     source_type = (source_type or "personal").strip().lower()
     if source_type not in ("personal", "shared"):
@@ -733,6 +746,7 @@ def _local_cfg(
         local_root=LOCAL_SAVE_DIR,
         source_type=source_type,
         source_vd_hash=vd_hash,
+        retry_enabled=retry_enabled,
     )
 
 
@@ -747,7 +761,7 @@ def save_local(req: LocalSaveRequest) -> dict:
     return _start_job(
         _local_cfg(
             creds, req.source_disk_id, req.path, req.page_limit,
-            req.source_type, req.source_vd_hash,
+            req.source_type, req.source_vd_hash, req.retry_enabled,
         ), mode="local",
     )
 
@@ -763,7 +777,7 @@ def save_local_cross(req: LocalSaveCrossRequest) -> dict:
     return _start_job(
         _local_cfg(
             creds, req.source_disk_id, req.path, req.page_limit,
-            req.source_type, req.source_vd_hash,
+            req.source_type, req.source_vd_hash, req.retry_enabled,
         ), mode="local",
     )
 
@@ -796,6 +810,7 @@ def run_batch(req: RunBatchRequest) -> dict:
             destination_disk_id=p.destination_disk_id,
             path=req.path or "/",
             page_limit=req.page_limit,
+            retry_enabled=req.retry_enabled,
             destination_type=dest_type,
             destination_vd_hash=vd_hash,
         )
@@ -836,6 +851,7 @@ def run_batch_cross(req: RunBatchCrossRequest) -> dict:
             destination_disk_id=p.destination_disk_id,
             path=req.path or "/",
             page_limit=req.page_limit,
+            retry_enabled=req.retry_enabled,
             destination_type=dest_type,
             destination_vd_hash=vd_hash,
         )
@@ -859,7 +875,8 @@ def _snapshot(job_id):
             raise HTTPException(404, "job not found")
         if job:
             return {**(saved or {}), "id": job.id, "mode": job.mode, "kind": job.kind,
-                    "status": job.status, "created_at": job.created_at,
+                    "status": job.status, "retry_enabled": job.retry_policy.enabled,
+                    "created_at": job.created_at,
                     "finished_at": job.finished_at, "error": job.error,
                     "summary": job.summary, "journal_error": job.journal_error,
                     "result": job.summary or None,
@@ -909,6 +926,37 @@ def stream(job_id: str, request: Request, after: int = Query(0, ge=0)) -> Stream
                 return
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache"})
+
+
+class RetrySettingsRequest(BaseModel):
+    enabled: bool = Field(..., strict=True)
+
+
+def _log_retry_settings(job):
+    enabled = job.retry_policy.enabled
+    JobLog(job).event({"event_type": "job", "stage": "retry_settings",
+                       "status": "enabled" if enabled else "disabled",
+                       "retry_enabled": enabled,
+                       "message": "Автоматические повторы включены." if enabled else
+                       "Автоматические повторы отключены: после ошибки выполняется одна попытка."})
+
+
+@app.post("/api/run/{job_id}/retries")
+def set_run_retries(job_id: str, payload: RetrySettingsRequest, request: Request):
+    origin = request.headers.get("Origin")
+    if (origin and origin.rstrip("/") != str(request.base_url).rstrip("/")) or (
+        request.headers.get("Sec-Fetch-Site", "").lower() not in {"", "same-origin", "none"}
+    ):
+        raise HTTPException(403, "journal_origin_rejected")
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job_not_found")
+        if job.status != "running":
+            raise HTTPException(409, "job_not_running")
+        job.retry_policy.set_enabled(payload.enabled)
+        _log_retry_settings(job)
+        return {"retry_enabled": job.retry_policy.enabled}
 
 
 @app.get("/api/run/{job_id}")

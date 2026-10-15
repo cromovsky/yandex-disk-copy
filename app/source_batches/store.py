@@ -17,7 +17,7 @@ from pathlib import Path
 from app.migration.runner import disk_path
 from app.run_journal import normalize_event, now
 
-COMMON_KEYS = {"source_org_id", "source_client_id", "page_limit"}
+COMMON_KEYS = {"source_org_id", "source_client_id", "page_limit", "retry_enabled"}
 ONPREM_KEYS = {"destination_url", "destination_identity", "destination_vd_hash",
                "destination_type", "destination_base", "identity_confirmed", "strategy"}
 
@@ -61,6 +61,8 @@ def clean_config(mode, config):
     if mode not in {"local", "onprem"} or not isinstance(config, dict) or set(config) - keys:
         raise ValueError("invalid_batch_config")
     value = dict(config)
+    if "retry_enabled" in value and type(value["retry_enabled"]) is not bool:
+        raise ValueError("invalid_retry_policy")
     for key in ("source_org_id", "source_client_id"):
         item = value.get(key)
         if not isinstance(item, str) or not item or len(item) > 256 or any(ord(c) < 32 for c in item):
@@ -167,7 +169,7 @@ class BatchStore:
             if previous:
                 old = self._batch(previous)
                 previous_sources = self.sources(old["id"])
-                if old["mode"] != mode or old["config"] != config or [
+                if old["mode"] != mode or {k: v for k, v in old["config"].items() if k != "retry_enabled"} != {k: v for k, v in config.items() if k != "retry_enabled"} or [
                     {k: s[k] for k in ("type", "email", "vd_hash", "path")} for s in previous_sources
                 ] != sources:
                     raise ValueError("idempotency_conflict")
@@ -183,6 +185,19 @@ class BatchStore:
                            ])
             return self.get(batch_id)
 
+    def set_retry_enabled(self, batch_id, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("invalid_retry_policy")
+        with self.connection() as db:
+            row = db.execute("SELECT config FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if row is None:
+                raise KeyError("batch_not_found")
+            config = json.loads(row["config"])
+            if config.get("retry_enabled", True) != enabled or "retry_enabled" not in config:
+                config["retry_enabled"] = enabled
+                # Changing an execution preference does not invalidate a running inventory.
+                db.execute("UPDATE batches SET config=? WHERE id=?", (json.dumps(config), batch_id))
+
     def get(self, batch_id):
         with self.lock:
             return self._batch(self.db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone())
@@ -194,6 +209,14 @@ class BatchStore:
                                    " ORDER BY created_at DESC,id LIMIT ? OFFSET ?",
                                    (*args, limit + 1, offset)).fetchall()
             return {"batches": [self._batch(row) for row in rows[:limit]], "has_more": len(rows) > limit}
+
+    def batch_for_child(self, child_job_id):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT batches.* FROM batches JOIN sources ON sources.batch_id=batches.id "
+                "WHERE sources.child_job_id=? LIMIT 1", (child_job_id,),
+            ).fetchone()
+            return self._batch(row) if row is not None else None
 
     def sources(self, batch_id):
         self.get(batch_id)

@@ -46,7 +46,7 @@ _EVENT_KEYS = DIAGNOSTIC_KEYS | frozenset({
     "stage", "http_status", "duration_ms", "remote_status", "source_path",
     "download_attempts", "max_download_attempts", "retry_delay_ms", "retry_at_ms",
     "point_retry_requested", "point_retry_attempts", "max_point_retry_attempts",
-    "operation_reference_issue",
+    "operation_reference_issue", "retry_enabled",
 })
 
 
@@ -82,6 +82,9 @@ def canonical_config(config):
     if kind not in {"personal", "shared"}:
         raise ValueError("invalid_destination_shared_disk")
     value = dict(config)
+    retry_enabled = value.pop("retry_enabled", None)
+    if "retry_enabled" in config and type(retry_enabled) is not bool:
+        raise ValueError("invalid_retry_policy")
     source_kind = value.get("source_type", "personal")
     if source_kind not in {"personal", "shared"}:
         raise ValueError("invalid_source_shared_disk")
@@ -157,6 +160,15 @@ def canonical_config(config):
         raise ValueError("invalid_identity_confirmation")
     if source_public:
         value["source_public"] = True
+    if "retry_enabled" in config:
+        value["retry_enabled"] = retry_enabled
+    return value
+
+
+def config_identity(config):
+    """Mutable execution preferences never invalidate a reviewed transfer plan."""
+    value = canonical_config(config)
+    value.pop("retry_enabled", None)
     return value
 
 
@@ -414,7 +426,7 @@ class MigrationStore:
                         or not minimum <= value <= maximum):
                     raise ValueError("invalid_event_value")
                 continue
-            if key == "point_retry_requested":
+            if key in {"point_retry_requested", "retry_enabled"}:
                 if not isinstance(value, bool):
                     raise ValueError("invalid_event_value")
                 continue
@@ -483,7 +495,7 @@ class MigrationStore:
                 "SELECT * FROM jobs WHERE idempotency_key=?", (idempotency_key,),
             ).fetchone()
             if existing:
-                if existing["config"] != serialized:
+                if config_identity(json.loads(existing["config"])) != config_identity(config):
                     raise ValueError("idempotency_config_mismatch")
                 if existing["restart_of"] is not None:
                     raise ValueError("idempotency_parent_mismatch")
@@ -503,11 +515,53 @@ class MigrationStore:
              "" if direct else f"disk:/.disk-copy-transfer-{job_id}",
              "owned" if direct else "unclaimed", restart_of, now, now),
         )
-        payload = {"state": initial_state}
+        retry_enabled = json.loads(config).get("retry_enabled", True)
+        payload = {"state": initial_state, "retry_enabled": retry_enabled}
         if restart_of is not None:
             payload["restart_of"] = restart_of
         self._event(connection, job_id, "job_created", payload, increment=False)
         return self._job(connection, self._required(connection, "jobs", job_id))
+
+    def set_retry_enabled(self, job_id, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("invalid_retry_policy")
+        cancelled_points = []
+        with self._connection(write=True) as connection:
+            job = self._required(connection, "jobs", job_id)
+            config = json.loads(job["config"])
+            if config.get("retry_enabled", True) == enabled and "retry_enabled" in config:
+                return
+            config["retry_enabled"] = enabled
+            connection.execute("UPDATE jobs SET config=? WHERE id=?", (_json(config), job_id))
+            if not enabled:
+                waiting = connection.execute(
+                    "SELECT entries.*,attempts.phase FROM entries JOIN attempts "
+                    "ON attempts.id=entries.attempt_id WHERE entries.job_id=? AND "
+                    "(entries.retry_at_ms IS NOT NULL OR attempts.phase='download_retry_wait')",
+                    (job_id,),
+                ).fetchall()
+                for entry in waiting:
+                    if entry["point_retry_requested"]:
+                        cancelled_points.append(entry["id"])
+                    elif entry["phase"] == "download_retry_wait":
+                        # A disabled scheduled retry stays cancelled even if the switch
+                        # is re-enabled before the worker's next tick.
+                        connection.execute("UPDATE attempts SET phase='failed' WHERE id=?", (entry["attempt_id"],))
+                        connection.execute("UPDATE entries SET state='failed',retry_at_ms=NULL WHERE id=?", (entry["id"],))
+                        self._event(connection, job_id, "transfer_stage", {
+                            "stage": "download_retry", "status": "skipped", "entry_id": entry["id"],
+                            "attempt_id": entry["attempt_id"], "error": entry["error"],
+                            "download_attempts": entry["download_attempts"], "max_download_attempts": 1,
+                            "retry_enabled": False,
+                        })
+                connection.execute("UPDATE entries SET retry_at_ms=NULL WHERE job_id=?", (job_id,))
+            self._event(connection, job_id, "retry_policy_changed", {
+                "stage": "retry_policy", "status": "succeeded", "retry_enabled": enabled,
+                "max_download_attempts": 5 if enabled else 1,
+                "max_point_retry_attempts": 3 if enabled else 1,
+            })
+        for entry_id in cancelled_points:
+            self.finish_point_retry(entry_id)
 
     def request_stop(self, job_id):
         """Persist a local stop independently of the worker's remote-request guard."""
@@ -597,7 +651,7 @@ class MigrationStore:
                 "stopped", "completed", "completed_with_issues",
             } or (parent["stop_requested"] and parent["state"] != "stopped"):
                 raise ValueError("job_not_restartable")
-            if parent["config"] != serialized:
+            if config_identity(json.loads(parent["config"])) != config_identity(config):
                 raise ValueError("restart_config_mismatch")
             if config.get("destination_type") == "shared":
                 config.update(
@@ -612,7 +666,10 @@ class MigrationStore:
             if existing:
                 if existing["restart_of"] != job_id:
                     raise ValueError("idempotency_parent_mismatch")
-                if existing["config"] not in {serialized, parent["config"]}:
+                if config_identity(json.loads(existing["config"])) not in [
+                    config_identity(json.loads(serialized)),
+                    config_identity(json.loads(parent["config"])),
+                ]:
                     raise ValueError("idempotency_config_mismatch")
                 return self._job(connection, existing)
             child = self._create_job(
@@ -840,6 +897,33 @@ class MigrationStore:
             })
             return dict(row, state=state, error=error, updated_at=now)
 
+    def schedule_download_retry(self, entry_id, attempt_id, retry_at_ms, payload):
+        """Publish the retry timer and its phase as one cancellable checkpoint."""
+        with self._connection(write=True) as connection:
+            entry = self._required(connection, "entries", entry_id)
+            job = self._required(connection, "jobs", entry["job_id"])
+            config = json.loads(job["config"])
+            if (not config.get("retry_enabled", True) or job["stop_requested"]
+                    or job["full_stop_requested"] or entry["point_retry_requested"]):
+                return False
+            if entry["attempt_id"] != attempt_id:
+                raise ValueError("attempt_changed")
+            self._required(connection, "attempts", attempt_id)
+            now = _now()
+            connection.execute(
+                "UPDATE entries SET state='downloading',error=?,retry_at_ms=?,updated_at=? "
+                "WHERE id=?", (payload["error"], retry_at_ms, now, entry_id),
+            )
+            connection.execute(
+                "UPDATE attempts SET phase='download_retry_wait',error=?,updated_at=? WHERE id=?",
+                (payload["error"], now, attempt_id),
+            )
+            self._event(connection, job["id"], "transfer_stage", {
+                **payload, "attempt_id": attempt_id, "status": "waiting",
+                "retry_at_ms": retry_at_ms,
+            })
+            return True
+
     def update_entry(self, entry_id, **fields):
         if not fields or set(fields) - {
             "state", "error", "attempt_id", "verification", "download_attempts",
@@ -983,7 +1067,7 @@ class MigrationStore:
             self._event(connection, job_id, "point_retry_requested", {
                 "entry_id": entry_id, "attempt_id": attempt_id,
                 "stage": "point_retry", "status": "started",
-                "max_point_retry_attempts": 3,
+                "max_point_retry_attempts": 3 if json.loads(job["config"]).get("retry_enabled", True) else 1,
             })
             return self._job(connection, self._required(connection, "jobs", job_id))
 
@@ -1064,7 +1148,7 @@ class MigrationStore:
                 "status": "succeeded" if entry["state"] in {"done", "already_verified"}
                 else "skipped", "error": entry["error"],
                 "point_retry_attempts": entry["point_retry_attempts"],
-                "max_point_retry_attempts": 3,
+                "max_point_retry_attempts": 3 if json.loads(job["config"]).get("retry_enabled", True) else 1,
             })
             return self._job(connection, self._required(connection, "jobs", job["id"]))
 

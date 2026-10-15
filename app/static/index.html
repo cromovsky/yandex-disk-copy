@@ -500,6 +500,8 @@
     .source-input-choice { margin: 0 0 18px; }
     .source-input-choice select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font: inherit; }
     .source-batches[hidden], .source-batches [hidden], #mode-local [hidden], [data-source-single][hidden] { display: none !important; }
+    .retry-setting { margin: 14px 0; }
+    .retry-setting .field-note { margin: 5px 0; }
     .source-batches { margin-top: 18px; }
     .source-batches textarea { width: 100%; min-height: 150px; box-sizing: border-box; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font: 13px/1.5 ui-monospace, monospace; }
     .source-batches .batch-run-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 18px 0 8px; }
@@ -688,6 +690,14 @@
         Если сотрудник-источник заблокирован, он временно разблокируется
         на время переноса и блокируется обратно.
       </p>
+      <div class="retry-setting">
+        <label class="onprem-check" for="retry-single">
+          <input id="retry-single" type="checkbox" checked>
+          <span>Автоматически повторять при ошибках</span>
+        </label>
+        <p class="field-note">Выключено: одна попытка, затем пропуск файла с записью ошибки в журнал.</p>
+        <p id="retry-single-notice" class="field-note onprem-result bad" role="status" aria-live="polite"></p>
+      </div>
       <div class="run-row">
         <button id="run" class="run-btn" type="button">Запустить перенос</button>
       </div>
@@ -824,6 +834,14 @@
         Если сотрудник-источник заблокирован, он временно разблокируется
         на время переноса и блокируется обратно.
       </p>
+      <div class="retry-setting">
+        <label class="onprem-check" for="retry-cross">
+          <input id="retry-cross" type="checkbox" checked>
+          <span>Автоматически повторять при ошибках</span>
+        </label>
+        <p class="field-note">Выключено: одна попытка, затем пропуск файла с записью ошибки в журнал.</p>
+        <p id="retry-cross-notice" class="field-note onprem-result bad" role="status" aria-live="polite"></p>
+      </div>
       <div class="run-row">
         <button id="run-cross" class="run-btn" type="button">Запустить перенос между организациями</button>
       </div>
@@ -899,6 +917,14 @@
             Все файлы сохраняются независимо от размера страницы.
           </p>
         </div>
+      </div>
+      <div class="retry-setting">
+        <label class="onprem-check" for="retry-local">
+          <input id="retry-local" type="checkbox" checked>
+          <span>Автоматически повторять при ошибках</span>
+        </label>
+        <p class="field-note">Выключено: одна попытка, затем пропуск файла с записью ошибки в журнал.</p>
+        <p id="retry-local-notice" class="field-note onprem-result bad" role="status" aria-live="polite"></p>
       </div>
       <div id="local-single-run" data-source-single="local">
       <p class="hint">
@@ -1037,6 +1063,14 @@
           <input id="onprem-identity-confirmed" type="checkbox" required>
           <span>Подтверждаю, что токен принадлежит указанному сотруднику. При повторном предоставлении доступа владелец токена проверен заново.</span>
         </label>
+      <div class="retry-setting">
+        <label class="onprem-check" for="retry-onprem">
+          <input id="retry-onprem" type="checkbox" checked>
+          <span>Автоматически повторять при ошибках</span>
+        </label>
+        <p class="field-note">Выключено: одна попытка, затем пропуск файла с записью ошибки в журнал.</p>
+        <p id="retry-onprem-notice" class="field-note onprem-result bad" role="status" aria-live="polite"></p>
+      </div>
         <div id="onprem-single-run" data-source-single="onprem">
         <div id="onprem-run-actions" class="run-row">
           <button id="onprem-plan" class="run-btn" type="submit" disabled>Dry Run</button>
@@ -1978,6 +2012,7 @@
       }
       Object.assign(body, extras || {});
       body.page_limit = parseInt(body.page_limit || "1000", 10);
+      body.retry_enabled = window.diskCopyRetries.value(local ? "local" : endpoint === "/api/run-cross" ? "cross" : "single");
 
       const useBatch = !local && batchCtrl && batchCtrl.isActive();
       let url = endpoint;
@@ -2066,8 +2101,9 @@
     }, $("run-cross"), { destination_type: getCrossDestType() }, batchCross));
 
   </script>
-  <script src="/static/run-journal.js?v=c3f3f63da74e"></script>
-  <script src="/static/onprem.js?v=95c00cc0e7d5"></script>
-  <script src="/static/source-batches.js?v=f855e7d7af22"></script>
+  <script src="/static/retry-controls.js?v=80e22866df02"></script>
+  <script src="/static/run-journal.js?v=a30f1fa4aa5c"></script>
+  <script src="/static/onprem.js?v=037f58bd0c30"></script>
+  <script src="/static/source-batches.js?v=af4b72b35f25"></script>
 </body>
 </html>

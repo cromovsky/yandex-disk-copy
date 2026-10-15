@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from .store import canonical_config
+from .store import config_identity
 
 
 class CredentialRegistry:
@@ -14,7 +14,7 @@ class CredentialRegistry:
         self._credentials = {}
 
     def put(self, job_id, config, credentials):
-        binding = canonical_config(config)
+        binding = config_identity(config)
         required = {"source_client_secret", "destination_token"}
         if (not isinstance(credentials, dict)
                 or not required <= set(credentials)

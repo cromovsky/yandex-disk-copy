@@ -5,6 +5,7 @@ from .diagnostics import describe_diagnostics, diagnostic_fields
 
 
 STAGE_LABELS = {
+    "retry_policy": "Автоматические повторы",
     "prepare_clients": "Подключение к дискам",
     "planning": "Чтение структуры исходного диска",
     "claim_namespace": "Создание служебной папки",

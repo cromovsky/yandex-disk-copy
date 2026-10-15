@@ -30,6 +30,9 @@ from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
+from urllib3.exceptions import MaxRetryError
+
+from .retry_policy import RetryPolicy
 
 from .throttle import (
     RETRY_STATUSES, ThrottledSession, backoff_delay, get_limiter,
@@ -63,19 +66,46 @@ else:
 class _ObservedRetry(Retry):
     observer = None
     limiter = None
+    retry_policy = None
 
     def new(self, **kwargs):
         clone = super().new(**kwargs)
         clone.observer = self.observer
         clone.limiter = self.limiter
+        clone.retry_policy = self.retry_policy
         return clone
 
-    def sleep(self, response=None):
+    def _disabled(self, error=None, pool=None, url=None, attempt=None):
+        last = self.history[-1] if self.history else None
+        actual_error = error or (last.error if last else None)
+        details = transport_details(actual_error, "saas") if actual_error else {}
         if callable(self.observer):
             try:
-                delay = (self.get_retry_after(response)
-                         if self.respect_retry_after_header and response else None)
-                delay = delay or self.get_backoff_time()
+                self.observer({"event_type": "retry", "status": "skipped",
+                               "error": "transport_error", "retry_enabled": False,
+                               **details,
+                               "attempt": attempt or max(1, len(self.history)),
+                               "message": "Автоматические повторы отключены; ошибка возвращена после текущей попытки."})
+            except Exception:
+                pass
+        raise MaxRetryError(pool, url or (last.url if last else None), actual_error)
+
+    def increment(self, method=None, url=None, response=None, error=None,
+                  _pool=None, _stacktrace=None):
+        if self.retry_policy is not None and not self.retry_policy.enabled:
+            self._disabled(error, _pool, url, len(self.history) + 1)
+        return super().increment(method, url, response, error, _pool, _stacktrace)
+
+    def sleep(self, response=None):
+        delay = (self.get_retry_after(response)
+                 if self.respect_retry_after_header and response else None)
+        delay = delay or self.get_backoff_time()
+        if self.retry_policy is not None and not self.retry_policy.enabled:
+            self._disabled()
+        generation = (self.retry_policy.cancellation_generation
+                      if self.retry_policy is not None else None)
+        if callable(self.observer):
+            try:
                 payload = {
                     "event_type": "retry", "status": "waiting",
                     "error": "transport_error", "attempt": len(self.history),
@@ -90,17 +120,24 @@ class _ObservedRetry(Retry):
                         payload["transport_error"] = category
                 self.observer(payload)
             except Exception:
-                # Journaling must not change urllib3 retry or sleep behavior.
                 pass
-        super().sleep(response)
-        # urllib3 resends inside adapter.send(); reserve another global slot before
-        # each transport retry instead of letting it bypass the process budget.
+        if self.retry_policy is None:
+            super().sleep(response)
+        elif not self.retry_policy.wait(delay, generation=generation):
+            self._disabled()
         if self.limiter is not None:
             method = self.history[-1].method if self.history else "GET"
-            self.limiter.acquire(method)
+            if self.retry_policy is None:
+                self.limiter.acquire(method)
+            else:
+                def checkpoint():
+                    if not self.retry_policy.wait(0, generation=generation):
+                        self._disabled()
+                self.limiter.acquire(method, checkpoint=checkpoint)
+                checkpoint()
 
 
-def _build_session() -> requests.Session:
+def _build_session(retry_policy=None) -> requests.Session:
     """Сессия с общим троттлингом, ретраями по статусам и таймаутами.
 
     Статусы (429/5xx) обрабатывает наш ThrottledSession, а не urllib3: ретраи
@@ -122,7 +159,8 @@ def _build_session() -> requests.Session:
     )
     limiter = get_limiter()
     transport_retries.limiter = limiter
-    session = ThrottledSession(limiter)
+    transport_retries.retry_policy = retry_policy
+    session = ThrottledSession(limiter, retry_policy=retry_policy)
     session.mount("https://", HTTPAdapter(max_retries=transport_retries))
     return session
 
@@ -184,6 +222,8 @@ class CopyConfig:
     # Для локального сохранения общего диска source_disk_id — email читателя.
     source_type: str = "personal"
     source_vd_hash: str = ""
+    retry_enabled: bool = True
+    retry_policy: Optional[RetryPolicy] = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -202,6 +242,11 @@ class CopyError(Exception):
         self.http_status = http_status
         self.uncertain = uncertain
         self.code = code
+
+
+def _access_failure(exc):
+    return (getattr(exc, "code", None) == "token_failed"
+            or getattr(exc, "journal_stage", None) == "get_token")
 
 
 def validate_source_email(value: str, *, shared: bool = False) -> str:
@@ -227,6 +272,7 @@ class DiskCopier:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        retry_policy=None,
     ):
         self.cfg = config
         self._log = log or (lambda _msg: None)
@@ -240,7 +286,11 @@ class DiskCopier:
         # часы инъектируются, чтобы тесты не спали по-настоящему
         self._monotonic = monotonic
         self._sleep = sleep
+        self.retry_policy = retry_policy or config.retry_policy or RetryPolicy(
+            config.retry_enabled, monotonic=monotonic, sleep=sleep,
+        )
         self.session = _build_session()
+        self.session.set_retry_policy(self.retry_policy)
         # 429 и ретраи должны быть видны в SSE-логе браузера, а не выглядеть
         # для пользователя как «просто стало медленно»
         self.session.set_log(self.log)
@@ -254,6 +304,7 @@ class DiskCopier:
         self.fails: list[dict] = []
         self.skipped: list[dict] = []
         self.unconfirmed: list[dict] = []
+        self._failed_publications: set[str] = set()
         # уже созданные папки общего диска: сосед в той же папке запросов не тратит
         self._vd_created: set[str] = set()
 
@@ -399,7 +450,9 @@ class DiskCopier:
             uncertain = method not in {"GET", "HEAD"} and stage != "get_token"
             if isinstance(exc, requests.RequestException):
                 exc.journal_diagnostics = details
-                exc.uncertain = uncertain
+                if not getattr(exc, "journal_stage", None):
+                    exc.journal_stage = stage
+                exc.uncertain = getattr(exc, "uncertain", uncertain)
             self._event({**self._request_context, **details, "event_type": "stage",
                          "status": "outcome_unknown" if uncertain else "failed",
                          "error": "transport_failed" if isinstance(exc, requests.RequestException)
@@ -431,11 +484,33 @@ class DiskCopier:
 
     def _failure(self, response, message, *, side, mutation=False, stream=False,
                  code="copy_failed", uncertain=False):
-        return CopyError(f"{message}: HTTP {response.status_code}",
-                         diagnostics=self._response_details(response, side, stream=stream),
-                         http_status=response.status_code,
-                         uncertain=uncertain or (mutation and response.status_code >= 500),
-                         code=code)
+        error = CopyError(f"{message}: HTTP {response.status_code}",
+                          diagnostics=self._response_details(response, side, stream=stream),
+                          http_status=response.status_code,
+                          uncertain=uncertain or (mutation and response.status_code >= 500),
+                          code=code)
+        error.journal_stage = getattr(response, "_journal_context", {}).get("stage")
+        return error
+
+    def _file_failure(self, record, exc, *, stage="file", side="destination",
+                      destination=None):
+        """Record one failed resource; disabling retries never hides its cause."""
+        error = self._safe_text(exc)
+        self.fails.append({**record, "error": error})
+        if self.retry_policy.enabled:
+            return
+        details = self._error_details(exc, side)
+        code = getattr(exc, "code", None) or (
+            "transport_failed" if isinstance(exc, requests.RequestException) else "transfer_failed"
+        )
+        self._event({"event_type": "stage", "stage": getattr(exc, "journal_stage", None) or stage,
+                     "status": "outcome_unknown" if getattr(exc, "uncertain", False) else "skipped",
+                     "source": record.get("path"), "destination": destination,
+                     "kind": record.get("type", "file"), **details,
+                     "error": code, "http_status": getattr(exc, "http_status", None),
+                     "retry_enabled": False, "attempt": 1, "max_attempts": 1,
+                     "message": "Автоматические повторы отключены; ресурс пропущен после ошибки: "
+                     + error})
 
     def _record_result(self, record):
         if self._file_outcome == "skipped":
@@ -457,6 +532,8 @@ class DiskCopier:
         try:
             yield
         except Exception as exc:
+            if not getattr(exc, "journal_stage", None):
+                exc.journal_stage = stage
             local_error = isinstance(exc, OSError) and not isinstance(
                 exc, requests.RequestException,
             )
@@ -680,6 +757,7 @@ class DiskCopier:
         side = context.get("error_side", "source")
         details = self._response_details(response, side)
         exc.journal_diagnostics = details
+        exc.journal_stage = context.get("stage")
         exc.http_status = response.status_code
         exc.code = code
         self._event({**context, **details, "event_type": "stage", "status": "failed",
@@ -692,6 +770,10 @@ class DiskCopier:
             yield
         except (ValueError, AttributeError, TypeError, RecursionError) as exc:
             self._invalid_response(response, exc, code)
+            if not self.retry_policy.enabled:
+                raise self._failure(response, "Сервер вернул некорректный JSON-ответ",
+                                    side=exc.journal_diagnostics.get("error_side", "source"),
+                                    code=code, uncertain=response.status_code == 202) from None
             raise
 
     def _response_payload(self, response) -> dict:
@@ -819,6 +901,8 @@ class DiskCopier:
         }
         response = self._request("GET", url, stage="metadata", side="source",
                                  source=path, params=params, headers=headers)
+        if not self.retry_policy.enabled and response.status_code >= 400:
+            raise self._failure(response, f"Не удалось прочитать свойства {path}", side="source")
         return self._response_payload(response)
 
     def _disk_publish_resource(self, token: str, path: str) -> None:
@@ -829,8 +913,11 @@ class DiskCopier:
         self._detail(
             f"disk_publish_resource | status: {response.status_code} | path: {path}"
         )
-        # отказ доступа — системная проблема, а не «этот файл не вышло»
-        if response.status_code in (401, 403):
+        # With retries enabled retain the legacy access-failure behavior.
+        # A disabled policy makes every failed publication final for this resource.
+        if response.status_code in (401, 403) or (
+            not self.retry_policy.enabled and response.status_code >= 400
+        ):
             error = self._failure(response, f"Не удалось опубликовать {path}",
                                   side="source", mutation=True)
             error.args = (str(error) + self._access_hint(
@@ -938,6 +1025,10 @@ class DiskCopier:
                              **self._error_details(exc, "destination", href),
                              "error": "operation_status_unavailable"})
                 raise
+            if not self.retry_policy.enabled and response.status_code >= 400:
+                raise self._failure(response, "Не удалось проверить результат принятой операции",
+                                    side="destination", uncertain=True,
+                                    code="operation_status_unavailable")
             try:
                 payload = response.json() if response.content else {}
                 status = payload.get("status")
@@ -947,7 +1038,15 @@ class DiskCopier:
                 self._event({"event_type": "stage", "stage": "poll_operation",
                              "status": "outcome_unknown", **exc.journal_diagnostics, **operation,
                              "error": "invalid_operation_response"})
+                if not self.retry_policy.enabled:
+                    raise self._failure(response, "Некорректный ответ проверки операции; исход неизвестен",
+                                        side="destination", uncertain=True,
+                                        code="invalid_operation_response") from None
                 raise
+            if not self.retry_policy.enabled and status not in ("in-progress", "success", "failed"):
+                raise self._failure(response, "Сервер не сообщил корректный статус принятой операции",
+                                    side="destination", uncertain=True,
+                                    code="invalid_operation_response")
             self._event({"event_type": "stage", "stage": "poll_operation",
                          "error_side": "destination",
                          **operation,
@@ -1081,12 +1180,17 @@ class DiskCopier:
     def make_links(self) -> None:
         """Публикует все ресурсы в исходной папке (создаёт публичные ссылки)."""
         self.log(f"make_links | start | path: {self.cfg.path}")
-        self._walk(
-            self.cfg.path,
-            lambda item: self._disk_publish_resource(
-                self._source_token(), item["path"]
-            ),
-        )
+        def publish(item):
+            token = self._source_token()
+            try:
+                self._disk_publish_resource(token, item["path"])
+            except (CopyError, requests.RequestException) as exc:
+                if self.retry_policy.enabled or _access_failure(exc):
+                    raise
+                self._failed_publications.add(item["path"])
+                self._file_failure(item, exc, stage="publish", side="source")
+
+        self._walk(self.cfg.path, publish)
         self.log("make_links | done")
 
     def get_links(self) -> None:
@@ -1094,6 +1198,10 @@ class DiskCopier:
         self.log(f"get_links | start | path: {self.cfg.path}")
 
         def collect(item: dict) -> None:
+            path = item.get("path", "")
+            if any(path == failed or path.startswith(failed.rstrip("/") + "/")
+                   for failed in self._failed_publications):
+                return
             public_key = item.get("public_key")
             record = {
                 "path": item.get("path"),
@@ -1111,7 +1219,9 @@ class DiskCopier:
                              "kind": record["type"],
                              "error": "publication_not_confirmed", "message": reason})
                 self._detail(f"get_links | пропуск {record['path']}: {reason}")
-                self.fails.append({**record, "error": reason})
+                self._file_failure(record, CopyError(reason, code="publication_not_confirmed",
+                                   diagnostics={"error_side": "source"}),
+                                   stage="collect_links", side="source")
 
         self._walk(self.cfg.path, collect)
         self.log(
@@ -1135,9 +1245,11 @@ class DiskCopier:
                                  destination=f"{folder}/{link.get('name')}", kind=link.get("type")):
                     self._save_one_link(link)
                     self._record_result(link)
-            except CopyError as exc:
+            except (CopyError, requests.RequestException) as exc:
+                if _access_failure(exc):
+                    raise
                 self._detail(f"save_links | ошибка {link.get('path')}: {exc}")
-                self.fails.append({**link, "error": self._safe_text(exc)})
+                self._file_failure(link, exc, destination=f"{folder}/{link.get('name')}")
             self.log(f"save_links | progress {i}/{len(pending)}")
         self.log(
             f"save_links | done | saved: {len(self.links)}, fails: {len(self.fails)}"
@@ -1267,7 +1379,7 @@ class DiskCopier:
             self._disk_save_public_resource(link["public_key"], link["name"])
             return
         except CopyError as exc:
-            if "404" not in str(exc):
+            if not self.retry_policy.enabled or "404" not in str(exc):
                 raise
             if link.get("type") != "file":
                 raise CopyError(
@@ -1296,52 +1408,46 @@ class DiskCopier:
             self.log("save_to_shared | нечего переносить")
             return
 
-        # Дерево папок создаём один раз на весь перенос, а не на каждый файл:
-        # прежний вызов внутри цикла пересоздавал всю цепочку заново (ответы 409).
-        parents = sorted(
-            {
-                parent
-                for parent in (
-                    self._dest_inner(item).rsplit("/", 1)[0] for item in files
-                )
-                if parent and parent != root_inner
-            },
-            key=lambda p: p.count("/"),  # сверху вниз: родитель раньше ребёнка
-        )
-        for parent in parents:
-            self._vd_ensure_folder_tree(parent)
-        self.log(f"save_to_shared | папок создано: {len(self._vd_created)}")
-
         for i, item in enumerate(files, 1):
             src_path = item["path"]
             name = item.get("name") or src_path.rsplit("/", 1)[-1]
-            dest_vd = self._vd_path(self._dest_inner(item))
-
-            self._disk_publish_resource(self._source_token(), src_path)
-            meta = self._disk_resource(self._source_token(), src_path)
-            public_key = meta.get("public_key")
+            inner = self._dest_inner(item)
+            dest_vd = self._vd_path(inner)
             record = {"path": src_path, "name": name}
-            if not isinstance(public_key, str):
-                self._event({"event_type": "stage", "stage": "collect_links", "status": "failed",
-                             "error_side": "source", "source": src_path, "destination": dest_vd,
-                             "kind": "file", "error": "publication_not_confirmed",
-                             "message": "Публикация не дала публичного ключа."})
-                self._detail(f"save_to_shared | нет public_key: {src_path}")
-                self.fails.append(record)
-                continue
-
+            token = self._source_token()
+            stage = "create_directory"
             try:
                 with self._stage("file", "destination", source=src_path, destination=dest_vd,
                                  kind="file", size=item.get("size")):
+                    self._vd_ensure_folder_tree(inner.rsplit("/", 1)[0])
+                    stage = "publish"
+                    self._disk_publish_resource(token, src_path)
+                    stage = "metadata"
+                    meta = self._disk_resource(self._source_token(), src_path)
+                    public_key = meta.get("public_key")
+                    if not isinstance(public_key, str):
+                        raise CopyError("Публикация не дала публичного ключа.",
+                                        diagnostics={"error_side": "source"},
+                                        code="publication_not_confirmed")
+                    stage = "get_download_url"
                     href = self._public_download_href(public_key)
+                    stage = "upload"
                     self._vd_upload_from_url(href, dest_vd)
                     self._record_result(
                         {**record, "public_key": public_key, "dest": dest_vd})
-            except CopyError as exc:
+            except (CopyError, requests.RequestException) as exc:
+                if _access_failure(exc) or (
+                    self.retry_policy.enabled and stage in {"create_directory", "publish", "metadata"}
+                    and getattr(exc, "code", None) != "publication_not_confirmed"
+                ):
+                    raise
                 self._detail(f"save_to_shared | ошибка {src_path}: {exc}")
-                self.fails.append({**record, "error": self._safe_text(exc)})
-
+                self._file_failure(record, exc, stage=stage,
+                                   side="source" if stage in {"publish", "metadata", "get_download_url"}
+                                   else "destination", destination=dest_vd)
             self.log(f"save_to_shared | progress {i}/{len(files)}")
+
+        self.log(f"save_to_shared | папок создано: {len(self._vd_created)}")
 
         self.log(
             f"save_to_shared | done | saved: {len(self.links)}, "
@@ -1376,7 +1482,9 @@ class DiskCopier:
             dest.parent.mkdir(parents=True, exist_ok=True)
         if self._download_session is None:
             # Повторы всего файла считаем здесь; signed URL в общий лог не пишем.
-            self._download_session = ThrottledSession(get_limiter(), max_attempts=1)
+            self._download_session = ThrottledSession(
+                get_limiter(), max_attempts=1, retry_policy=self.retry_policy,
+            )
         for attempt in range(LOCAL_DOWNLOAD_RETRIES + 1):
             response = part = None
             status = retry_after = None
@@ -1392,7 +1500,8 @@ class DiskCopier:
                                          source=src_path, destination=str(dest), kind="file",
                                          session=self._download_session, stream=True,
                                          attempt=attempt + 1,
-                                         max_attempts=LOCAL_DOWNLOAD_RETRIES + 1, **kwargs)
+                                         max_attempts=(LOCAL_DOWNLOAD_RETRIES + 1
+                                                       if self.retry_policy.enabled else 1), **kwargs)
                 status = response.status_code
                 if status != 200:
                     error = self._failure(response, f"Не удалось скачать {src_path}",
@@ -1431,6 +1540,8 @@ class DiskCopier:
                 if part is not None and part.exists():
                     part.unlink()
 
+            if not self.retry_policy.enabled:
+                raise error
             if attempt == LOCAL_DOWNLOAD_RETRIES:
                 self._event({"event_type": "retry", "stage": "download", "status": "failed",
                              "source": src_path, "destination": str(dest),
@@ -1444,6 +1555,7 @@ class DiskCopier:
                 delay = max(delay, retry_after)
             if status == 429:
                 get_limiter().penalize(delay)
+            generation = self.retry_policy.cancellation_generation
             message = (f"save_local | {src_path} | {reason} | "
                        f"retry {attempt + 1}/{LOCAL_DOWNLOAD_RETRIES} через {delay:.1f} с")
             if callable(getattr(self._log, "event", None)):
@@ -1454,7 +1566,14 @@ class DiskCopier:
                              "retry_delay_ms": int(delay * 1000), "message": message})
             else:
                 self.log(message)
-            self._sleep(delay)
+            if not self.retry_policy.wait(delay, generation=generation):
+                self._event({"event_type": "retry", "stage": "download", "status": "skipped",
+                             "source": src_path, "destination": str(dest),
+                             **self._error_details(error, "source"), "http_status": status,
+                             "attempt": attempt + 1, "retry_enabled": False,
+                             "error": getattr(error, "code", "transport_failed"),
+                             "message": "Автоматические повторы отключены; ожидавший повтор отменён."})
+                raise error
 
     def save_local(self) -> None:
         """Скачивает дерево PATH на машину, с которой запущена утилита.
@@ -1508,10 +1627,18 @@ class DiskCopier:
             if not isinstance(path, str):
                 return
             if kind == "dir":
-                dest_dir = self._local_file_path(path, base)
-                with self._stage("create_directory", "local", source=path,
-                                 destination=str(dest_dir), kind="dir"):
-                    dest_dir.mkdir(parents=True, exist_ok=True)
+                dest_dir = None
+                try:
+                    with self._stage("create_directory", "local", source=path, kind="dir"):
+                        dest_dir = self._local_file_path(path, base)
+                        self._context["destination"] = str(dest_dir)
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                except (CopyError, ValueError, OSError) as exc:
+                    if self.retry_policy.enabled:
+                        raise
+                    self._file_failure(item, exc, stage="create_directory", side="local",
+                                       destination=str(dest_dir) if dest_dir is not None else None)
+                    return
                 self._walk(path, visit)
             elif kind == "file":
                 files.append(item)
@@ -1520,6 +1647,7 @@ class DiskCopier:
         self.log(f"save_local | файлов: {len(files)}")
         for i, item in enumerate(files, 1):
             src_path = item["path"]
+            dest = None
             try:
                 with self._stage("file", "local", source=src_path, kind="file",
                                  size=item.get("size")):
@@ -1547,14 +1675,15 @@ class DiskCopier:
                         )
                         self._detail(f"save_local | сохранён {src_path}")
             except (CopyError, OSError, ValueError, requests.RequestException) as exc:
+                if _access_failure(exc):
+                    raise
                 error = (
                     f"Ошибка скачивания: {type(exc).__name__}"
                     if isinstance(exc, requests.RequestException) else self._safe_text(exc)
                 )
                 self._detail(f"save_local | ошибка {src_path}: {error}")
-                self.fails.append(
-                    {"path": src_path, "name": item.get("name"), "error": error}
-                )
+                self._file_failure({"path": src_path, "name": item.get("name")}, exc,
+                                   side="local", destination=str(dest) if dest is not None else None)
             self.log(f"save_local | progress {i}/{len(files)}")
         self.log(
             f"save_local | done | saved: {len(self.links)}, fails: {len(self.fails)}"

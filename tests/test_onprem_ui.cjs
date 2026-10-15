@@ -47,7 +47,7 @@ class Element {
 
 const staticRoot = path.resolve(__dirname, "../app/static");
 const html = fs.readFileSync(path.join(staticRoot, "index.html"), "utf8");
-const source = fs.readFileSync(path.join(staticRoot, "onprem.js"), "utf8");
+const source = fs.readFileSync(path.join(staticRoot, "retry-controls.js"), "utf8") + "\n" + fs.readFileSync(path.join(staticRoot, "onprem.js"), "utf8");
 const matches = (node, selector) => {
   if (selector === ".mode-tab") return node.classList.contains("mode-tab");
   if (selector === '[data-legacy-output]') return "data-legacy-output" in node.attributes;
@@ -1069,7 +1069,73 @@ async function verifyAutomaticJobActions() {
   }
 }
 
+async function verifyRetryPolicy() {
+  async function load({state = "ready", retryEnabled = false, strategy = "staged", failPolicy = false} = {}) {
+    const ui = createDocument(), calls = [];
+    let current = {...clone(job), state, config: {...clone(config), strategy, retry_enabled: retryEnabled}};
+    const policyWindow = {diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: false}), addEventListener() {}};
+    const api = async (address, options = {}) => {
+      const url = new URL(address, "http://localhost"), method = options.method || "GET", body = options.body ? JSON.parse(options.body) : null;
+      calls.push({path: url.pathname, method, body});
+      let result = current;
+      if (url.pathname.endsWith("/retries")) {
+        if (failPolicy) return {ok: false, status: 403, json: async () => ({detail: "onprem_access_required", private_detail: "secret-value"})};
+        current.config.retry_enabled = body.enabled; result = {retry_enabled: body.enabled};
+      } else if (url.pathname.endsWith("/entries")) result = {entries: []};
+      else if (url.pathname.endsWith("/events")) result = {events: []};
+      else if (url.pathname === "/api/onprem/jobs" && method === "GET") result = {jobs: [current]};
+      else if (url.pathname === "/api/onprem/preflight") result = {destination: preflightDestination};
+      else if (url.pathname === "/api/onprem/jobs" && method === "POST") {
+        current = {...clone(current), id: "new-job", state: "queued", config: {...clone(body.config), retry_enabled: true}};
+        result = current;
+      }
+      return {ok: true, status: 200, json: async () => clone(result)};
+    };
+    vm.runInNewContext(source, {document: ui.document, window: policyWindow, fetch: api, URL, Blob, crypto, Uint8Array, console, setTimeout() {return 1;}, clearTimeout() {}});
+    await flush();
+    const history = ui.byId.get("onprem-history"); history.value = "job-1"; await fire(history, "change");
+    return {...ui, calls};
+  }
+  for (const state of ["ready", "running", "paused"]) {
+    const ui = await load({state});
+    const check = ui.byId.get("retry-onprem");
+    assert.equal(check.checked, false, "Onprem restores the persisted policy");
+    assert.equal(check.disabled, false, "Onprem keeps live retry control available");
+    const before = ui.calls.length;
+    check.checked = true; await fire(check, "change");
+    assert.deepEqual(ui.calls.slice(before), [{path: "/api/onprem/jobs/job-1/retries", method: "POST", body: {enabled: true}}]);
+    assert.equal(check.checked, true);
+    assert.equal(check.disabled, false);
+  }
+  const history = await load({state: "completed", strategy: "url"});
+  let before = history.calls.length;
+  history.byId.get("retry-onprem").checked = true; await fire(history.byId.get("retry-onprem"), "change");
+  assert.equal(history.calls.length, before, "retry setting never mutates old URL history");
+  const rejected = await load({state: "running", retryEnabled: true, failPolicy: true});
+  rejected.byId.get("retry-onprem").checked = false; await fire(rejected.byId.get("retry-onprem"), "change");
+  assert.equal(rejected.byId.get("retry-onprem").checked, true);
+  assert.equal(rejected.byId.get("retry-onprem").disabled, false);
+  assert.doesNotMatch(rejected.byId.get("retry-onprem-notice").textContent, /secret-value/);
+  const recovered = await load({state: "stopped", retryEnabled: true});
+  recovered.byId.get("retry-onprem").checked = false; await fire(recovered.byId.get("retry-onprem"), "change");
+  for (const [key, value] of Object.entries(config)) {
+    const field = recovered.nodes.find((node) => node.dataset.onpremConfig === key); if (field) field.value = value;
+  }
+  recovered.byId.get("onprem-source-secret").value = "source-secret";
+  recovered.byId.get("onprem-destination-token").value = "destination-secret";
+  recovered.byId.get("onprem-identity-confirmed").checked = true;
+  await fire(recovered.byId.get("onprem-identity-confirmed"), "change");
+  before = recovered.calls.length;
+  await fire(recovered.byId.get("onprem-form"), "submit");
+  const writes = recovered.calls.slice(before).filter((call) => call.method !== "GET");
+  assert.equal(writes[1].path, "/api/onprem/jobs");
+  assert.equal(writes[1].body.config.retry_enabled, false);
+  assert.deepEqual(writes[2], {path: "/api/onprem/jobs/new-job/retries", method: "POST", body: {enabled: false}});
+  assert.equal(recovered.byId.get("retry-onprem").checked, false, "idempotent create preserves the latest form choice");
+}
+
 (async () => {
+  await verifyRetryPolicy();
   await verifyStagedOnly();
   await verifyReleaseGate();
   await verifyGlobalCacheCleanup();
@@ -1844,8 +1910,8 @@ async function verifyAutomaticJobActions() {
   assert.equal(byId.get("onprem-history").value, stoppedParent.id);
   assert.match(byId.get("onprem-notice").textContent, /Соединение прервалось/);
   const uncertainRestart = requests.filter((request) => request.path.endsWith("/restart")).at(-1);
-  assert.deepEqual(uncertainRestart.body.config, stoppedParent.config,
-    "restart sends the exact historical parent config for strict binding verification");
+  assert.deepEqual(uncertainRestart.body.config, {...stoppedParent.config, retry_enabled: true},
+    "restart preserves all historical parameters while sending the independently editable retry policy");
   assert.equal(uncertainRestart.body.credentials.destination_token, "fresh-destination-token");
   assert.match(uncertainRestart.body.idempotency_key, /^[0-9a-f-]{36}$/i);
   const otherParent = {...clone(stoppedParent), id: "c".repeat(32), state: "completed", stop_requested: false, full_stop_requested: false};

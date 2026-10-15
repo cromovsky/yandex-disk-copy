@@ -178,7 +178,7 @@
     move_file: "Перемещение в целевую папку", poll_move: "Ожидание перемещения",
     verify_destination: "Проверка итогового файла", cleanup: "Очистка временных файлов",
     download_retry: "Повтор скачивания",
-    point_retry: "Проверка и повтор файла",
+    point_retry: "Проверка и повтор файла", retry_policy: "Настройка повторов",
     publish_source: "Публикация исходного ресурса",
     public_download_link: "Получение публичной ссылки скачивания",
   };
@@ -205,7 +205,7 @@
     entry_done: "Объект перенесён",
     outcome_unknown: "Исход операции неизвестен", cleanup: "Локальная очистка",
     local_cleanup: "Локальная очистка", error: "Ошибка",
-    transfer_stage: "Этап переноса",
+    transfer_stage: "Этап переноса", retry_policy_changed: "Автоматические повторы",
     // Подписи старых событий сохранены для чтения истории. Ручное разрешение
     // исхода удалено; новых действий через эти подписи интерфейс не запускает.
     attempt_resolved: "Исход попытки установлен",
@@ -324,6 +324,7 @@
   function readConfig() {
     const config = {};
     fields.forEach((field) => { config[field.dataset.onpremConfig] = field.value.trim(); });
+    config.retry_enabled = window.diskCopyRetries?.value("onprem") !== false;
     config.strategy = "staged";
     config.destination_type = "shared";
     config.destination_base = "/";
@@ -692,7 +693,7 @@
       result.appendChild(state);
       if (validDownloadAttempts(entry.download_attempts)) {
         const counter = document.createElement("div");
-        counter.textContent = `Скачивание: ${entry.download_attempts}/5`;
+        counter.textContent = `Скачивание: ${entry.download_attempts}` + (selected.config.retry_enabled === false ? "" : "/5");
         result.appendChild(counter);
       }
       if (retryAt) {
@@ -702,7 +703,7 @@
       }
       if (validPointRetryAttempts(entry.point_retry_attempts) && (entry.point_retry_requested || entry.point_retry_attempts > 0)) {
         const counter = document.createElement("div");
-        counter.textContent = `Точечный повтор: ${entry.point_retry_attempts}/3`;
+        counter.textContent = `Точечный повтор: ${entry.point_retry_attempts}` + (selected.config.retry_enabled === false ? "" : "/3");
         result.appendChild(counter);
       }
       if (entry.point_retry_requested && !oldWorkStopped(selected) && retryDate(entry.retry_at_ms)) {
@@ -805,11 +806,25 @@
         throw failure("point_retry_not_available");
       }
       await mutate(`entries/${encodeURIComponent(entryId)}/retry`, {attempt_id: attemptId, revision: selected.revision});
-      notice("Проверка и повтор выбранного файла запущены: до трёх попыток. Ход и причины ошибок записываются в журнал.");
+      notice("Проверка и повтор выбранного файла запущены: " + (window.diskCopyRetries.value("onprem") ? "до трёх попыток" : "одна попытка") + ". Ход и причины ошибок записываются в журнал.");
     });
   }
 
   function updateActions() {
+    if (byId("onprem-source-input")?.value !== "list") {
+      const id = selected?.id;
+      window.diskCopyRetries?.bind("onprem", {
+        id: "onprem:" + (id || "new"), enabled: selected?.config?.retry_enabled !== false,
+        loading: false,
+        editable: Boolean(selected && sharedConfig(selected.config) && selected.config.strategy === "staged" &&
+          !oldWorkStopped(selected) && !["completed", "completed_with_issues"].includes(selected.state)),
+        save: async (enabled) => {
+          const result = await request(`/jobs/${encodeURIComponent(id)}/retries`, {method: "POST", body: {enabled}});
+          if (selected?.id === id) selected.config.retry_enabled = result.retry_enabled;
+          return result;
+        }, errorText,
+      });
+    }
     const locked = busy || !enabled || !authorized();
     const legacy = selected && (!sharedConfig(selected.config) || selected.config.strategy !== "staged");
     const confirmed = byId("onprem-identity-confirmed").checked;
@@ -871,6 +886,7 @@
       const context = event.context || {};
       const detail = [];
       if (Object.hasOwn(stageLabels, payload.stage)) detail.push(stageLabels[payload.stage]);
+      if (typeof payload.retry_enabled === "boolean") detail.push("Автоматические повторы: " + (payload.retry_enabled ? "включены" : "выключены"));
       if (Object.hasOwn(stageStatuses, payload.status)) detail.push(stageStatuses[payload.status]);
       if (payload.state) detail.push(stateLabel(payload.state));
       if (event.type === "local_operations_cancelled" && Number.isSafeInteger(payload.count) && payload.count >= 0) {
@@ -913,11 +929,11 @@
       if (Number.isSafeInteger(payload.duration_ms) && payload.duration_ms >= 0) {
         detail.push(`${payload.duration_ms} мс`);
       }
-      if (validPointRetryAttempts(payload.point_retry_attempts) && payload.max_point_retry_attempts === 3) {
-        detail.push(`Точечный повтор: ${payload.point_retry_attempts}/3`);
+      if (validPointRetryAttempts(payload.point_retry_attempts) && [1, 3].includes(payload.max_point_retry_attempts)) {
+        detail.push(`Точечный повтор: ${payload.point_retry_attempts}/${payload.max_point_retry_attempts}`);
       }
-      if (validDownloadAttempts(payload.download_attempts) && payload.max_download_attempts === 5) {
-        detail.push(`Скачивание: ${payload.download_attempts}/5`);
+      if (validDownloadAttempts(payload.download_attempts) && [1, 5].includes(payload.max_download_attempts)) {
+        detail.push(`Скачивание: ${payload.download_attempts}/${payload.max_download_attempts}`);
       }
       if (Number.isSafeInteger(payload.retry_delay_ms) && payload.retry_delay_ms >= 0) {
         detail.push(`Пауза перед повтором: ${payload.retry_delay_ms / 1000} с`);
@@ -957,6 +973,14 @@
     if (restore) fillConfig(job.config || {});
     updateDestinationPreview();
     renderJob();
+  }
+
+  async function synchronizeRetries(job, retryIntent) {
+    while ((job.config?.retry_enabled !== false) !== retryIntent.enabled) {
+      const result = await request(`/jobs/${encodeURIComponent(job.id)}/retries`, {method: "POST", body: {enabled: retryIntent.enabled}});
+      if (typeof result?.retry_enabled !== "boolean") throw failure("invalid_response");
+      job.config.retry_enabled = result.retry_enabled;
+    }
   }
 
   async function openJob(id) {
@@ -1073,17 +1097,21 @@
     if (byId("onprem-source-input")?.value === "list") return;
     if (byId("onprem-plan").disabled || !byId("onprem-form").reportValidity()) return;
     action(async () => {
-      const config = readConfig();
-      await checkDestination(config);
-      const fingerprint = JSON.stringify(config);
-      if (!pendingCreate || pendingCreate.fingerprint !== fingerprint) pendingCreate = {fingerprint, key: uuid()};
-      const job = await request("/jobs", {method: "POST", body: {
-        config, credentials: credentials(), idempotency_key: pendingCreate.key,
-      }});
-      pendingCreate = null;
-      selectJob(job);
-      notice("Dry Run запущен. Дождитесь готовности плана и проверьте итоговые пути.");
-      await refreshAll();
+      const retryIntent = window.diskCopyRetries.track("onprem");
+      try {
+        const config = readConfig();
+        await checkDestination(config);
+        const fingerprint = JSON.stringify({...config, retry_enabled: undefined});
+        if (!pendingCreate || pendingCreate.fingerprint !== fingerprint) pendingCreate = {fingerprint, key: uuid()};
+        const job = await request("/jobs", {method: "POST", body: {
+          config, credentials: credentials(), idempotency_key: pendingCreate.key,
+        }});
+        await synchronizeRetries(job, retryIntent);
+        pendingCreate = null;
+        selectJob(job);
+        notice("Dry Run запущен. Дождитесь готовности плана и проверьте итоговые пути.");
+        await refreshAll();
+      } finally {retryIntent.close();}
     });
   });
 
@@ -1155,25 +1183,29 @@
   byId("onprem-restart").addEventListener("click", () => {
     if (byId("onprem-restart").disabled || !byId("onprem-form").reportValidity()) return;
     action(async () => {
-      const id = selected.id;
-      const snapshot = generation;
-      if (selected.config.strategy !== "staged") throw failure("onprem_staged_required");
-      const config = {...selected.config, strategy: "staged", identity_confirmed: true};
-      const fingerprint = JSON.stringify(config);
-      let pending = pendingRestarts.get(id);
-      if (!pending || pending.fingerprint !== fingerprint) {
-        pending = {fingerprint, key: uuid()};
-        pendingRestarts.set(id, pending);
-      }
-      const job = await request(`/jobs/${encodeURIComponent(id)}/restart`, {method: "POST", body: {
-        config, credentials: credentials(), idempotency_key: pending.key,
-      }});
-      if (!selected || selected.id !== id || snapshot !== generation) return;
-      if (!job || job.id === id || job.restart_of !== id) throw failure("invalid_response");
-      pendingRestarts.delete(id);
-      selectJob(job);
-      await refreshAll(0);
-      notice("Создан новый перенос в папку email в корне общего диска, с публикацией источника. Дождитесь плана, проверьте его и нажмите «Начать перенос».");
+      const retryIntent = window.diskCopyRetries.track("onprem");
+      try {
+        const id = selected.id;
+        const snapshot = generation;
+        if (selected.config.strategy !== "staged") throw failure("onprem_staged_required");
+        const config = {...selected.config, strategy: "staged", identity_confirmed: true, retry_enabled: window.diskCopyRetries.value("onprem")};
+        const fingerprint = JSON.stringify({...config, retry_enabled: undefined});
+        let pending = pendingRestarts.get(id);
+        if (!pending || pending.fingerprint !== fingerprint) {
+          pending = {fingerprint, key: uuid()};
+          pendingRestarts.set(id, pending);
+        }
+        const job = await request(`/jobs/${encodeURIComponent(id)}/restart`, {method: "POST", body: {
+          config, credentials: credentials(), idempotency_key: pending.key,
+        }});
+        if (!selected || selected.id !== id || snapshot !== generation) return;
+        if (!job || job.id === id || job.restart_of !== id) throw failure("invalid_response");
+        await synchronizeRetries(job, retryIntent);
+        pendingRestarts.delete(id);
+        selectJob(job);
+        await refreshAll(0);
+        notice("Создан новый перенос в папку email в корне общего диска, с публикацией источника. Дождитесь плана, проверьте его и нажмите «Начать перенос».");
+      } finally {retryIntent.close();}
     });
   });
   byId("onprem-resume").addEventListener("click", () => {
@@ -1226,6 +1258,7 @@
 
 
   panel.querySelectorAll("input, select, textarea").forEach((field) => {
+    if (field.id === "retry-onprem") return;
     const changed = () => {
       if (fields.includes(field) || ["onprem-source-secret", "onprem-source-admin-token", "onprem-destination-token", "onprem-identity-confirmed"].includes(field.id)) {
         clearDestinationCheck();
@@ -1236,6 +1269,7 @@
     field.addEventListener("input", changed);
     field.addEventListener("change", changed);
   });
+  byId("onprem-source-input")?.addEventListener("change", updateActions);
   updateDestinationPreview();
 
   function modeChanged() {

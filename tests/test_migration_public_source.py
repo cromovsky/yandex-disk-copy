@@ -54,7 +54,9 @@ def test_new_folder_publication_is_confirmed_after_checkpoint(monkeypatch):
         seen.append([call[0] for call in session.calls])
 
     assert client.ensure_publication(FOLDER, checkpoint=checkpoint) == "published"
-    assert seen == [["POST", "GET"]]
+    # Check cancellation immediately before publication and after its response,
+    # then confirm the published metadata with the final GET.
+    assert seen == [["POST", "GET"], ["POST", "GET", "PUT"]]
     assert [call[0] for call in session.calls] == ["POST", "GET", "PUT", "GET"]
     assert session.calls[2][1] == API + "/resources/publish"
     assert session.calls[2][2]["params"] == {"path": "disk:/Проекты"}

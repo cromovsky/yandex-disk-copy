@@ -8,7 +8,7 @@ const {loadUi} = require("./helpers/legacy_ui.cjs");
 const code = fs.readFileSync(path.resolve(__dirname, "../app/static/source-batches.js"), "utf8");
 const flush = async () => { for (let count = 0; count < 5; count += 1) await new Promise((resolve) => setImmediate(resolve)); };
 const clone = (value) => JSON.parse(JSON.stringify(value));
-async function setup({mode = "local", enabled = true, state = "ready", complete = true, credentials = true, sourceError = null, started = false, selectionError = null, failFirstPlan = false, strategy = "staged", childStrategy = null, createdBatchId = "list-id", failCreates = false} = {}) {
+async function setup({mode = "local", enabled = true, state = "ready", complete = true, credentials = true, sourceError = null, started = false, selectionError = null, failFirstPlan = false, strategy = "staged", childStrategy = null, createdBatchId = "list-id", failCreates = false, retryEnabled = true, retryError = null, createdRetryEnabled = null, createGate = null} = {}) {
   const ui = await loadUi({cross_org: true, onprem_enabled: enabled});
   const values = {local_client_id: "client", local_orgid: "org", local_client_secret: "secret-value", local_admin_token: "admin-token-value", local_page_limit: "1000",
     "onprem-source-org": "org", "onprem-source-client": "client", "onprem-source-secret": "secret-value", "onprem-source-admin-token": "admin-token-value",
@@ -16,7 +16,7 @@ async function setup({mode = "local", enabled = true, state = "ready", complete 
     "onprem-destination-token": "destination-token-value", "onprem-destination-vd-hash": "target", "onprem-strategy": "staged"};
   for (const [id, value] of Object.entries(values)) ui.byId.get(id).value = value;
   ui.byId.get("onprem-identity-confirmed").checked = true;
-  const config = {source_org_id: "org", source_client_id: "client", page_limit: 1000,
+  const config = {source_org_id: "org", source_client_id: "client", page_limit: 1000, retry_enabled: retryEnabled,
     ...(mode === "onprem" ? {destination_url: "https://disk.example.test/v1/disk", destination_identity: "operator@example.test", destination_vd_hash: "target", identity_confirmed: true, strategy} : {})};
   const detail = {batch: {id: "list-id", mode, state, phase: "inventory", created_at: "2026-10-14T10:00:00Z", config,
     credentials_available: credentials, started, summary: {selected_sources: 2, ready_sources: 2, failed_sources: 0, total_files: 2, total_bytes: 2048, required_bytes: 1024, verified_bytes: 1024}},
@@ -26,17 +26,19 @@ async function setup({mode = "local", enabled = true, state = "ready", complete 
   if (childStrategy) Object.assign(detail.sources[0], {child_job_id: "a".repeat(32), child_strategy: childStrategy});
   const requests = [], events = [], timers = [];
   const listeners = {};
-  const window = {diskCopyConfigPromise: Promise.resolve({onprem_enabled: enabled, onprem_auth_required: false}),
+  const window = {diskCopyRetries: ui.window.diskCopyRetries, diskCopyConfigPromise: Promise.resolve({onprem_enabled: enabled, onprem_auth_required: false}),
     addEventListener(name, fn) {(listeners[name] ||= []).push(fn);},
     dispatchEvent(event) {events.push(event); (listeners[event.type] || []).forEach((fn) => fn(event));}};
   const fetch = async (address, options = {}) => {
     const url = new URL(address, "http://localhost");
     const method = options.method || "GET", body = options.body ? JSON.parse(options.body) : null;
     requests.push({url, method, body, options});
+    if (createGate && method === "POST" && url.pathname === "/api/source-batches") await createGate;
     if (failCreates && method === "POST" && url.pathname === "/api/source-batches") throw new Error("simulated create response interruption");
     if (method === "POST" && url.pathname === "/api/source-batches") {
       detail.batch.id = createdBatchId; detail.batch.state = "draft"; detail.batch.credentials_available = true;
       detail.batch.config = clone(body.config); detail.batch.started = false;
+      if (createdRetryEnabled !== null) detail.batch.config.retry_enabled = createdRetryEnabled;
       detail.sources.forEach((source) => {delete source.child_job_id; delete source.child_strategy;});
     }
     if (url.pathname.endsWith("/plan")) {
@@ -55,6 +57,11 @@ async function setup({mode = "local", enabled = true, state = "ready", complete 
       if (selectionError) return {ok: false, status: 409, json: async () => ({detail: selectionError})};
       detail.sources.forEach((source) => {source.selected = body.source_ids.includes(source.id);});
       detail.batch.state = detail.sources.filter((source) => source.selected).every((source) => source.state === "ready") ? "ready" : "draft";
+    }
+    if (url.pathname.endsWith("/retries")) {
+      if (retryError) return {ok: false, status: 403, json: async () => ({detail: retryError, private_detail: "secret-value"})};
+      detail.batch.config.retry_enabled = body.enabled;
+      return {ok: true, status: 200, json: async () => ({retry_enabled: body.enabled})};
     }
     let response = detail;
     if (url.pathname.endsWith("/entries")) response = {total: 1, entries: [{source_path: "disk:/<unsafe>.txt", destination_path: "/<unsafe>.txt", size: 1024, state: "planned"}]};
@@ -510,4 +517,74 @@ test("historical URL lists can create an independent staged Dry Run from active 
       assert.equal(node("pause").disabled, false, "the new staged Dry Run uses the regular lifecycle");
     }
   }
+});
+
+for (const mode of ["local", "onprem"]) {
+  for (const state of ["ready", "running", "paused"]) test(`${mode} list ${state}: retry policy changes without credentials or invalidating Dry Run`, async () => {
+    const {ui, node, requests, detail} = await setup({mode, state, retryEnabled: false});
+    const checkbox = ui.byId.get("retry-" + mode);
+    assert.equal(checkbox.checked, false);
+    assert.equal(checkbox.disabled, false);
+    const before = requests.length;
+    checkbox.checked = true; await checkbox.fire("change");
+    const writes = requests.slice(before).filter((request) => request.method !== "GET");
+    assert.deepEqual(writes.map((request) => request.url.pathname), ["/api/source-batches/list-id/retries"]);
+    assert.deepEqual(writes[0].body, {enabled: true});
+    assert.equal(detail.batch.config.retry_enabled, true);
+    if (state === "ready") assert.equal(node("start").disabled, false, "a policy change keeps the saved plan ready");
+  });
+  test(`${mode} list: changing retry policy after uncertain creation keeps identity and applies latest setting`, async () => {
+    const {ui, node, requests} = await setup({mode, state: "stopped", createdRetryEnabled: true});
+    const checkbox = ui.byId.get("retry-" + mode);
+    checkbox.checked = false; await checkbox.fire("change");
+    await node("plan").fire("click");
+    const writes = requests.filter((request) => request.method !== "GET");
+    assert.equal(writes[0].body.config.retry_enabled, false);
+    assert.deepEqual(writes.map((request) => request.url.pathname), ["/api/source-batches", "/api/source-batches/list-id/retries", "/api/source-batches/list-id/plan"]);
+    assert.equal(checkbox.checked, false);
+  });
+  test(`${mode} list: retry policy cannot modify historical URL jobs or completed lists`, async () => {
+    const {ui, requests} = await setup({mode, state: "completed", strategy: mode === "onprem" ? "url" : "staged"});
+    const checkbox = ui.byId.get("retry-" + mode);
+    checkbox.checked = false; await checkbox.fire("change");
+    assert.equal(requests.filter((request) => request.method !== "GET").length, 0);
+  });
+  test(`${mode} list: rejected retry policy restores the old value and leaves plan actions available`, async () => {
+    const {ui, node} = await setup({mode, retryError: "onprem_access_required"});
+    const checkbox = ui.byId.get("retry-" + mode);
+    checkbox.checked = false; await checkbox.fire("change");
+    assert.equal(checkbox.checked, true);
+    assert.equal(checkbox.disabled, false);
+    assert.equal(node("start").disabled, false);
+    assert.doesNotMatch(ui.byId.get("retry-" + mode + "-notice").textContent, /secret-value/);
+  });
+}
+
+for (const mode of ["local", "onprem"]) test(`${mode} list: retry selection preserves an uncertain create idempotency key`, async () => {
+  const {ui, node, requests} = await setup({mode, state: "stopped", failCreates: true});
+  await node("plan").fire("click");
+  const check = ui.byId.get("retry-" + mode); check.checked = false; await check.fire("change");
+  await node("plan").fire("click");
+  const creates = requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/source-batches");
+  assert.equal(creates.length, 2);
+  assert.equal(creates[0].body.idempotency_key, creates[1].body.idempotency_key);
+  assert.equal(creates[1].body.config.retry_enabled, false);
+});
+
+for (const mode of ["local", "onprem"]) for (const switchContext of [false, true]) test(`${mode} pending CSV creation: ${switchContext ? "standalone preference stays separate" : "latest list preference reaches accepted list"}`, async () => {
+  let release;
+  const createGate = new Promise((resolve) => {release = resolve;});
+  const {ui, node, requests, detail} = await setup({mode, state: "stopped", retryEnabled: true, createdBatchId: "new-list", createGate});
+  const pending = node("plan").fire("click"); await flush();
+  if (switchContext) {
+    ui.byId.get(mode + "-source-input").value = "single"; await ui.byId.get(mode + "-source-input").fire("change");
+    // This harness loads source-batches; the standalone Onprem module owns its own context in the page.
+    if (mode === "onprem") ui.window.diskCopyRetries.bind(mode, {id: "onprem:standalone", enabled: true, editable: false});
+  }
+  const check = ui.byId.get("retry-" + mode); check.checked = false; await check.fire("change");
+  release(); await pending;
+  const changes = requests.filter((request) => request.url.pathname === "/api/source-batches/new-list/retries");
+  assert.equal(changes.length, switchContext ? 0 : 1);
+  assert.equal(detail.batch.config.retry_enabled, switchContext);
+  assert.equal(check.checked, false);
 });

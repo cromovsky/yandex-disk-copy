@@ -42,7 +42,7 @@ function assertLocalRequest(ui, type = "personal") {
   assert.equal(request.url, "/api/save-local");
   assert.deepEqual(Object.keys(request.body).sort(), [
     "admin_token", "client_id", "client_secret", "orgid", "page_limit", "path",
-    "source_disk_id", "source_type", "source_vd_hash",
+    "source_disk_id", "source_type", "source_vd_hash", "retry_enabled",
   ].sort());
   assert.equal(request.body.client_id, "local-client");
   assert.equal(request.body.client_secret, "local-secret");
@@ -100,7 +100,7 @@ test("local saving has its own main tab with source-only fields", async () => {
   assert.deepEqual(panel.querySelectorAll("input").map((field) => field.id || field.attributes.name).sort(), [
     "local_client_id", "local_client_secret", "local_orgid", "local_admin_token",
     "local_source_disk_id", "local_source_type", "local_source_type",
-    "local_source_vd_hash", "local_path", "local_page_limit", "local-batch-file",
+    "local_source_vd_hash", "local_path", "local_page_limit", "local-batch-file", "retry-local",
   ].sort());
   for (const id of ["run-local-cross", "source_vd_hash", "x_source_vd_hash", "source_shared_fields", "x_source_shared_fields"]) {
     assert.equal(ui.document.getElementById(id), null, `legacy field ${id} must be removed`);
@@ -310,3 +310,15 @@ for (const cross of [false, true]) {
     assertSharedLogLock(ui, false);
   });
 }
+
+for (const mode of ["single", "cross", "local"]) test(`${mode}: new transfers send disabled retries as boolean without adding it to required fields`, async () => {
+  const ui = await loadUi();
+  const checkbox = ui.byId.get("retry-" + mode);
+  assert.equal(checkbox.checked, true);
+  checkbox.checked = false; await checkbox.fire("change");
+  if (mode === "local") fillLocal(ui);
+  else {fillTransfer(ui, mode === "cross"); ui.byId.get(mode === "cross" ? "x_destination_disk_id" : "destination_disk_id").value = "destination@example.test";}
+  if (mode === "cross") {ui.byId.get("x_dst_client_id").value = "destination-client"; ui.byId.get("x_dst_client_secret").value = "destination-secret";}
+  await ui.byId.get(mode === "single" ? "run" : "run-" + mode).fire("click");
+  assert.equal(ui.requests[0].body.retry_enabled, false);
+});

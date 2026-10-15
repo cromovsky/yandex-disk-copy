@@ -112,7 +112,7 @@ def diagnostic_fields(value):
             continue
         valid = False
         if key == "error_side":
-            valid = item in {"saas", "onprem"}
+            valid = item in {"saas", "onprem", "local"}
         elif key == "api_error":
             valid = item in API_MESSAGES or (
                 bool(_API_CODE.fullmatch(item)) and not _SECRET_CODE.search(item)
@@ -311,5 +311,5 @@ def describe_diagnostics(payload):
     if details.get("request_id"):
         text.append(f"ID запроса: {details['request_id']}.")
     if text and side:
-        text.insert(0, {"saas": "SaaS.", "onprem": "On-premises."}[side])
+        text.insert(0, {"saas": "SaaS.", "onprem": "On-premises.", "local": "Локальный кеш."}[side])
     return " ".join(text)

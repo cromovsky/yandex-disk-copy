@@ -16,6 +16,7 @@ from app.throttle import (
     get_limiter, retry_after_seconds,
 )
 from .errors import MigrationError, disk_path, https_url
+from app.retry_policy import RetryPolicy
 from .diagnostics import response_details, transport_details
 
 
@@ -43,6 +44,10 @@ def shared_source_folder(name, vd_hash):
     return safe + suffix
 
 
+class _RetryCancelled(Exception):
+    pass
+
+
 class SaasDiskSource:
     def __init__(self, config, credentials):
         self.config = config
@@ -57,67 +62,107 @@ class SaasDiskSource:
         self._publications = {}
         self._unknown_publications = set()
         self.checkpoint = None
+        self.retry_policy = (RetryPolicy(config["retry_enabled"])
+                             if "retry_enabled" in config else None)
 
     def close(self):
         self.session.close()
 
+    def _retries_enabled(self, generation=None):
+        policy = self.retry_policy
+        return policy is None or (policy.enabled and (
+            generation is None or generation == policy.cancellation_generation
+        ))
+
+    def _retry_wait(self, delay, checkpoint, generation):
+        if self.retry_policy is not None:
+            return self.retry_policy.wait(delay, checkpoint=checkpoint, generation=generation)
+        if self.checkpoint is not None:
+            self.limiter.pause(delay, checkpoint=checkpoint)
+        else:
+            self.limiter.pause(delay)
+        return True
+
     def _request(self, method, url, *, max_attempts=MAX_ATTEMPTS,
                  checkpoint=None, **kwargs):
         checkpoint = checkpoint or self.checkpoint
-        cancel_waits = self.checkpoint is not None
+        generation = (self.retry_policy.cancellation_generation
+                      if self.retry_policy is not None else None)
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
         kwargs.setdefault("allow_redirects", False)
+        previous_response, previous_error = None, None
         for attempt in range(1, max_attempts + 1):
-            if cancel_waits:
-                self.limiter.acquire(method, checkpoint=checkpoint)
-            else:
-                self.limiter.acquire(method)
-            if checkpoint is not None:
-                checkpoint()
+            def request_checkpoint():
+                if checkpoint is not None:
+                    checkpoint()
+                if attempt > 1 and not self._retries_enabled(generation):
+                    raise _RetryCancelled()
+            try:
+                if self.checkpoint is not None or (attempt > 1 and self.retry_policy is not None):
+                    self.limiter.acquire(method, checkpoint=request_checkpoint)
+                else:
+                    self.limiter.acquire(method)
+                request_checkpoint()
+            except _RetryCancelled:
+                if previous_response is not None:
+                    return previous_response
+                raise previous_error from None
+            except BaseException:
+                if previous_response is not None:
+                    previous_response.close()
+                raise
+            if previous_response is not None:
+                previous_response.close()
+                previous_response = None
             try:
                 response = self.session.request(method, url, **kwargs)
             except requests.RequestException as exc:
-                if cancel_waits:
+                if checkpoint is not None:
                     checkpoint()
-                if method == "GET" and attempt < max_attempts:
-                    delay = random.uniform(0, backoff_delay(attempt))
-                    if cancel_waits:
-                        self.limiter.pause(delay, checkpoint=checkpoint)
-                    else:
-                        self.limiter.pause(delay)
-                    continue
                 code = ("source_timeout" if isinstance(exc, requests.Timeout) else
                         "source_connection_failed" if isinstance(
                             exc, requests.ConnectionError,
                         ) else "source_unavailable")
-                raise MigrationError(
+                previous_error = MigrationError(
                     code, diagnostics=transport_details(exc, "saas", url=url),
-                ) from None
+                )
+                if method == "GET" and attempt < max_attempts and self._retries_enabled(generation):
+                    delay = random.uniform(0, backoff_delay(attempt))
+                    if self._retry_wait(delay, checkpoint, generation):
+                        continue
+                raise previous_error from None
+            cooldown = None
             if response.status_code == 429:
                 delay = retry_after_seconds(response.headers.get("Retry-After"))
                 if delay is None or not math.isfinite(delay):
                     delay = random.uniform(0, backoff_delay(attempt))
-                self.limiter.penalize(delay)
-            if cancel_waits:
-                try:
+                cooldown = self.limiter.penalize(delay)
+            try:
+                if checkpoint is not None:
                     checkpoint()
-                except Exception:
-                    response.close()
-                    raise
-            if response.status_code not in RETRY_STATUSES:
+            except BaseException:
+                response.close()
+                raise
+            if (response.status_code not in RETRY_STATUSES or method != "GET"
+                    or attempt == max_attempts or not self._retries_enabled(generation)):
                 return response
             delay = retry_after_seconds(response.headers.get("Retry-After"))
             if delay is None or not math.isfinite(delay):
                 delay = random.uniform(0, backoff_delay(attempt))
-            # Every method shares the 429 barrier; uncertain mutations are not replayed.
-            if method != "GET" or attempt == max_attempts:
-                return response
-            response.close()
-            if response.status_code != 429:
-                if cancel_waits:
-                    self.limiter.pause(delay, checkpoint=checkpoint)
-                else:
-                    self.limiter.pause(delay)
+            if response.status_code == 429:
+                # Keep the shared barrier even when this particular retry is cancelled.
+                # Wait on the job switch too, so disabling never submits a queued replay.
+                if self.retry_policy is None:
+                    previous_response = response
+                    continue
+                delay = cooldown if cooldown is not None else delay
+            try:
+                if not self._retry_wait(delay, checkpoint, generation):
+                    return response
+            except BaseException:
+                response.close()
+                raise
+            previous_response = response
 
     def _payload(self, response, *, url=None):
         status = response.status_code

@@ -1239,3 +1239,90 @@ def test_shared_local_rejects_hash_as_email_without_api_requests(tmp_path):
         copier.run()
 
     assert session.calls == []
+
+
+@pytest.mark.parametrize("source_type", ["personal", "shared"])
+def test_disabled_retry_skips_failed_local_file_and_continues(tmp_path, source_type):
+    session = _local_session(embedded([
+        {"path": "disk:/a.txt", "type": "file", "size": 5},
+        {"path": "disk:/b.txt", "type": "file", "size": 5},
+    ]))
+    link_route = VD_DOWNLOAD_URL if source_type == "shared" else DOWNLOAD_HREF_URL
+    session.routes[("GET", link_route)] = [
+        FakeResponse(200, payload={"href": "https://downloader/a"}),
+        FakeResponse(200, payload={"href": "https://downloader/b"}),
+    ]
+    session.routes[("GET", "https://downloader/a")] = FakeResponse(503)
+    session.routes[("GET", "https://downloader/b")] = FakeResponse(200, text="hello")
+    if source_type == "shared":
+        session.routes[("GET", VD_RESOURCES_URL)] = session.routes[("GET", RESOURCES_URL)]
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    copier.cfg.source_type = source_type
+    copier.cfg.source_vd_hash = "shared-hash"
+    copier.cfg.local_root = str(tmp_path)
+    copier.retry_policy.set_enabled(False)
+    logs = []
+    copier._log = logs.append
+    copier.save_local()
+    assert len(session.calls_to("https://downloader/a")) == 1
+    assert len(copier.fails) == len(copier.links) == 1
+    assert clock.sleeps == []
+    assert "повторы отключены" in "\n".join(logs).lower()
+    folder = tmp_path / ("shared/shared-hash" if source_type == "shared" else "src@company.ru")
+    assert (folder / "b.txt").read_bytes() == b"hello"
+
+
+@pytest.mark.parametrize("destination", ["personal", "shared"])
+def test_file_network_failure_is_logged_and_next_file_is_transferred(destination):
+    class DisconnectFirst(FakeSession):
+        def post(self, url, **kwargs):
+            if not getattr(self, "failed_once", False):
+                self.failed_once = True
+                raise requests.ConnectionError("connection interrupted")
+            return super().post(url, **kwargs)
+    files = [file_item("a.txt"), file_item("b.txt")]
+    if destination == "personal":
+        session = DisconnectFirst({("PUT", RESOURCES_URL): FakeResponse(201),
+                                   ("POST", SAVE_TO_DISK_URL): FakeResponse(201)})
+    else:
+        routes = _shared_routes(files)
+        routes[("GET", RESOURCES_URL)] = [
+            FakeResponse(200, payload=embedded(files)),
+            FakeResponse(200, payload={"public_key": "pk", "type": "file"}),
+        ]
+        session = DisconnectFirst(routes)
+    copier = make_copier(session, dest_type=destination, vd_hash="shared")
+    copier.retry_policy.set_enabled(False)
+    if destination == "personal":
+        copier.links = [dict(item, public_key="pk") for item in files]
+        copier.save_links()
+    else:
+        copier.save_to_shared()
+    assert [item["name"] for item in copier.links] == ["b.txt"]
+    assert [item["name"] for item in copier.fails] == ["a.txt"]
+
+
+def test_disabled_retries_still_refresh_rejected_owner_token_once():
+    session = FakeSession({
+        ("GET", RESOURCES_URL): [FakeResponse(401), FakeResponse(200, payload={"path": "disk:/a"})],
+        ("POST", TOKEN_URL): FakeResponse(200, payload={"access_token": "renewed", "expires_in": 3600}),
+    })
+    copier = make_copier(session)
+    copier.retry_policy.set_enabled(False)
+    assert copier._disk_resource("t.uid-42.sig", "disk:/a") == {"path": "disk:/a"}
+    assert session.auth_tokens_for(RESOURCES_URL) == ["OAuth t.uid-42.sig", "OAuth renewed"]
+    assert len(session.calls_to(TOKEN_URL)) == 1
+
+
+def test_disabled_retries_still_wait_for_an_accepted_operation():
+    session = FakeSession({("GET", OPERATION_URL): [
+        FakeResponse(200, payload={"status": "in-progress"}),
+        FakeResponse(200, payload={"status": "success"}),
+    ]})
+    clock = FakeClock()
+    copier = make_copier(session, clock=clock)
+    copier.retry_policy.set_enabled(False)
+    copier._wait_operation(OPERATION_URL, "token")
+    assert len(session.calls_to(OPERATION_URL)) == 2
+    assert clock.sleeps == [POLL_FIRST_DELAY]

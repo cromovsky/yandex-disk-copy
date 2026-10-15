@@ -17,10 +17,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.migration.errors import MigrationError
-from app.migration.runner import SaasDiskSource, disk_path, join_path
+from app.migration.runner import SaasDiskSource, disk_path, join_path, file_access_denied
 from app.migration.source import shared_source_folder
 from app.run_journal import CSV_FIELDS, JournalError, Redactor
 from .store import BatchStore, parse_sources
+from app.retry_policy import RetryPolicy
 
 TERMINAL = {"completed", "completed_with_issues", "stopped"}
 OUTAGES = {"destination_unavailable", "destination_timeout", "destination_connection_failed",
@@ -28,6 +29,10 @@ OUTAGES = {"destination_unavailable", "destination_timeout", "destination_connec
 
 
 class Interrupted(Exception):
+    pass
+
+
+class _AutomaticRetryDisabled(Exception):
     pass
 
 
@@ -50,6 +55,8 @@ class BatchService:
         self.source_factory = source_factory
         self.guard = threading.RLock()
         self._credentials = {}
+        self._retry_policies = {}
+        self._retry_lock = threading.RLock()
         self._redactors = {}
         self._active = {}
         self._planning_checks = set()
@@ -67,6 +74,47 @@ class BatchService:
         if start_worker:
             self.start()
 
+    def retry_policy(self, batch_id):
+        with self._retry_lock:
+            policy = self._retry_policies.get(batch_id)
+            if policy is None:
+                policy = RetryPolicy(self.store.get(batch_id)["config"].get("retry_enabled", True))
+                self._retry_policies[batch_id] = policy
+            return policy
+
+    def _bind_child_policy(self, batch_id, child_id):
+        with self._retry_lock:
+            policy = self.retry_policy(batch_id)
+            self.onprem.runner.bind_retry_policy(child_id, policy)
+            self.onprem.store.set_retry_enabled(child_id, policy.enabled)
+
+    def set_retry_enabled(self, batch_id, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("invalid_retry_policy")
+        batch = self.store.get(batch_id)
+        self._require_staged(batch, check_children=True)
+        policy = self.retry_policy(batch_id)
+        # No coordinator/job guard: an in-flight HTTP call must not hold this switch.
+        with self._retry_lock:
+            self.store.set_retry_enabled(batch_id, enabled)
+            policy.set_enabled(enabled)
+            for source in self.store.sources(batch_id):
+                if source["child_job_id"]:
+                    self._bind_child_policy(batch_id, source["child_job_id"])
+                self._event(batch, source, "retry_settings", "succeeded",
+                            retry_enabled=enabled, max_attempts=5 if enabled else 1)
+        self.notify()
+        if self.onprem:
+            self.onprem.notify()
+        return {"retry_enabled": enabled}
+
+    def set_child_retry_enabled(self, child_id, enabled):
+        batch = self.store.batch_for_child(child_id)
+        if batch is None:
+            return False
+        self.set_retry_enabled(batch["id"], enabled)
+        return True
+
     def start(self):
         if self.thread is None:
             self.thread = threading.Thread(target=self._run, name="disk-source-lists", daemon=False)
@@ -83,6 +131,11 @@ class BatchService:
         with self.guard:
             batch = self.store.create(mode, config, sources, idempotency_key)
             self.attach_credentials(batch["id"], credentials)
+            if not self.store.last_sequence(batch["id"]):
+                for source in self.store.sources(batch["id"]):
+                    self._event(batch, source, "retry_settings", "succeeded",
+                                retry_enabled=self.retry_policy(batch["id"]).enabled,
+                                max_attempts=5 if self.retry_policy(batch["id"]).enabled else 1)
             return self.detail(batch["id"])
 
     @staticmethod
@@ -138,7 +191,8 @@ class BatchService:
     def _config(self, batch, source):
         value = {"source_org_id": batch["config"]["source_org_id"],
                  "source_client_id": batch["config"]["source_client_id"],
-                 "source_email": source["email"], "source_path": source["path"]}
+                 "source_email": source["email"], "source_path": source["path"],
+                 "retry_enabled": self.retry_policy(batch["id"]).enabled}
         if source["type"] == "shared":
             value.update(source_type="shared", source_vd_hash=source["vd_hash"], source_folder=source["folder"] or "")
         return value
@@ -297,7 +351,11 @@ class BatchService:
         journal_id = uuid.uuid4().hex
         self.journal.create(journal_id, "local", "batch", source["email"] +
                             (" / " + source["vd_hash"] if source["vd_hash"] else ""), source["folder"] or "")
-        return self.store.update_source(source["id"], journal_id=journal_id)
+        source = self.store.update_source(source["id"], journal_id=journal_id)
+        policy = self.retry_policy(batch["id"])
+        self._event(batch, source, "retry_settings", "succeeded",
+                    retry_enabled=policy.enabled, max_attempts=5 if policy.enabled else 1)
+        return source
 
     def _finish_local_journal(self, source, status, error=None):
         if (self.journal and source.get("journal_id")
@@ -318,6 +376,7 @@ class BatchService:
                     if batch["mode"] == "local":
                         source = self._new_local_journal(batch, source)
                 source_client = self.source_factory(self._config(batch, source), self._credentials_for(batch["id"]))
+                source_client.retry_policy = self.retry_policy(batch["id"])
                 source_client.checkpoint = checkpoint
                 source_client.page_limit = batch["config"]["page_limit"]
                 checkpoint()
@@ -342,6 +401,7 @@ class BatchService:
                         child = self.onprem.store.create(config, "batch-" + source_id + "-" + uuid.uuid4().hex, initial_state="planning")
                         self.onprem.excluded_job_ids.add(child["id"])
                         source = self.store.update_source(source_id, child_job_id=child["id"])
+                    self._bind_child_policy(batch["id"], child["id"])
                     with self.onprem.job_guard(child["id"]):
                         self.onprem.registry.put(child["id"], child["config"], self._credentials_for(batch["id"]))
                         _, destination = self.onprem.runner.clients(child)
@@ -472,6 +532,7 @@ class BatchService:
             first = selected[0]
             client = self.onprem.runner.destination_factory(self._child_config(batch, first), credentials)
             client.checkpoint = checkpoint
+            client.retry_policy = self.retry_policy(batch["id"])
             try:
                 info = client.info()
                 if checkpoint:
@@ -662,6 +723,7 @@ class BatchService:
         source = next(s for s in self.store.sources(batch["id"]) if s["selected"])
         config = self._child_config(batch, source)
         client = self.onprem.runner.destination_factory(config, self._credentials_for(batch["id"]))
+        client.retry_policy = self.retry_policy(batch["id"])
         try:
             info = client.check_available()
             self.onprem.runner._identity(config, info)
@@ -722,6 +784,8 @@ class BatchService:
                 else:
                     client = self.source_factory(self._config(batch, source), self._credentials_for(batch["id"]))
                     client.page_limit = batch["config"]["page_limit"]
+                    client.retry_policy = self.retry_policy(batch["id"])
+                    client.checkpoint = lambda: self._checkpoint(batch["id"])
                     self._transfer_local(batch, source, client)
         except Interrupted:
             current = self.store.get(batch["id"])
@@ -747,6 +811,7 @@ class BatchService:
 
     def _transfer_child(self, batch, source):
         child_id = source["child_job_id"]
+        self._bind_child_policy(batch["id"], child_id)
         while True:
             self._checkpoint(batch["id"])
             with self.onprem.job_guard(child_id):
@@ -758,7 +823,7 @@ class BatchService:
                 entries = self.onprem.store.entries(child_id, limit=1000000, state="failed")
                 outage = next((e["error"] for e in entries if e.get("error") in OUTAGES
                                and (e["id"], e["updated_at"]) not in old_failures), None)
-                if outage:
+                if outage and self.retry_policy(batch["id"]).enabled:
                     self._pause_destination(batch, outage)
                     self.store.update_source(source["id"], state="paused", error=outage)
                     return
@@ -775,7 +840,8 @@ class BatchService:
 
     def _pause_destination(self, batch, code):
         for other in self.store.batches(mode="onprem", limit=1000000)["batches"]:
-            if (other["state"] == "running" and all(other["config"][key] == batch["config"][key]
+            if (other["state"] == "running" and self.retry_policy(other["id"]).enabled
+                    and all(other["config"][key] == batch["config"][key]
                     for key in ("destination_url", "destination_vd_hash"))):
                 self.store.update(other["id"], state="paused", resume_state="running", error=code)
                 for source in self.store.sources(other["id"]):
@@ -796,9 +862,9 @@ class BatchService:
         while entry := self.store.next_entry(source["id"]):
             checkpoint()
             relative = entry["destination_path"][len(source["folder"]) + 1:]
-            target = self._local_path(source["folder"], relative)
             stage = "check_source"
             try:
+                target = self._local_path(source["folder"], relative)
                 self._event(batch, source, "check_source", "started", source=entry["source_path"])
                 self._current_local(entry, client)
                 self._event(batch, source, "check_source", "succeeded", source=entry["source_path"])
@@ -827,9 +893,19 @@ class BatchService:
                 raise
             except Exception as exc:
                 code = getattr(exc, "_source_batch_logged", None) or self._exception(batch, source, stage, exc, source=entry["source_path"], destination=entry["destination_path"])
-                self.store.update_entry(entry["id"], state="planned" if isinstance(exc, MigrationError) and exc.auth else "failed", error=code)
-                if isinstance(exc, MigrationError) and exc.auth:
+                global_auth = isinstance(exc, MigrationError) and exc.auth and not (
+                    not self.retry_policy(batch["id"]).enabled and file_access_denied(exc, stage)
+                )
+                self.store.update_entry(entry["id"], state="planned" if global_auth else "failed", error=code)
+                if global_auth:
                     raise
+                if not self.retry_policy(batch["id"]).enabled:
+                    details = dict(exc.diagnostics) if isinstance(exc, MigrationError) else {}
+                    details["error_side"] = "source" if code.startswith("source_") else "local"
+                    self._event(batch, source, stage, "skipped", source=entry["source_path"],
+                                destination=entry["destination_path"], error=code,
+                                http_status=getattr(exc, "http_status", None), retry_enabled=False,
+                                **details)
             self.store.update_source(source["id"], summary=self.store.summary(source["id"]))
         summary = self.store.summary(source["id"])
         state = "completed_with_issues" if summary["issues"] else "completed"
@@ -840,6 +916,7 @@ class BatchService:
 
     def _download_local(self, batch, source, entry, client, target, checkpoint):
         target.parent.mkdir(parents=True, exist_ok=True)
+        policy = self.retry_policy(batch["id"])
         for attempt in range(1, 6):
             checkpoint()
             temporary = None
@@ -851,7 +928,7 @@ class BatchService:
                 self._local_reserved[entry["id"]] = entry["size"]
             try:
                 self._current_local(entry, client)
-                self._event(batch, source, "downloading", "started", source=entry["source_path"], attempt=attempt, max_attempts=5)
+                self._event(batch, source, "downloading", "started", source=entry["source_path"], attempt=attempt, max_attempts=5 if policy.enabled else 1)
                 fd, filename = tempfile.mkstemp(prefix=".disk-copy-", suffix=".part", dir=target.parent)
                 temporary = Path(filename)
                 digest = hashlib.md5()
@@ -886,15 +963,29 @@ class BatchService:
             except Interrupted:
                 raise
             except Exception as exc:
-                code = self._exception(batch, source, "downloading", exc, source=entry["source_path"], attempt=attempt, max_attempts=5)
+                code = self._exception(batch, source, "downloading", exc, source=entry["source_path"], attempt=attempt, max_attempts=5 if policy.enabled else 1)
                 exc._source_batch_logged = code
                 retryable = isinstance(exc, MigrationError) and not exc.auth and code.startswith("source_") and code != "source_changed"
-                if attempt == 5 or not retryable:
+                if attempt == 5 or not retryable or not policy.enabled:
                     self._event(batch, source, "downloading", "skipped", source=entry["source_path"], error=code, attempt=attempt)
                     raise
                 delay = max((2, 5, 10, 20)[attempt - 1], min(120, exc.retry_after or 0))
-                self._event(batch, source, "download_retry", "waiting", source=entry["source_path"], error=code, attempt=attempt, max_attempts=5, retry_delay_ms=int(delay * 1000))
-                self._delay(delay, checkpoint)
+                generation = policy.cancellation_generation
+                self._event(batch, source, "download_retry", "waiting", source=entry["source_path"], error=code, attempt=attempt, max_attempts=5 if policy.enabled else 1, retry_delay_ms=int(delay * 1000))
+                def retry_checkpoint():
+                    checkpoint()
+                    if not policy.enabled or policy.cancellation_generation != generation:
+                        raise _AutomaticRetryDisabled()
+                retry_checkpoint.retry_policy = policy
+                retry_checkpoint.retry_generation = generation
+                try:
+                    if self._delay(delay, retry_checkpoint) is False:
+                        raise _AutomaticRetryDisabled()
+                    retry_checkpoint()
+                except _AutomaticRetryDisabled:
+                    self._event(batch, source, "downloading", "skipped", source=entry["source_path"],
+                                error=code, attempt=attempt, max_attempts=1, retry_enabled=False)
+                    raise exc
             finally:
                 if temporary:
                     temporary.unlink(missing_ok=True)
@@ -902,6 +993,10 @@ class BatchService:
                     self._local_reserved.pop(entry["id"], None)
 
     def _delay(self, delay, checkpoint):
+        policy = getattr(checkpoint, "retry_policy", None)
+        if policy is not None:
+            return policy.wait(delay, checkpoint=checkpoint,
+                               generation=checkpoint.retry_generation)
         end = time.monotonic() + delay
         while time.monotonic() < end:
             checkpoint()

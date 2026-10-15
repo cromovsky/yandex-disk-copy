@@ -6,7 +6,7 @@
   const names = {single: "Одна организация", cross: "Между организациями", local: "Сохранить локально"};
   const states = {running: "Выполняется", done: "Завершено", error: "Ошибка", interrupted: "Прервано при перезапуске утилиты"};
   const statuses = {started: "Начато", running: "Выполняется", done: "Завершено", succeeded: "Успешно", success: "Успешно", failed: "Ошибка", error: "Ошибка",
-    skipped: "Пропущено", waiting: "Ожидание", retry: "Повтор", outcome_unknown: "Исход неизвестен", interrupted: "Прервано"};
+    skipped: "Пропущено", waiting: "Ожидание", retry: "Повтор", outcome_unknown: "Исход неизвестен", interrupted: "Прервано", enabled: "Включены", disabled: "Выключены"};
   const sides = {source: "SaaS: источник", destination: "SaaS: получатель", local: "Локальный диск / кеш"};
   const stages = {get_token: "Получение токена", source_auth: "Авторизация источника", destination_auth: "Авторизация получателя",
     check_user: "Проверка сотрудника", check_space: "Проверка свободного места", list_resources: "Чтение папки",
@@ -15,7 +15,7 @@
     user_status: "Проверка сотрудника", set_user_status: "Изменение статуса сотрудника", disk_space: "Проверка свободного места",
     list_folder: "Чтение папки", metadata: "Сведения о файле", get_download_url: "Получение ссылки скачивания",
     get_upload_url: "Получение ссылки загрузки", file: "Обработка файла", local_write: "Запись на локальный диск", collect_links: "Сбор ссылок",
-    check_local: "Проверка локального файла", transfer: "Перенос",
+    check_local: "Проверка локального файла", transfer: "Перенос", retry_policy: "Настройка повторов", retry_settings: "Автоматические повторы",
     poll_operation: "Ожидание операции", save_local: "Локальное сохранение", save_public: "Сохранение по ссылке"};
   const idPattern = /^[A-Za-z0-9._:-]{1,128}$/;
   const storageKey = (mode) => "diskCopyJournalSelection:v1:" + mode;
@@ -28,7 +28,7 @@
     catch (_) {}
   }
   const data = Object.fromEntries(modes.map((mode) => [mode, {jobs: [], knownIds: new Set(), selected: remembered(mode), job: null, offset: 0,
-    hasMore: false, restored: false, lines: [], cursor: 0, loaded: false, warning: "", cleanup: "", cleanupError: false}]));
+    hasMore: false, restored: false, lines: [], cursor: 0, loaded: false, warning: "", retryWarning: "", cleanup: "", cleanupError: false}]));
   const activity = Object.fromEntries(modes.map((mode) => [mode, null]));
   let mode = document.querySelector(".mode-tab.active")?.dataset.mode || "single";
   let version = 0;
@@ -44,6 +44,8 @@
   let connectionWarning = "";
   const runButtons = ["run", "run-cross", "run-local"];
   const knownErrors = {
+    job_not_running: "Задание уже завершено. Настройте повторы перед новым запуском.",
+    job_not_found: "Задание не найдено. Обновите историю и выберите задание заново.",
     journal_in_use: "В этом режиме ещё выполняется перенос. Дождитесь его завершения, затем очистите журнальный кеш.",
     journal_write_failed: "Не удалось сохранить журнал. Проверьте свободное место и права доступа к хранилищу утилиты.",
     journal_storage_unavailable: "Хранилище журналов недоступно. Проверьте свободное место и права доступа.",
@@ -91,6 +93,19 @@
   }
   function isLocked() { return starting || Boolean(uncertainStart) || modes.some((key) => activity[key] === null || activity[key] > 0); }
   function controls() {
+    for (const key of modes) {
+      if (key === "local" && get("local-source-input")?.value === "list") continue;
+      const current = data[key], job = current.job, id = current.selected;
+      window.diskCopyRetries?.bind(key, {
+        id: "run:" + (id || "new"), enabled: job ? job.retry_enabled !== false : window.diskCopyRetries.value(key),
+        loading: Boolean(id && !job), editable: job?.status === "running",
+        save: async (enabled) => {
+          const result = await request(`/api/run/${encodeURIComponent(id)}/retries`, {method: "POST", body: {enabled}});
+          if (current.selected === id && current.job) {current.job.retry_enabled = result.retry_enabled; current.retryWarning = "";}
+          return result;
+        }, errorText,
+      });
+    }
     runButtons.forEach((id) => { if (get(id)) get(id).disabled = isLocked(); });
     const current = data[mode];
     get("run-journal-csv").disabled = !current?.selected || exportBusy || cleanupBusy;
@@ -103,7 +118,7 @@
   function resetSelection(key, id) {
     const current = data[key]; current.selected = id; current.job = null; current.lines = []; current.cursor = 0; current.loaded = false;
     current.selectionRevision = (current.selectionRevision || 0) + 1;
-    current.warning = ""; current.restored = true; remember(key, id);
+    current.warning = ""; current.retryWarning = ""; current.restored = true; remember(key, id);
   }
   function render() {
     const current = data[mode];
@@ -132,7 +147,7 @@
       .filter(([key]) => Number.isSafeInteger(summary[key]) && summary[key] >= 0)
       .map(([key, label]) => label + ": " + summary[key]).join(" · ");
     get("run-journal-direction").textContent = job ? [clean(job.source), clean(job.destination)].filter(Boolean).join(" → ") : "";
-    const warnings = [connectionWarning, current.warning];
+    const warnings = [connectionWarning, current.warning, current.retryWarning];
     if (uncertainStart) warnings.push("Ответ на запуск не получен. Обновите историю и убедитесь, что задание в ней не появилось. Повторный запуск может создать второе задание. Запрос автоматически не повторяется.");
     if (job?.journal_error) warnings.push("Журнал этого задания может быть неполным: произошла ошибка записи. Результат переноса показан отдельно. Проверьте хранилище утилиты.");
     if (job?.status === "interrupted") warnings.push("Утилита была перезапущена. Старый перенос автоматически не продолжается; проверьте уже сохранённые файлы перед новым запуском.");
@@ -156,6 +171,7 @@
     if (clean(event.stage, 128)) parts.push(stages[event.stage] || event.stage);
     if (clean(event.status, 128)) parts.push(statuses[event.status] || event.status);
     if (clean(event.message)) parts.push(event.message);
+    if (typeof event.retry_enabled === "boolean") parts.push("Автоматические повторы: " + (event.retry_enabled ? "включены" : "выключены"));
     if (clean(event.source)) parts.push("Источник: " + event.source);
     if (clean(event.destination)) parts.push("Назначение: " + event.destination);
     if (Number.isFinite(event.size) && event.size >= 0) parts.push("Размер: " + volume(event.size));
@@ -194,6 +210,19 @@
     clearTimeout(timer);
     timer = setTimeout(() => { if (!document.hidden) refresh(); else schedule(); }, modes.some((key) => activity[key] > 0) ? 2500 : 5000);
   }
+  async function synchronizeStartRetries(id, initial, intent) {
+    let saved = initial !== false;
+    while (intent && saved !== intent.enabled) {
+      let result;
+      try { result = await request(`/api/run/${encodeURIComponent(id)}/retries`, {method: "POST", body: {enabled: intent.enabled}}); }
+      catch (error) {
+        if (["job_not_running", "job_not_found"].includes(error.code)) {refreshAgain = true; return;}
+        throw error;
+      }
+      if (typeof result?.retry_enabled !== "boolean") throw apiError("invalid_response");
+      saved = result.retry_enabled;
+    }
+  }
   async function refresh() {
     if (refreshing) { refreshAgain = true; return refreshing; }
     clearTimeout(timer);
@@ -219,11 +248,17 @@
           current.restored = true;
         }
         if (uncertainStart?.mode === snapshot.key) {
-          const candidate = current.jobs.find((job) => !uncertainStart.before.has(job.id));
+          const candidates = current.jobs.filter((job) => !uncertainStart.before.has(job.id));
+          const candidate = candidates[0];
           if (candidate) {
-            const showStarted = mode === snapshot.key && version === uncertainStart.viewVersion;
+            const pending = uncertainStart;
+            const showStarted = mode === snapshot.key && version === pending.viewVersion;
             uncertainStart = null;
-            if (showStarted) resetSelection(snapshot.key, candidate.id);
+            pending.retryIntent?.close();
+            if (showStarted) {
+              resetSelection(snapshot.key, candidate.id);
+              current.retryWarning = "Найдено задание в истории. Проверьте источник и настройку автоматических повторов: результат исходного запроса запуска не подтверждён. Изменение галочки во время запуска могло не примениться.";
+            }
           }
         }
       });
@@ -240,6 +275,7 @@
     if (!data[key] || isLocked()) return;
     starting = true;
     const stamp = version;
+    let retryIntent = window.diskCopyRetries.track(key);
     const before = new Set(data[key].knownIds);
     data[key].offset = 0;
     if (data[key].selected) before.add(data[key].selected);
@@ -248,11 +284,16 @@
       const result = await request(endpoint, {method: "POST", body});
       if (!idPattern.test(result?.job_id || "")) throw apiError("invalid_response");
       activity[key] = Math.max(1, activity[key] || 0);
-      if (version === stamp && mode === key) { resetSelection(key, result.job_id); version += 1; }
+      let retryWarning = "";
+      try { await synchronizeStartRetries(result.job_id, body.retry_enabled, retryIntent); }
+      catch (error) {retryWarning = errorText(error);}
+      if (version === stamp && mode === key) {resetSelection(key, result.job_id); data[key].warning = retryWarning; version += 1;}
     } catch (error) {
       data[key].warning = errorText(error);
-      if (error.code === "network" || error.code === "invalid_response" || (error.status >= 500 && !knownErrors[error.code])) uncertainStart = {mode: key, before, checked: false, viewVersion: stamp};
-    } finally { mutationVersion += 1; starting = false; render(); await refresh(); }
+      if (error.code === "network" || error.code === "invalid_response" || (error.status >= 500 && !knownErrors[error.code])) {
+        uncertainStart = {mode: key, before, checked: false, viewVersion: stamp, retryIntent}; retryIntent = null;
+      }
+    } finally {retryIntent?.close(); mutationVersion += 1; starting = false; render(); await refresh();}
   }
   get("run-history").addEventListener("change", () => {
     if (!data[mode]) return;
@@ -263,7 +304,7 @@
   get("run-history-refresh").addEventListener("click", refresh);
   get("run-start-unlock").addEventListener("click", () => {
     if (!uncertainStart?.checked || starting || modes.some((key) => activity[key] !== 0)) return;
-    data[uncertainStart.mode].warning = ""; uncertainStart = null; render();
+    data[uncertainStart.mode].warning = ""; uncertainStart.retryIntent?.close(); uncertainStart = null; render();
   });
   for (const [id, direction] of [["run-history-previous", -1], ["run-history-next", 1]]) get(id).addEventListener("click", () => {
     if (!data[mode] || get(id).disabled) return;
@@ -300,6 +341,7 @@
     mode = "local"; resetSelection("local", id); version += 1; render(); refresh();
     get("run-journal-mode")?.scrollIntoView?.({behavior: "smooth", block: "start"});
   });
+  get("local-source-input")?.addEventListener("change", controls);
   window.runJournal = {selectMode, start, refresh};
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
   window.addEventListener("pagehide", () => clearTimeout(timer));

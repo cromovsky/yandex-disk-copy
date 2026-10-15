@@ -150,10 +150,10 @@
     }
     config() {
       const value = (id) => get(id).value.trim();
-      if (this.mode === "local") return {source_org_id: value("local_orgid"), source_client_id: value("local_client_id"), page_limit: Number(value("local_page_limit"))};
+      if (this.mode === "local") return {source_org_id: value("local_orgid"), source_client_id: value("local_client_id"), page_limit: Number(value("local_page_limit")), retry_enabled: window.diskCopyRetries?.value(this.mode) !== false};
       return {source_org_id: value("onprem-source-org"), source_client_id: value("onprem-source-client"), page_limit: 1000,
         destination_url: value("onprem-destination-url"), destination_identity: value("onprem-destination-identity"), destination_vd_hash: value("onprem-destination-vd-hash"),
-        strategy: "staged", identity_confirmed: get("onprem-identity-confirmed").checked};
+        retry_enabled: window.diskCopyRetries?.value(this.mode) !== false, strategy: "staged", identity_confirmed: get("onprem-identity-confirmed").checked};
     }
     secrets() {
       const value = this.mode === "local" ? {source_client_secret: get("local_client_secret").value}
@@ -175,7 +175,7 @@
       if (!this.batch?.config) return false;
       const current = this.config(), original = this.batch.config;
       return Object.keys(current).every((key) => {
-        if (key === "identity_confirmed") return true;
+        if (["identity_confirmed", "retry_enabled"].includes(key)) return true;
         if (key === "destination_url") {
           const normalize = (value) => {
             try { const url = new URL(value); url.pathname = url.pathname.replace(/\/+$/, "") || "/v1/disk"; return url.href; } catch (_) { return String(value || ""); }
@@ -253,6 +253,18 @@
       finally { this.busy = false; this.controls(); this.schedule(); }
     }
     controls() {
+      if (this.listMode()) {
+        const batch = this.batch, id = batch?.id;
+        window.diskCopyRetries?.bind(this.mode, {
+          id: "list:" + (id || "new"), enabled: batch ? batch.config?.retry_enabled !== false : window.diskCopyRetries.value(this.mode),
+          loading: false, editable: Boolean(batch && !this.legacy() && !terminalStates.has(batch.state)),
+          save: async (enabled) => {
+            const result = await this.request("/" + encodeURIComponent(id) + "/retries", {method: "POST", body: {enabled}});
+            if (this.batch?.id === id) this.batch.config.retry_enabled = result.retry_enabled;
+            return result;
+          }, errorText: (error) => this.errorText(error),
+        });
+      }
       const locked = this.busy || !this.enabled() || !this.authorized();
       const selected = this.sources.filter((source) => source.selected);
       const batch = this.batch, legacy = this.legacy();
@@ -293,17 +305,28 @@
     }
     async createPlan() {
       if (!this.valid()) throw failure("validation_error");
-      const config = this.config(), sources_csv = this.node("csv").value;
-      const fingerprint = JSON.stringify({mode: this.mode, config, sources_csv});
-      if (!this.pendingCreate || this.pendingCreate.fingerprint !== fingerprint) this.pendingCreate = {fingerprint, key: uuid()};
-      this.accept(await this.request("", {method: "POST", body: {mode: this.mode, config, sources_csv, credentials: this.secrets(), idempotency_key: this.pendingCreate.key}}));
-      this.pendingCreate = null;
-      this.plannedCsv = sources_csv;
-      this.node("details").hidden = true; this.entrySource = null;
-      this.accept(await this.request(this.path("plan"), {method: "POST", body: {}}));
-      this.message("Dry Run запущен: проверка доступа, затем полный план каждого источника. Диски остаются без изменений.");
-      await this.refreshHistory();
+      const retryIntent = window.diskCopyRetries.track(this.mode);
+      try {
+        const config = this.config(), sources_csv = this.node("csv").value;
+        const fingerprint = JSON.stringify({mode: this.mode, config: {...config, retry_enabled: undefined}, sources_csv});
+        if (!this.pendingCreate || this.pendingCreate.fingerprint !== fingerprint) this.pendingCreate = {fingerprint, key: uuid()};
+        const detail = await this.request("", {method: "POST", body: {mode: this.mode, config, sources_csv, credentials: this.secrets(), idempotency_key: this.pendingCreate.key}});
+        if (!detail?.batch?.id) throw failure("invalid_response");
+        while ((detail.batch.config?.retry_enabled !== false) !== retryIntent.enabled) {
+          const result = await this.request("/" + encodeURIComponent(detail.batch.id) + "/retries", {method: "POST", body: {enabled: retryIntent.enabled}});
+          if (typeof result?.retry_enabled !== "boolean") throw failure("invalid_response");
+          detail.batch.config.retry_enabled = result.retry_enabled;
+        }
+        this.accept(detail);
+        this.pendingCreate = null;
+        this.plannedCsv = sources_csv;
+        this.node("details").hidden = true; this.entrySource = null;
+        this.accept(await this.request(this.path("plan"), {method: "POST", body: {}}));
+        this.message("Dry Run запущен: проверка доступа, затем полный план каждого источника. Диски остаются без изменений.");
+        await this.refreshHistory();
+      } finally {retryIntent.close();}
     }
+
     async attach() {
       this.requireStaged();
       if (!this.valid() || !this.matches()) throw failure("credential_binding_mismatch");

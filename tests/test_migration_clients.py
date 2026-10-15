@@ -63,7 +63,9 @@ class Limiter:
         self.calls = []
         self.delays = []
 
-    def acquire(self, method):
+    def acquire(self, method, *, checkpoint=None):
+        if checkpoint is not None:
+            checkpoint()
         self.calls.append(method)
 
     def penalize(self, delay):

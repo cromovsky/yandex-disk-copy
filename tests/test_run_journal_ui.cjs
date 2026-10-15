@@ -308,3 +308,151 @@ test("journal polling preserves reading position and follows new events only fro
   log.scrollTop = 900; await select(ui, "other");
   assert.equal(log.scrollTop, log.scrollHeight, "selecting another journal starts at its latest events");
 });
+
+for (const mode of ["single", "cross", "local"]) {
+  test(`${mode}: retry checkbox defaults on and edits the running job without credentials`, async () => {
+    const ui = await loadUi(undefined, {initialJobs: [job("live", mode, "running", {retry_enabled: false})], journalOverride: ({url, body}) => {
+      if (url.pathname.endsWith("/retries")) return response({retry_enabled: body.enabled});
+    }});
+    if (mode !== "single") await ui.journal.selectMode(mode);
+    const checkbox = get(ui, "retry-" + mode);
+    assert.ok(checkbox, "each mode has a retry setting");
+    assert.equal(checkbox.checked, false, "stored job setting is restored");
+    assert.equal(checkbox.disabled, false, "running form remains editable");
+    checkbox.checked = true; await checkbox.fire("change");
+    assert.deepEqual(ui.requests.at(-1), {url: "/api/run/live/retries", body: {enabled: true}});
+    assert.equal(checkbox.checked, true);
+    assert.equal(ui.storageWrites.some(({value}) => /secret|token/.test(value)), false);
+  });
+}
+
+test("completed history changes only the next run's retry setting", async () => {
+  const ui = await loadUi(undefined, {initialJobs: [job("history", "single", "done", {retry_enabled: false})]});
+  const checkbox = get(ui, "retry-single"); assert.ok(checkbox);
+  checkbox.checked = true; await checkbox.fire("change");
+  assert.equal(ui.requests.length, 0);
+  assert.equal(checkbox.checked, true);
+});
+
+test("a late retry-settings response cannot overwrite a newly selected job", async () => {
+  let release;
+  const ui = await loadUi(undefined, {initialJobs: [job("a", "single", "running", {retry_enabled: true}), job("b", "single", "done", {retry_enabled: false})],
+    journalOverride: async ({url}) => {
+      if (url.pathname === "/api/run/a/retries") {await new Promise((resolve) => {release = resolve;}); return response({retry_enabled: false});}
+    }});
+  const checkbox = get(ui, "retry-single"); assert.ok(checkbox);
+  checkbox.checked = false; const pending = checkbox.fire("change"); await flush();
+  await select(ui, "b"); checkbox.checked = true; await checkbox.fire("change");
+  release(); await pending;
+  assert.equal(get(ui, "run-history").value, "b");
+  assert.equal(checkbox.checked, true);
+  assert.equal(checkbox.disabled, false);
+});
+
+test("retry settings reject safely and restore the server's setting", async () => {
+  const ui = await loadUi(undefined, {initialJobs: [job("a", "single", "running", {retry_enabled: true})], journalOverride: ({url}) =>
+    url.pathname.endsWith("/retries") ? response({detail: "journal_origin_rejected", private_detail: "secret-value"}, 403) : null});
+  const checkbox = get(ui, "retry-single"); assert.ok(checkbox);
+  checkbox.checked = false; await checkbox.fire("change");
+  assert.equal(checkbox.checked, true);
+  assert.equal(checkbox.disabled, false);
+  assert.match(get(ui, "retry-single-notice").textContent, /не удалось|откройте/i);
+  assert.doesNotMatch(get(ui, "retry-single-notice").textContent, /secret-value/);
+});
+
+test("retry-policy events show the persisted choice in the journal", async () => {
+  const ui = await loadUi(undefined, {initialJobs: [job("policy")], initialEvents: {policy: [event(1, {stage: "retry_policy", retry_enabled: false})]}});
+  assert.match(get(ui, "log").textContent, /Автоматические повторы: выключены/);
+});
+
+for (const mode of ["single", "cross", "local"]) test(`${mode}: retry choice changed while creation is pending reaches the accepted job`, async () => {
+  let release;
+  const endpoint = mode === "single" ? "/api/run" : mode === "cross" ? "/api/run-cross" : "/api/save-local";
+  const ui = await loadUi(undefined, {journalOverride: async ({url, method, body, jobs}) => {
+    if (method === "POST" && url.pathname === endpoint) {
+      await new Promise((resolve) => {release = resolve;});
+      jobs.unshift(job("accepted", mode, "running", {retry_enabled: body.retry_enabled}));
+      return response({job_id: "accepted"});
+    }
+    if (url.pathname === "/api/run/accepted/retries") {jobs[0].retry_enabled = body.enabled; return response({retry_enabled: body.enabled});}
+  }});
+  if (mode !== "single") await ui.journal.selectMode(mode);
+  const pending = ui.journal.start({endpoint, body: {retry_enabled: true}, mode}); await flush();
+  const check = get(ui, "retry-" + mode); check.checked = false; await check.fire("change");
+  release(); await pending;
+  assert.equal(ui.jobs[0].retry_enabled, false);
+  assert.equal(check.checked, false);
+  assert.deepEqual(ui.requests.at(-1), {url: "/api/run/accepted/retries", body: {enabled: false}});
+});
+
+test("late creation never takes retry choice from another selected history job", async () => {
+  let release;
+  const ui = await loadUi(undefined, {initialJobs: [job("a"), job("b")], journalOverride: async ({url, method, jobs}) => {
+    if (method === "POST" && url.pathname === "/api/run") {
+      await new Promise((resolve) => {release = resolve;}); jobs.unshift(job("accepted", "single", "running", {retry_enabled: true})); return response({job_id: "accepted"});
+    }
+  }});
+  const pending = ui.journal.start({endpoint: "/api/run", body: {retry_enabled: true}, mode: "single"}); await flush();
+  await select(ui, "b"); get(ui, "retry-single").checked = false; await get(ui, "retry-single").fire("change");
+  release(); await pending;
+  assert.equal(get(ui, "run-history").value, "b");
+  assert.equal(get(ui, "retry-single").checked, false);
+  assert.equal(ui.jobs[0].retry_enabled, true);
+  assert.equal(ui.requests.length, 1, "the historical form preference does not mutate the accepted run");
+});
+
+test("local creation never takes retry preference from a list opened before acceptance", async () => {
+  let release;
+  const ui = await loadUi(undefined, {journalOverride: async ({url, method, jobs}) => {
+    if (method === "POST" && url.pathname === "/api/save-local") {
+      await new Promise((resolve) => {release = resolve;}); jobs.unshift(job("accepted", "local", "running", {retry_enabled: true})); return response({job_id: "accepted"});
+    }
+  }});
+  await ui.journal.selectMode("local");
+  const pending = ui.journal.start({endpoint: "/api/save-local", body: {retry_enabled: true}, mode: "local"}); await flush();
+  get(ui, "local-source-input").value = "list"; await get(ui, "local-source-input").fire("change");
+  ui.window.diskCopyRetries.bind("local", {id: "list:new", enabled: true, editable: false});
+  get(ui, "retry-local").checked = false; await get(ui, "retry-local").fire("change");
+  release(); await pending;
+  assert.equal(ui.jobs[0].retry_enabled, true);
+  assert.equal(get(ui, "retry-local").checked, false);
+  assert.equal(ui.requests.length, 1);
+});
+
+for (const foreign of [false, true]) test(`unknown creation discovers ${foreign ? "another browser's" : "the original"} run read-only and asks to check retries`, async () => {
+  let release;
+  const ui = await loadUi(undefined, {journalOverride: async ({url, method, body, jobs}) => {
+    if (method === "POST" && url.pathname === "/api/run") {
+      await new Promise((resolve) => {release = resolve;});
+      jobs.unshift(job("discovered", "single", "running", {retry_enabled: true, source: foreign ? "unrelated@example.test" : "reader@example.test"}));
+      throw Error("start response lost");
+    }
+    if (url.pathname === "/api/run/discovered/retries") {jobs[0].retry_enabled = body.enabled; return response({retry_enabled: body.enabled});}
+  }});
+  const pending = ui.journal.start({endpoint: "/api/run", body: {retry_enabled: true}, mode: "single"}); await flush();
+  get(ui, "retry-single").checked = false; await get(ui, "retry-single").fire("change"); release(); await pending; await flush();
+  assert.equal(get(ui, "run-history").value, "discovered");
+  assert.equal(get(ui, "run-start-recovery").hidden, true);
+  assert.equal(ui.jobs[0].retry_enabled, true, "history discovery never mutates an uncorrelated run");
+  assert.equal(ui.requests.length, 1, "only the original start request was sent");
+  assert.match(get(ui, "run-journal-notice").textContent, /проверьте.*автоматических повторов/i);
+  await ui.journal.refresh();
+  assert.match(get(ui, "run-journal-notice").textContent, /проверьте.*автоматических повторов/i, "the warning survives polling");
+  get(ui, "retry-single").checked = false; await get(ui, "retry-single").fire("change");
+  assert.equal(ui.jobs[0].retry_enabled, false, "an explicit change applies to the selected run");
+});
+
+test("a known accepted run completing before retry synchronization never blocks history or future starts", async () => {
+  let release;
+  const ui = await loadUi(undefined, {journalOverride: async ({url, method, jobs}) => {
+    if (method === "POST" && url.pathname === "/api/run") {
+      await new Promise((resolve) => {release = resolve;}); jobs.unshift(job("accepted", "single", "running", {retry_enabled: true})); return response({job_id: "accepted"});
+    }
+    if (url.pathname === "/api/run/accepted/retries") {jobs[0].status = "done"; return response({detail: "job_not_running"}, 409);}
+  }});
+  const pending = ui.journal.start({endpoint: "/api/run", body: {retry_enabled: true}, mode: "single"}); await flush();
+  get(ui, "retry-single").checked = false; await get(ui, "retry-single").fire("change"); release(); await pending; await flush();
+  assert.equal(get(ui, "run-history").value, "accepted");
+  assert.equal(get(ui, "run-start-recovery").hidden, true);
+  assertLocked(ui, false);
+});

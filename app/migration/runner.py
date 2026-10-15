@@ -20,6 +20,7 @@ from .destination import OnPremDiskDestination, destination_path
 from .diagnostics import diagnostic_fields
 from .errors import MigrationError
 from .source import SaasDiskSource
+from app.retry_policy import RetryPolicy
 
 
 ACTIVE = {"transferring", "waiting_operation", "verifying", "committing",
@@ -66,6 +67,18 @@ def destination_interrupted(exc):
         exc.code.startswith("destination_")
         and exc.code not in {"destination_conflict", "destination_url_import_failed"}
     ))
+
+
+def file_access_denied(exc, stage):
+    """A resource-level 403 is distinct from rejected application credentials."""
+    return bool(isinstance(exc, MigrationError) and exc.http_status == 403
+                and exc.code in {"source_auth_failed", "destination_auth_failed",
+                                 "source_public_access_denied"}
+                and stage not in {"prepare_clients", "planning", "check_destination_access"}
+                and exc.diagnostics.get("request_host") != "oauth.yandex.ru"
+                and exc.diagnostics.get("api_error") not in {
+                    "invalid_client", "invalid_grant", "unauthorized_client", "invalid_scope",
+                })
 
 
 class _StopRequested(Exception):
@@ -124,6 +137,8 @@ class MigrationRunner:
         self.staging.mkdir(mode=0o700, exist_ok=True)
         os.chmod(self.staging, 0o700)
         self._clients = {}
+        self._retry_policies = {}
+        self._retry_lock = threading.RLock()
         self._transfers = {}
         self._rate_lock = threading.Lock()
         self._cache_lock = threading.RLock()
@@ -181,6 +196,35 @@ class MigrationRunner:
                 rates[direction + "_active"] = True
         return rates
 
+    def retry_policy(self, job_id):
+        with self._retry_lock:
+            policy = self._retry_policies.get(job_id)
+            if policy is None:
+                policy = RetryPolicy(self.store.get(job_id)["config"].get("retry_enabled", True))
+                self._retry_policies[job_id] = policy
+            return policy
+
+    def bind_retry_policy(self, job_id, policy):
+        with self._retry_lock:
+            self._retry_policies[job_id] = policy
+            current = self._clients.get(job_id)
+            if current:
+                for client in current[1:]:
+                    if client is not None:
+                        client.retry_policy = policy
+
+    def set_retry_enabled(self, job_id, enabled):
+        with self._retry_lock:
+            policy = self.retry_policy(job_id)
+            self.store.set_retry_enabled(job_id, enabled)
+            policy.set_enabled(enabled)
+
+    def _download_limit(self, job_id):
+        return MAX_DOWNLOAD_ATTEMPTS if self.retry_policy(job_id).enabled else 1
+
+    def _point_limit(self, job_id):
+        return MAX_POINT_RETRY_ATTEMPTS if self.retry_policy(job_id).enabled else 1
+
     def close(self):
         for _, source, destination in self._clients.values():
             if source:
@@ -205,7 +249,8 @@ class MigrationRunner:
                          "prepare_destination_directory", "upload_file",
                          "submit_url_upload", "claim_namespace", "move_file"}:
                 self._checkpoint(job["id"])
-                if not (entry and entry.get("point_retry_requested")):
+                if not (entry and (entry.get("point_retry_requested")
+                                  or not self.retry_policy(job["id"]).enabled)):
                     with self._outage_lock:
                         interrupted = self._destination_outages.get(
                             self._destination_key(job["config"]),
@@ -225,6 +270,7 @@ class MigrationRunner:
                 payload["error"] = exc.code if isinstance(exc, MigrationError) \
                     else "internal_error"
             if isinstance(exc, MigrationError):
+                exc._migration_stage = getattr(exc, "_migration_stage", stage)
                 if (attempt and stage in {"upload_file", "submit_url_upload"}
                         and not exc.uncertain and not exc.auth):
                     # This submission is known to have failed. Read failures
@@ -246,7 +292,7 @@ class MigrationRunner:
                     download_attempts=self.store.entry(
                         entry["id"],
                     )["download_attempts"],
-                    max_download_attempts=MAX_DOWNLOAD_ATTEMPTS,
+                    max_download_attempts=self._download_limit(job["id"]),
                 )
             self.store.event(job["id"], "transfer_stage", payload)
             raise
@@ -285,9 +331,12 @@ class MigrationRunner:
         }:
             payload.update(
                 download_attempts=self.store.entry(entry["id"])["download_attempts"],
-                max_download_attempts=MAX_DOWNLOAD_ATTEMPTS,
+                max_download_attempts=self._download_limit(job["id"]),
             )
         self.store.event(job["id"], "transfer_stage", payload)
+        if result is False and entry and not self.retry_policy(job["id"]).enabled:
+            error = self.store.entry(entry["id"]).get("error") or "verification_mismatch"
+            self._skip_event(job["id"], entry, MigrationError(error), stage=stage)
         return result
 
     def final_pending(self, job_id):
@@ -340,6 +389,7 @@ class MigrationRunner:
             current = None
         if not current:
             destination = self.destination_factory(job["config"], credentials)
+            destination.retry_policy = self.retry_policy(job["id"])
             current = (credentials, None, destination)
             self._clients[job["id"]] = current
         return current[2]
@@ -349,6 +399,7 @@ class MigrationRunner:
         current = self._clients[job["id"]]
         if not current[1]:
             source = self.source_factory(job["config"], current[0])
+            source.retry_policy = self.retry_policy(job["id"])
             current = (current[0], source, destination)
             self._clients[job["id"]] = current
         return current[1:]
@@ -397,7 +448,7 @@ class MigrationRunner:
             self._destination_outages.pop(self._destination_key(config), None)
 
     def _record_destination_outage(self, job_id, exc):
-        if destination_interrupted(exc):
+        if destination_interrupted(exc) and self.retry_policy(job_id).enabled:
             config = self.store.get(job_id)["config"]
             with self._outage_lock:
                 self._destination_outages[self._destination_key(config)] = (
@@ -647,10 +698,21 @@ class MigrationRunner:
             self.store.update_job(job_id, state="paused")
             return
         if (point and point_start
-                and point["point_retry_attempts"] >= MAX_POINT_RETRY_ATTEMPTS):
+                and point["point_retry_attempts"] >= self._point_limit(job_id)):
             self._finish_point_retry(job_id, point, exhausted=True)
             return
         waiting = point or next((e for e in entries if e["state"] in ACTIVE), None)
+        if (waiting and not point and not self.retry_policy(job_id).enabled
+                and waiting.get("attempt_id")
+                and self.store.attempt(waiting["attempt_id"])["phase"] == "download_retry_wait"):
+            self._failure(job_id, waiting, MigrationError(waiting.get("error") or "source_download_failed"))
+            self.store.event(job_id, "transfer_stage", {
+                "stage": "download_retry", "status": "skipped", "entry_id": waiting["id"],
+                "error": waiting.get("error") or "source_download_failed",
+                "download_attempts": waiting["download_attempts"], "max_download_attempts": 1,
+                "retry_enabled": False,
+            })
+            return
         if waiting and (waiting.get("retry_at_ms") or 0) > int(time.time() * 1000):
             return
         entry = point or waiting
@@ -702,7 +764,8 @@ class MigrationRunner:
             else:
                 entry = next((e for e in entries if e["state"] == "planned"), None)
             if not entry:
-                if any(e["state"] == "outcome_unknown" for e in entries):
+                if (self.retry_policy(job_id).enabled
+                        and any(e["state"] == "outcome_unknown" for e in entries)):
                     self.store.update_job(job_id, state="needs_attention",
                                           error="transfer_outcome_unknown")
                     return
@@ -722,7 +785,8 @@ class MigrationRunner:
         except _StopRequested:
             return
         except MigrationError as exc:
-            if exc.auth:
+            if exc.auth and not (entry and not self.retry_policy(job_id).enabled
+                                 and file_access_denied(exc, getattr(exc, "_migration_stage", ""))):
                 if entry and destination_interrupted(exc):
                     if point:
                         self._point_failure(job_id, entry, exc)
@@ -761,7 +825,8 @@ class MigrationRunner:
             "stage": "point_retry", "entry_id": entry["id"],
             "attempt_id": entry["attempt_id"], "status": status,
             "point_retry_attempts": entry["point_retry_attempts"],
-            "max_point_retry_attempts": MAX_POINT_RETRY_ATTEMPTS, **fields,
+            "max_point_retry_attempts": self._point_limit(job_id),
+            "retry_enabled": self.retry_policy(job_id).enabled, **fields,
         })
 
     def _point_file(self, job, entry, source, destination):
@@ -841,10 +906,13 @@ class MigrationRunner:
             self._point_event(job_id, entry, "failed", error=exc.code,
                               http_status=exc.http_status, **exc.diagnostics)
             self._finish_point_retry(job_id, entry, exhausted=True)
-            self._job_error(job_id, state="needs_attention", error=exc.code)
+            if self.retry_policy(job_id).enabled:
+                self._job_error(job_id, state="needs_attention", error=exc.code)
             return
         if not entry.get("attempt_id"):
             self.store.update_entry(entry["id"], state="failed", error=exc.code)
+            if not self.retry_policy(job_id).enabled:
+                self._skip_event(job_id, entry, exc)
             self._finish_point_retry(job_id, entry, exhausted=True)
             return
         attempt = self.store.attempt(entry["attempt_id"])
@@ -864,7 +932,7 @@ class MigrationRunner:
         if self.store.get(job_id).get("full_stop_requested"):
             return
         if (exc.code in POINT_RETRY_ERRORS | DOWNLOAD_ERRORS
-                and entry["point_retry_attempts"] < MAX_POINT_RETRY_ATTEMPTS):
+                and entry["point_retry_attempts"] < self._point_limit(job_id)):
             delay_ms = (10000, 30000)[entry["point_retry_attempts"] - 1]
             retry_at = int(time.time() * 1000) + delay_ms
             self.store.update_entry(entry["id"], retry_at_ms=retry_at)
@@ -872,6 +940,8 @@ class MigrationRunner:
                               retry_delay_ms=delay_ms, retry_at_ms=retry_at,
                               **exc.diagnostics)
             return
+        if not self.retry_policy(job_id).enabled:
+            self._skip_event(job_id, entry, exc)
         self._finish_point_retry(job_id, entry, exhausted=True)
 
     def _finish_point_retry(self, job_id, entry, *, exhausted=False):
@@ -889,7 +959,18 @@ class MigrationRunner:
             raise _StopRequested()
 
     def _prepare_publications(self, job, source, *, path=None):
+        pending_roots = None
+        if not self.retry_policy(job["id"]).enabled and path is None:
+            pending_roots = set()
+            for entry in self.store.entries(job["id"], limit=1000000):
+                if entry["state"] in ACTIVE | {"planned"}:
+                    parent = entry["source_path"]
+                    while parent.startswith("disk:/"):
+                        pending_roots.add(parent)
+                        parent = parent.rsplit("/", 1)[0]
         for root in self.store.publications(job["id"]):
+            if pending_roots is not None and root["source_path"] not in pending_roots:
+                continue
             if path is not None and not (
                 path == root["source_path"]
                 or path.startswith(root["source_path"] + "/")
@@ -918,12 +999,46 @@ class MigrationRunner:
                     self.store.update_publication(
                         job["id"], root["entry_id"], state="failed", error=exc.code,
                     )
+                if not self.retry_policy(job["id"]).enabled and (
+                    not exc.auth or file_access_denied(exc, "publish_source")
+                ):
+                    # Publication can be uncertain; no destination upload has been
+                    # submitted for these planned dependants, so they are safe skips.
+                    failure = MigrationError(exc.code, http_status=exc.http_status,
+                                             diagnostics=exc.diagnostics)
+                    failure._migration_stage = "publish_source"
+                    self._failure(job["id"], self.store.entry(root["entry_id"]), failure)
+                    if path is None:
+                        continue
                 raise
             if root["state"] != "published":
                 self.store.update_publication(
                     job["id"], root["entry_id"], state="published",
                 )
             self._publication_checkpoint(job["id"])
+
+    def _skip_event(self, job_id, entry, exc, *, stage=None):
+        details = dict(exc.diagnostics)
+        if "error_side" not in details:
+            if exc.code.startswith(("staging_", "invalid_staging_", "cache_")):
+                details["error_side"] = "local"
+            elif exc.code.startswith("source_"):
+                details["error_side"] = "saas"
+            else:
+                details["error_side"] = "onprem"
+        self.store.event(job_id, "transfer_stage", {
+            "stage": stage or getattr(exc, "_migration_stage", "check_source"),
+            "status": "skipped", "entry_id": entry["id"], "error": exc.code,
+            "http_status": exc.http_status, "retry_enabled": False, **details,
+        })
+
+    def _skip_dependants(self, job_id, entry, exc):
+        for child in self.store.entries(job_id, limit=1000000):
+            if (child["state"] == "planned" and child["source_path"].startswith(
+                entry["source_path"].rstrip("/") + "/"
+            )):
+                self.store.update_entry(child["id"], state="failed", error=exc.code, retry_at_ms=None)
+                self._skip_event(job_id, child, exc)
 
     def _failure(self, job_id, entry, exc):
         self._record_destination_outage(job_id, exc)
@@ -954,8 +1069,13 @@ class MigrationRunner:
             self.store.update_attempt(attempt["id"], phase=phase, error=exc.code)
         self.store.update_entry(entry["id"], state=state, error=exc.code,
                                 retry_at_ms=None)
-        if exc.uncertain or destination_interrupted(exc):
-            self._job_error(job_id, state="needs_attention", error=exc.code)
+        if self.retry_policy(job_id).enabled:
+            if exc.uncertain or destination_interrupted(exc):
+                self._job_error(job_id, state="needs_attention", error=exc.code)
+        elif not exc.auth or file_access_denied(exc, getattr(exc, "_migration_stage", "")):
+            self._skip_event(job_id, entry, exc)
+            if entry["kind"] == "dir":
+                self._skip_dependants(job_id, entry, exc)
 
     def _current(self, entry, source):
         current = source.stat(entry["source_path"])
@@ -1219,7 +1339,7 @@ class MigrationRunner:
 
     def _begin_download(self, entry):
         current = self.store.entry(entry["id"])
-        if current["download_attempts"] >= MAX_DOWNLOAD_ATTEMPTS:
+        if current["download_attempts"] >= self._download_limit(entry["job_id"]):
             raise MigrationError(current.get("error") or "source_stream_interrupted")
         self._checkpoint(entry["job_id"])
         self.store.update_entry(
@@ -1253,12 +1373,13 @@ class MigrationRunner:
             "stage": "download_retry", "entry_id": entry["id"],
             "attempt_id": attempt["id"], "error": exc.code,
             "download_attempts": current["download_attempts"],
-            "max_download_attempts": MAX_DOWNLOAD_ATTEMPTS,
+            "max_download_attempts": self._download_limit(job["id"]),
+            "retry_enabled": self.retry_policy(job["id"]).enabled,
             **exc.diagnostics,
         }
         if exc.http_status is not None:
             payload["http_status"] = exc.http_status
-        if current["download_attempts"] >= MAX_DOWNLOAD_ATTEMPTS:
+        if current["download_attempts"] >= self._download_limit(job["id"]):
             self.store.event(job["id"], "transfer_stage", {
                 **payload, "status": "skipped",
             })
@@ -1270,8 +1391,6 @@ class MigrationRunner:
         delay_ms = min(int(min(delay, (2 ** 63 - 1) // 1000) * 1000),
                        2 ** 63 - 1 - now_ms)
         retry_at = now_ms + delay_ms
-        self.store.update_entry(entry["id"], state="downloading", error=exc.code,
-                                retry_at_ms=retry_at)
         if fresh_attempt:
             previous = attempt
             if not job["remote_root"]:
@@ -1279,13 +1398,16 @@ class MigrationRunner:
             attempt = self.store.new_attempt(entry["id"], attempt["strategy"])
             if job["remote_root"]:
                 self.store.update_attempt(previous["id"], phase="failed", error=exc.code)
-        self.store.update_attempt(attempt["id"], phase="download_retry_wait",
-                                  error=exc.code)
-        self.store.event(job["id"], "transfer_stage", {
-            **payload, "status": "waiting", "retry_delay_ms": delay_ms,
-            "retry_at_ms": retry_at,
-        })
-        return True
+        scheduled = self.store.schedule_download_retry(
+            entry["id"], attempt["id"], retry_at, {**payload, "retry_delay_ms": delay_ms},
+        )
+        if not scheduled:
+            self.store.event(job["id"], "transfer_stage", {
+                **payload, "status": "skipped",
+                "retry_enabled": self.retry_policy(job["id"]).enabled,
+                "max_download_attempts": self._download_limit(job["id"]),
+            })
+        return scheduled
 
     def _stage(self, entry, attempt, source):
         if attempt.get("local_name"):

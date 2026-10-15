@@ -38,6 +38,10 @@ class CredentialsRequest(StrictModel):
     credentials: Credentials
 
 
+class RetryPolicyRequest(StrictModel):
+    enabled: bool = Field(strict=True)
+
+
 class SelectionRequest(StrictModel):
     source_ids: list[str] = Field(min_length=1, max_length=1000)
 
@@ -118,6 +122,13 @@ def plan(request: Request, batch_id: str):
 @router.post("/{batch_id}/start")
 def start(request: Request, batch_id: str):
     return invoke(existing(request, batch_id).start_transfer, batch_id)
+
+
+@router.post("/{batch_id}/retries")
+async def retries(request: Request, batch_id: str):
+    value = existing(request, batch_id)
+    model = await body(request, RetryPolicyRequest)
+    return invoke(value.set_retry_enabled, batch_id, model.enabled)
 
 
 @router.post("/{batch_id}/pause")
