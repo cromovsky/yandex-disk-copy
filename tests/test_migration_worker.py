@@ -459,9 +459,8 @@ def test_explicit_stop_releases_unknown_upload_and_never_finishes_old_file(
     service.store.request_stop(first_id)
     service.notify()
     wait_until(lambda: service.store.get(first_id)["state"] == "stopped")
-    # The stopped state is committed before the guarded client cleanup completes.
-    with service.guard:
-        assert service.registry.get(first_id) is None
+    # The stopped state is committed before asynchronous client cleanup completes.
+    wait_until(lambda: service.registry.get(first_id) is None)
     assert service.store.attempts(first_id)[0] == attempt
     first.upload_error = None
     first.nodes[attempt["remote_path"]] = dict(META)

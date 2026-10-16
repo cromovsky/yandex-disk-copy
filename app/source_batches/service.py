@@ -23,6 +23,7 @@ from app.migration.source import shared_source_folder
 from app.run_journal import CSV_FIELDS, JournalError, Redactor
 from .store import BatchStore, parse_sources
 from app.retry_policy import RetryPolicy
+from app.file_cooldown import FileCooldown
 
 TERMINAL = {"completed", "completed_with_issues", "stopped"}
 OUTAGES = {"destination_unavailable", "destination_timeout", "destination_connection_failed",
@@ -61,6 +62,7 @@ class BatchService:
         self._redactors = {}
         self._active = {}
         self._planning_checks = set()
+        self._file_cooldown = FileCooldown()
         self._rates = {}
         self._rate_lock = threading.Lock()
         self._local_reserved = {}
@@ -982,6 +984,8 @@ class BatchService:
         self._local_path(source["folder"]).mkdir(parents=True, exist_ok=True)
         while entry := self.store.next_entry(source["id"]):
             checkpoint()
+            if self._file_cooldown.after_error(source["id"]):
+                self._wait_local_file_pause(batch, source, entry, checkpoint)
             relative = entry["destination_path"][len(source["folder"]) + 1:]
             stage = "check_source"
             try:
@@ -1008,7 +1012,9 @@ class BatchService:
                         raise MigrationError("destination_conflict")
                 else:
                     stage = "downloading"
+                    self._wait_local_file_pause(batch, source, entry, checkpoint)
                     self._download_local(batch, source, entry, client, target, checkpoint)
+                    self._file_cooldown.mark(source["id"])
             except Interrupted:
                 self.store.update_entry(entry["id"], state="planned")
                 raise
@@ -1027,6 +1033,7 @@ class BatchService:
                                 destination=entry["destination_path"], error=code,
                                 http_status=getattr(exc, "http_status", None), retry_enabled=False,
                                 **details)
+                    self._file_cooldown.mark(source["id"], after_error=True)
             self.store.update_source(source["id"], summary=self.store.summary(source["id"]))
         summary = self.store.summary(source["id"])
         state = "completed_with_issues" if summary["issues"] else "completed"
@@ -1036,6 +1043,15 @@ class BatchService:
             self.journal.finish(source["journal_id"], "done" if not summary["issues"] else "error",
                                 summary={"saved": selected_files - summary["issues"], "failed": summary["issues"],
                                          "skipped": summary["total_files"] - selected_files, "total": summary["total_files"]})
+
+    def _wait_local_file_pause(self, batch, source, entry, checkpoint):
+        delay = self._file_cooldown.remaining(source["id"])
+        if delay > 0:
+            self._event(batch, source, "file_pause", "waiting",
+                        source=entry["source_path"], retry_delay_ms=int(delay * 1000),
+                        message="Пауза между передачами: 20 с. Очередь продолжится автоматически.")
+            self._delay(delay, checkpoint)
+            checkpoint()
 
     def _download_local(self, batch, source, entry, client, target, checkpoint):
         target.parent.mkdir(parents=True, exist_ok=True)

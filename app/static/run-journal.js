@@ -16,6 +16,7 @@
     list_folder: "Чтение папки", metadata: "Сведения о файле", get_download_url: "Получение ссылки скачивания",
     get_upload_url: "Получение ссылки загрузки", file: "Обработка файла", local_write: "Запись на локальный диск", collect_links: "Сбор ссылок",
     check_local: "Проверка локального файла", transfer: "Перенос", retry_policy: "Настройка повторов", retry_settings: "Автоматические повторы",
+    file_pause: "Пауза между передачами",
     poll_operation: "Ожидание операции", save_local: "Локальное сохранение", save_public: "Сохранение по ссылке"};
   const idPattern = /^[A-Za-z0-9._:-]{1,128}$/;
   const storageKey = (mode) => "diskCopyJournalSelection:v1:" + mode;

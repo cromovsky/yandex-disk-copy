@@ -16,3 +16,9 @@ def _reset_limiter():
     set_limiter(None)
     yield
     set_limiter(None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_file_pause(monkeypatch):
+    """Transfer pacing has separate fake-clock tests; other suites never wait 20 s."""
+    monkeypatch.setattr("app.file_cooldown.FILE_PAUSE_SECONDS", 0)

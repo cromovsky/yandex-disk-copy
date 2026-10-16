@@ -17,6 +17,7 @@ STAGE_LABELS = {
     "prepare_upload_directory": "Подготовка папки для загрузки",
     "downloading": "Скачивание в локальный кеш",
     "download_retry": "Повтор скачивания",
+    "file_pause": "Пауза между передачами",
     "point_retry": "Проверка и повтор файла",
     "get_download_url": "Получение ссылки для скачивания",
     "publish_source": "Публикация исходной папки или файла",

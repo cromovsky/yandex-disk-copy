@@ -33,6 +33,7 @@ from requests.adapters import HTTPAdapter, Retry
 from urllib3.exceptions import MaxRetryError
 
 from .retry_policy import RetryPolicy
+from .file_cooldown import FileCooldown
 
 from .throttle import (
     RETRY_STATUSES, ThrottledSession, backoff_delay, get_limiter,
@@ -286,6 +287,7 @@ class DiskCopier:
         # часы инъектируются, чтобы тесты не спали по-настоящему
         self._monotonic = monotonic
         self._sleep = sleep
+        self._file_cooldown = FileCooldown(monotonic=monotonic)
         self.retry_policy = retry_policy or config.retry_policy or RetryPolicy(
             config.retry_enabled, monotonic=monotonic, sleep=sleep,
         )
@@ -499,6 +501,7 @@ class DiskCopier:
         self.fails.append({**record, "error": error})
         if self.retry_policy.enabled:
             return
+        self._file_cooldown.mark(self.cfg.source_disk_id, after_error=True)
         details = self._error_details(exc, side)
         code = getattr(exc, "code", None) or (
             "transport_failed" if isinstance(exc, requests.RequestException) else "transfer_failed"
@@ -512,6 +515,14 @@ class DiskCopier:
                      "message": "Автоматические повторы отключены; ресурс пропущен после ошибки: "
                      + error})
 
+    def _wait_file_pause(self):
+        delay = self._file_cooldown.remaining(self.cfg.source_disk_id)
+        if delay > 0:
+            self._event({"event_type": "stage", "stage": "file_pause", "status": "waiting",
+                         "retry_delay_ms": int(delay * 1000),
+                         "message": "Пауза между передачами: 20 с. Очередь продолжится автоматически."})
+            self._sleep(delay)
+
     def _record_result(self, record):
         if self._file_outcome == "skipped":
             self.skipped.append(record)
@@ -519,6 +530,7 @@ class DiskCopier:
             self.unconfirmed.append(record)
         else:
             self.links.append(record)
+            self._file_cooldown.mark(self.cfg.source_disk_id)
 
     @contextmanager
     def _stage(self, stage, side, **context):
@@ -1181,6 +1193,7 @@ class DiskCopier:
         """Публикует все ресурсы в исходной папке (создаёт публичные ссылки)."""
         self.log(f"make_links | start | path: {self.cfg.path}")
         def publish(item):
+            self._wait_file_pause()
             token = self._source_token()
             try:
                 self._disk_publish_resource(token, item["path"])
@@ -1243,6 +1256,7 @@ class DiskCopier:
             try:
                 with self._stage("file", "destination", source=link.get("path"),
                                  destination=f"{folder}/{link.get('name')}", kind=link.get("type")):
+                    self._wait_file_pause()
                     self._save_one_link(link)
                     self._record_result(link)
             except (CopyError, requests.RequestException) as exc:
@@ -1419,6 +1433,7 @@ class DiskCopier:
             try:
                 with self._stage("file", "destination", source=src_path, destination=dest_vd,
                                  kind="file", size=item.get("size")):
+                    self._wait_file_pause()
                     self._vd_ensure_folder_tree(inner.rsplit("/", 1)[0])
                     stage = "publish"
                     self._disk_publish_resource(token, src_path)
@@ -1630,6 +1645,8 @@ class DiskCopier:
                 dest_dir = None
                 try:
                     with self._stage("create_directory", "local", source=path, kind="dir"):
+                        if self._file_cooldown.after_error(self.cfg.source_disk_id):
+                            self._wait_file_pause()
                         dest_dir = self._local_file_path(path, base)
                         self._context["destination"] = str(dest_dir)
                         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1647,6 +1664,8 @@ class DiskCopier:
         self.log(f"save_local | файлов: {len(files)}")
         for i, item in enumerate(files, 1):
             src_path = item["path"]
+            if self._file_cooldown.after_error(self.cfg.source_disk_id):
+                self._wait_file_pause()
             dest = None
             try:
                 with self._stage("file", "local", source=src_path, kind="file",
@@ -1669,7 +1688,9 @@ class DiskCopier:
                             {"path": src_path, "name": item.get("name"), "dest": str(dest)}
                         )
                     else:
+                        self._wait_file_pause()
                         self._download_to_path(src_path, dest)
+                        self._file_cooldown.mark(self.cfg.source_disk_id)
                         self.links.append(
                             {"path": src_path, "name": item.get("name"), "dest": str(dest)}
                         )

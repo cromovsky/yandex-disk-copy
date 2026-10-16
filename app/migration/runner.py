@@ -20,6 +20,7 @@ from .destination import OnPremDiskDestination, destination_path
 from .diagnostics import diagnostic_fields
 from .errors import MigrationError
 from .source import SaasDiskSource
+from app.file_cooldown import FileCooldown
 from app.retry_policy import RetryPolicy
 
 
@@ -145,6 +146,8 @@ class MigrationRunner:
         self._cache_reservations = {}
         self._outage_lock = threading.Lock()
         self._destination_outages = {}
+        self._file_cooldown = FileCooldown()
+        self._file_pause_logged = set()
         self.shutdown_event = None
         self.default_strategy = None
 
@@ -348,6 +351,8 @@ class MigrationRunner:
     def stop_job(self, job_id):
         self.store.update_job(job_id, state="stopped", resume_state=None,
                               pause_requested=False)
+        self._file_cooldown.clear(job_id)
+        self._file_pause_logged.discard(job_id)
         if self.store.get(job_id).get("full_stop_requested"):
             self.store.cancel_local_entries(job_id)
             self.release_clients(job_id)
@@ -740,6 +745,21 @@ class MigrationRunner:
             return
         if waiting and (waiting.get("retry_at_ms") or 0) > int(time.time() * 1000):
             return
+        candidate = waiting or next((e for e in entries if e["state"] == "planned"), None)
+        if (candidate and self._file_cooldown.remaining(job_id)
+                and (candidate["kind"] == "file" or self._file_cooldown.after_error(job_id))):
+            phase = (self.store.attempt(candidate["attempt_id"])["phase"]
+                     if candidate.get("attempt_id") else None)
+            # Accepted remote work must still be polled and verified during a pause.
+            if point_start or phase in {None, "prepared", "downloading", "staged",
+                                        "download_retry_wait", "failed"}:
+                if job_id not in self._file_pause_logged:
+                    self.store.event(job_id, "transfer_stage", {
+                        "stage": "file_pause", "status": "waiting", "entry_id": candidate["id"],
+                        "retry_delay_ms": round(self._file_cooldown.remaining(job_id) * 1000),
+                    })
+                    self._file_pause_logged.add(job_id)
+                return
         entry = point or waiting
         try:
             if point and point_start:
@@ -766,7 +786,8 @@ class MigrationRunner:
                                       error="technical_namespace_outcome_unknown")
                 return
             if job["config"].get("source_public") and not waiting:
-                self._prepare_publications(job, source)
+                if self._prepare_publications(job, source) is False:
+                    return
             if job["remote_root"] and namespace == "unclaimed":
                 self._checkpoint(job_id)
                 self.store.update_job(job_id, namespace_state="intent")
@@ -1035,6 +1056,8 @@ class MigrationRunner:
                     failure._migration_stage = "publish_source"
                     self._failure(job["id"], self.store.entry(root["entry_id"]), failure)
                     if path is None:
+                        if self._file_cooldown.remaining(job["id"]):
+                            return False
                         continue
                 raise
             if root["state"] != "published":
@@ -1044,6 +1067,8 @@ class MigrationRunner:
             self._publication_checkpoint(job["id"])
 
     def _skip_event(self, job_id, entry, exc, *, stage=None):
+        self._file_cooldown.mark(job_id, after_error=True)
+        self._file_pause_logged.discard(job_id)
         details = dict(exc.diagnostics)
         if "error_side" not in details:
             if exc.code.startswith(("staging_", "invalid_staging_", "cache_")):
@@ -1177,6 +1202,9 @@ class MigrationRunner:
             attempt = self.store.new_attempt(entry["id"], strategy)
             self.store.update_entry(entry["id"], state="transferring", error=None)
         phase = attempt["phase"]
+        transferred = phase in {
+            "waiting_transfer", "waiting_move", "verifying", "verifying_final", "succeeded",
+        }
         if phase == "download_retry_wait":
             self.store.update_entry(entry["id"], retry_at_ms=None)
             self.store.update_attempt(attempt["id"], phase="prepared")
@@ -1239,6 +1267,7 @@ class MigrationRunner:
             phase = "waiting_transfer" if operation else "verifying"
             self.store.update_attempt(attempt["id"], phase=phase,
                                       operation_id=operation)
+            transferred = True
             self.store.update_entry(entry["id"], state="waiting_operation"
                                     if operation else "verifying")
             attempt = self.store.attempt(attempt["id"])
@@ -1337,6 +1366,9 @@ class MigrationRunner:
             self.store.update_attempt(attempt["id"], phase="succeeded", error=None)
             self.store.update_entry(entry["id"], state="done", verification="md5",
                                     error=None, retry_at_ms=None)
+            if transferred:
+                self._file_cooldown.mark(job["id"])
+                self._file_pause_logged.discard(job["id"])
             self._logged(job, entry, "cleanup", self.cleanup, job["id"],
                          successes_only=True, attempt=attempt)
 
