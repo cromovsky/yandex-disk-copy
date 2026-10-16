@@ -30,6 +30,7 @@ class Element {
     };
   }
   addEventListener(name, handler) {(this.listeners[name] ||= []).push(handler);}
+  setAttribute(name, value) {this.attributes[name] = String(value);}
   get disabled() {return this._disabled;}
   set disabled(value) {this._disabled = Boolean(value);}
   get title() {return this.attributes.title || "";}

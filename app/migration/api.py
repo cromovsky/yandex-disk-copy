@@ -138,6 +138,11 @@ class PointRetryRequest(StrictModel):
     revision: int = Field(ge=0, strict=True)
 
 
+class EntrySelectionRequest(StrictModel):
+    selected: bool = Field(strict=True)
+    revision: int = Field(ge=0, strict=True)
+
+
 async def body(request, model):
     try:
         return model.model_validate(await request.json())
@@ -331,9 +336,13 @@ def entries(job_id: str, request: Request, limit: int = 200, offset: int = 0,
             state: str | None = None):
     value = service(request)
     job_of(value, job_id)
-    return {"entries": value.store.describe_entries(job_id, value.store.entries(
+    rows = value.store.describe_entries(job_id, value.store.entries(
         job_id, limit=max(1, min(limit, 1000)), offset=max(0, offset), state=state,
-    ))}
+    ))
+    if job_id in value.excluded_job_ids:
+        for row in rows:
+            row["can_select"] = False
+    return {"entries": rows}
 
 
 @router.get("/jobs/{job_id}/entries/{entry_id}")
@@ -341,7 +350,10 @@ def get_entry(job_id: str, entry_id: str, request: Request):
     value = service(request)
     job_of(value, job_id)
     try:
-        return value.store.describe_entries(job_id, [{"id": entry_id}])[0]
+        entry = value.store.describe_entries(job_id, [{"id": entry_id}])[0]
+        if job_id in value.excluded_job_ids:
+            entry["can_select"] = False
+        return entry
     except KeyError:
         raise HTTPException(404, "entry_not_found") from None
 
@@ -354,13 +366,34 @@ def start(job_id: str, request: Request):
         job = job_of(value, job_id)
         require_live_job(job)
         value.runner.require_staged_job(job)
-        if job["state"] != "ready":
+        if not job["plan_complete"] or job["state"] not in {"ready", "needs_attention"}:
             raise HTTPException(409, "plan_not_ready")
         if not value.registry.get(job_id):
             raise HTTPException(409, "credentials_required")
-        value.store.update_job(job_id, state="running", pause_requested=False)
+        value.runner.validate_selection(job_id)
+        value.store.freeze_selection(job_id)
+        value.store.revalidate_verified_files(job_id)
+        value.store.update_job(job_id, state="running", pause_requested=False,
+                               error=None)
     value.notify()
     return value.store.get(job_id)
+
+
+@router.post("/jobs/{job_id}/entries/{entry_id}/selection")
+async def entry_selection(job_id: str, entry_id: str, request: Request):
+    model = await body(request, EntrySelectionRequest)
+    require_batch_active(request, job_id)
+    value = service(request)
+    if job_id in value.excluded_job_ids:
+        raise HTTPException(409, "selection_not_allowed")
+    with guarded(value, job_id):
+        job_of(value, job_id)
+        try:
+            return value.store.set_entry_selection(
+                job_id, entry_id, model.selected, model.revision,
+            )
+        except KeyError:
+            raise HTTPException(404, "entry_not_found") from None
 
 
 @router.post("/jobs/{job_id}/retries")
@@ -471,7 +504,10 @@ def resume(job_id: str, request: Request):
         if job.get("namespace_state") in {"intent", "unknown"}:
             raise HTTPException(409, "technical_namespace_outcome_unknown")
         target = job.get("resume_state")
-        if job["point_retry_active"]:
+        prestart = value.store.is_prestart_plan(job_id)
+        if prestart:
+            target = target or job["state"]
+        elif job["point_retry_active"]:
             target = "running"
         elif target in {"queued", "planning"}:
             target = "queued"
@@ -482,7 +518,8 @@ def resume(job_id: str, request: Request):
         else:
             target = "running"
         value.store.update_job(job_id, state=target, resume_state=None,
-                               pause_requested=False, error=None)
+                               pause_requested=False,
+                               error=job["error"] if prestart else None)
     batches = getattr(request.app.state, "source_batches", None)
     if batches is not None:
         batches.activate_child_retry(job_id)
@@ -673,7 +710,7 @@ def report(job_id: str, request: Request):
     writer.writerow(["source", "destination", "kind", "size", "md5", "modified",
                      "strategy", "state", "verification", "error", "remote_path",
                      "remote_phase", "download_attempts", "retry_at_ms",
-                     "point_retry_attempts", "max_point_retry_attempts"])
+                     "point_retry_attempts", "max_point_retry_attempts", "selected"])
     for entry in value.store.entries(job_id, limit=1000000):
         attempt = (value.store.attempt(entry["attempt_id"])
                    if entry.get("attempt_id") else {})
@@ -689,6 +726,7 @@ def report(job_id: str, request: Request):
             entry.get("download_attempts", 0), entry.get("retry_at_ms"),
             entry.get("point_retry_attempts", 0),
             3 if job["config"].get("retry_enabled", True) else 1,
+            entry["selected"],
         )])
     return Response("\ufeff" + output.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition":

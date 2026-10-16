@@ -41,6 +41,8 @@ class Element {
   async dispatch(name) {
     for (const handler of this.listeners[name] || []) await handler({ target: this });
   }
+  get textContent() { return (this._text || "") + this.children.map((node) => node.textContent).join(""); }
+  set textContent(value) { this._text = String(value); this.children = []; }
   get title() { return this.attributes.title || ""; }
   set title(value) { this.attributes.title = String(value); }
   appendChild(node) { this.children.push(node); node.parent = this; return node; }

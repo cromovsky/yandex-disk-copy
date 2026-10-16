@@ -1675,7 +1675,9 @@ def test_quota_accounts_for_full_plan_and_largest_technical_copy(unplanned_migra
     }
     runner.step(job_id)
     assert store.get(job_id)["error"] == "destination_space_insufficient"
-    assert store.entries(job_id) == []
+    assert store.get(job_id)["plan_complete"] is True
+    assert store.get(job_id)["selection"]["editable"] is True
+    assert len(store.entries(job_id)) == 3
     assert dst.nodes == {}
 
 

@@ -127,7 +127,13 @@ class MigrationService:
         pending_final = (self.runner.final_pending(job["id"])
                          if job["state"] == "stopped" or job.get("full_stop_requested")
                          else [])
-        return {**job, "blocked_by": blocker,
+        selection = dict(job["selection"])
+        can_start_transfer = job["can_start_transfer"]
+        if job["id"] in self.excluded_job_ids:
+            selection["editable"] = False
+            can_start_transfer = False
+        return {**job, "selection": selection,
+                "can_start_transfer": can_start_transfer, "blocked_by": blocker,
                 "transfer_rates": self.runner.transfer_rates(job["id"]),
                 "stop_blocked": False,
                 "remote_pending": bool(pending_final),

@@ -14,6 +14,7 @@ import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 
 from app.migration.errors import MigrationError
@@ -173,12 +174,22 @@ class BatchService:
                             self.onprem.runner.release_clients(job["id"])
                             self.onprem.registry.put(job["id"], job["config"], credentials)
                             if job["state"] == "awaiting_credentials":
-                                self.onprem.store.update_job(job["id"], state="paused" if job["resume_state"] in {"running", "paused"} else job["resume_state"] or "ready", error=None)
+                                state = "paused" if job["resume_state"] in {"running", "paused"} else job["resume_state"] or "ready"
+                                error = job["error"] if state == "needs_attention" else None
+                                self.onprem.store.update_job(job["id"], state=state, error=error)
             if batch["state"] == "awaiting_credentials":
                 resume = batch["resume_state"] or "draft"
                 # Reattachment never starts work without the user's action.
                 state = "ready" if resume == "ready" else "paused" if resume in {"running", "paused", "planning"} else "draft"
                 self.store.update(batch_id, state=state, error=None)
+            current = self.store.get(batch_id)
+            if current["mode"] == "onprem" and not current["started"] and current["state"] in {"ready", "needs_attention"}:
+                sources = self.store.sources(batch_id)
+                with ExitStack() as child_guards:
+                    for source in sources:
+                        if source["child_job_id"]:
+                            child_guards.enter_context(self.onprem.job_guard(source["child_job_id"]))
+                    self._restore_unstarted_children(current, sources)
             self.notify()
             return self.detail(batch_id)
 
@@ -340,9 +351,10 @@ class BatchService:
                 "COALESCE(SUM(CASE WHEN kind='file' AND state NOT IN ('done','already_verified') THEN size ELSE 0 END),0),"
                 "COALESCE(MAX(CASE WHEN kind='file' AND state NOT IN ('done','already_verified') THEN size ELSE 0 END),0),"
                 "COALESCE(SUM(CASE WHEN state IN ('conflict','verification_unavailable','failed','outcome_unknown') THEN 1 ELSE 0 END),0) "
-                "FROM entries WHERE job_id=?", (child_id,),
+                "FROM entries WHERE job_id=? AND selected=1", (child_id,),
             ).fetchone()
-        summary.update(largest_file=row[0], required_bytes=row[1], largest_required_file=row[2], issues=row[3])
+        summary.update(largest_file=row[0], required_bytes=row[1], largest_required_file=row[2],
+                       issues=row[3], selection=job["selection"])
         return summary
 
     def _new_local_journal(self, batch, source):
@@ -436,8 +448,11 @@ class BatchService:
             code = self._exception(batch, source, "planning", exc)
             with self.guard:
                 stopped = self.store.get(batch["id"])["state"] == "stopped"
+                complete = bool(source["child_job_id"] and not stopped
+                                and self.onprem.store.get(source["child_job_id"])["plan_complete"])
+                fields = {"summary": self._summary_child(source["child_job_id"])} if complete else {}
                 self.store.update_source(source_id, state="stopped" if stopped else "error",
-                                         error=None if stopped else code, plan_complete=False)
+                                         error=None if stopped else code, plan_complete=complete, **fields)
             if batch["mode"] == "local":
                 self._finish_local_journal(source, "error", code)
             if source["child_job_id"] and not stopped:
@@ -498,6 +513,44 @@ class BatchService:
         self._finish_planning(batch_id)
         return self.detail(batch_id)
 
+    def _entry_selection_editable(self, batch, source):
+        resumable = batch["state"] == "awaiting_credentials" and batch["resume_state"] in {"ready", "needs_attention"}
+        return bool(not batch["started"] and (batch["state"] in {"ready", "needs_attention"} or resumable)
+                    and source["plan_complete"] and source["state"] in {"ready", "error"}
+                    and source.get("error") in {None, "plan_conflicts", "destination_space_insufficient"}
+                    and source["id"] not in self._active and batch["id"] not in self._planning_checks)
+
+    def entry_selection(self, batch_id, source_id, entry_id, selected):
+        with self.guard:
+            batch, source = self.store.get(batch_id), self.store.source(source_id)
+            self._require_staged(batch, check_children=True)
+            if source["batch_id"] != batch_id:
+                raise KeyError("source_not_found")
+            if not self._entry_selection_editable(batch, source):
+                raise ValueError("selection_not_allowed")
+            if source["child_job_id"]:
+                with self.onprem.job_guard(source["child_job_id"]):
+                    child = self.onprem.store.get(source["child_job_id"])
+                    self.onprem.store.set_entry_selection(child["id"], entry_id, selected, child["revision"])
+                    summary = self._summary_child(child["id"])
+            else:
+                self.store.set_entry_selection(source_id, entry_id, selected)
+                summary = self.store.summary(source_id)
+            self.store.update_source(source_id, summary=summary,
+                                     state="error" if summary["issues"] else "ready",
+                                     error="plan_conflicts" if summary["issues"] else None)
+            # Invalidate destination checks that captured the previous selection.
+            awaiting_credentials = batch["state"] == "awaiting_credentials" or (
+                batch["mode"] == "onprem" and batch_id not in self._credentials
+            )
+            if awaiting_credentials:
+                self.store.update(batch_id, state="awaiting_credentials", resume_state="ready", error="credentials_required")
+            else:
+                self.store.update(batch_id, state="planning", error=None, resume_state="planning")
+        if not awaiting_credentials:
+            self._finish_planning(batch_id)
+        return self.detail(batch_id)
+
     def _aggregate(self, sources):
         selected = [s for s in sources if s["selected"]]
         summary = {k: sum(s["summary"].get(k, 0) for s in selected) for k in ("total_files", "total_directories", "total_bytes", "required_bytes", "verified_bytes")}
@@ -510,7 +563,8 @@ class BatchService:
         self._require_staged(batch, check_children=True)
         if checkpoint:
             checkpoint()
-        selected = [s for s in sources if s["selected"]]
+        included = [s for s in sources if s["selected"]]
+        selected = [s for s in included if not s["plan_complete"] or s["summary"]["selection"]["selected"]]
         folders = []
         for source in selected:
             if not source["folder"]:
@@ -521,8 +575,12 @@ class BatchService:
             if normalized in folders:
                 return "target_folder_collision"
             folders.append(normalized)
-        if any(not s["plan_complete"] or s["state"] not in {"ready", "completed"} for s in selected):
+        if any(not s["plan_complete"] or s["state"] not in {"ready", "completed"} for s in included):
             return "plan_incomplete"
+        if any(s["summary"]["issues"] for s in selected):
+            return "plan_conflicts"
+        if not selected:
+            return None
         required = self._aggregate(selected)["required_bytes"]
         if batch["mode"] == "local":
             if shutil.disk_usage(self.local_root).free < required:
@@ -567,7 +625,7 @@ class BatchService:
             batch = self.store.get(batch_id)
             if batch["state"] not in {"planning", "draft", "ready", "needs_attention"} or batch_id in self._planning_checks:
                 return
-            sources = self.store.sources(batch_id)
+            sources = self.detail(batch_id)["sources"]
             selected = [s for s in sources if s["selected"]]
             if not selected or any(s["state"] in {"pending", "planning"} for s in selected):
                 return
@@ -595,29 +653,92 @@ class BatchService:
                 self._planning_checks.discard(batch_id)
             self.notify()
 
+    def _restore_unstarted_children(self, batch, sources):
+        if batch["mode"] != "onprem" or batch["started"]:
+            return
+        repairs = []
+        for source in sources:
+            if not source["child_job_id"]:
+                continue
+            job = self.onprem.store.get(source["child_job_id"])
+            if (source["state"] not in {"running", "paused", "completed"}
+                    and job["state"] not in {"running", "paused", "completed"}):
+                continue
+            # Managed children cannot dispatch before the parent commits started.
+            # Require stored evidence too, so actual work is never rewound.
+            if (not source["plan_complete"] or not job["plan_complete"]
+                    or job["stop_requested"] or job["full_stop_requested"]
+                    or job["state"] not in {"ready", "needs_attention", "running", "paused", "completed"}):
+                raise ValueError("selection_not_allowed")
+            with self.onprem.store._connection() as db:
+                attempts = db.execute("SELECT 1 FROM attempts a JOIN entries e ON e.id=a.entry_id "
+                                      "WHERE e.job_id=? LIMIT 1", (job["id"],)).fetchone()
+                executed = db.execute("SELECT 1 FROM entries WHERE job_id=? AND state NOT IN "
+                                      "('planned','already_verified','conflict','verification_unavailable','skipped_by_user') "
+                                      "LIMIT 1", (job["id"],)).fetchone()
+                publications = db.execute("SELECT 1 FROM publications WHERE job_id=? AND state!='planned' LIMIT 1",
+                                          (job["id"],)).fetchone()
+            if attempts or executed or publications:
+                raise ValueError("selection_not_allowed")
+            summary = self._summary_child(job["id"])
+            error = "plan_conflicts" if summary["issues"] else (
+                "destination_space_insufficient" if job["error"] == "destination_space_insufficient" else None
+            )
+            repairs.append((source, job, summary, error))
+        for source, job, summary, error in repairs:
+            self.onprem.store.update_job(job["id"], state="needs_attention" if error else "ready",
+                                         pause_requested=False, resume_state=None, error=error)
+            self.store.update_source(source["id"], state="error" if summary["issues"] else "ready",
+                                     error="plan_conflicts" if summary["issues"] else None, summary=summary)
+
     def start_transfer(self, batch_id):
-        with self.guard:
+        with self.guard, ExitStack() as child_guards:
             batch = self.store.get(batch_id)
             self._require_staged(batch, check_children=True)
+            sources = self.detail(batch_id)["sources"]
+            if (all(s["plan_complete"] for s in sources if s["selected"])
+                    and not any(s["selected"] and s["summary"]["selection"]["selected"] for s in sources)):
+                raise ValueError("empty_selection")
             if batch["state"] != "ready":
                 raise ValueError("dry_run_required")
             self._credentials_for(batch_id)
-            sources = self.store.sources(batch_id)
+            for source in sources:
+                if source["child_job_id"]:
+                    child_guards.enter_context(self.onprem.job_guard(source["child_job_id"]))
+            self._restore_unstarted_children(batch, sources)
+            sources = self.detail(batch_id)["sources"]
+            for source in sources:
+                if source["selected"] and source["child_job_id"]:
+                    self.onprem.store.validate_selection(source["child_job_id"], allow_empty=True)
             error = self._group_check(batch, sources)
             if error:
                 self.store.update(batch_id, state="needs_attention", error=error)
                 raise ValueError(error)
-            for source in sources:
-                if source["selected"]:
-                    self.store.update_source(source["id"], state="running")
-                    if batch["mode"] == "local":
-                        self.store.revalidate_verified_files(source["id"])
+            if batch["mode"] == "local":
+                self.store.start_local_transfer(batch_id)
+                for source in sources:
+                    if source["selected"] and source["summary"]["selection"]["selected"]:
                         self._new_local_journal(batch, source)
-                    if source["child_job_id"]:
-                        with self.onprem.job_guard(source["child_job_id"]):
+            else:
+                try:
+                    for source in sources:
+                        if source["selected"]:
+                            if not source["summary"]["selection"]["selected"]:
+                                self.onprem.store.freeze_selection(source["child_job_id"], allow_empty=True)
+                                self.onprem.store.update_job(source["child_job_id"], state="completed", error=None)
+                                self.store.update_source(source["id"], state="completed", error=None)
+                                continue
+                            self.store.update_source(source["id"], state="running")
+                            self.onprem.store.freeze_selection(source["child_job_id"])
                             self.onprem.store.revalidate_verified_files(source["child_job_id"])
                             self.onprem.store.update_job(source["child_job_id"], state="running", pause_requested=False, error=None)
-            self.store.update(batch_id, state="running", phase="transfer", started=True, error=None, resume_state="running")
+                    self.store.update(batch_id, state="running", phase="transfer", started=True, error=None, resume_state="running")
+                except Exception:
+                    try:
+                        self._restore_unstarted_children(self.store.get(batch_id), self.store.sources(batch_id))
+                    except Exception:
+                        pass  # Preserve the admission error if storage is still unavailable.
+                    raise
             self.notify()
             return self.detail(batch_id)
 
@@ -911,8 +1032,10 @@ class BatchService:
         state = "completed_with_issues" if summary["issues"] else "completed"
         self.store.update_source(source["id"], state=state, summary=summary)
         if self.journal and source["journal_id"]:
+            selected_files = summary["selection"]["selected_files"]
             self.journal.finish(source["journal_id"], "done" if not summary["issues"] else "error",
-                                summary={"saved": summary["total_files"] - summary["issues"], "failed": summary["issues"], "total": summary["total_files"]})
+                                summary={"saved": selected_files - summary["issues"], "failed": summary["issues"],
+                                         "skipped": summary["total_files"] - selected_files, "total": summary["total_files"]})
 
     def _download_local(self, batch, source, entry, client, target, checkpoint):
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,7 +1136,16 @@ class BatchService:
                 source["summary"] = self.store.summary(source["id"])
                 with self._rate_lock:
                     source["transfer_rates"] = {"download_bytes_per_second": self._rates.get(source["id"]), "upload_bytes_per_second": None}
+            selection = source["summary"]["selection"]
+            selection["editable"] = self._entry_selection_editable(batch, source) and (
+                selection["editable"] if source["child_job_id"] else True
+            )
         batch["summary"] = self._aggregate(sources)
+        batch["selection"] = {"total": sum(s["summary"]["selection"]["total"] for s in sources),
+                              "editable": any(s["summary"]["selection"]["editable"] for s in sources)}
+        for key in ("selected", "selected_files", "selected_directories", "selected_bytes"):
+            batch["selection"][key] = sum(s["summary"]["selection"][key] for s in sources if s["selected"])
+        batch["selection"]["excluded"] = batch["selection"]["total"] - batch["selection"]["selected"]
         batch["credentials_available"] = batch_id in self._credentials
         batch["stop_pending"] = batch["state"] == "stopped" and (
             batch_id in self._planning_checks or any(
@@ -1025,11 +1157,17 @@ class BatchService:
 
     def entries(self, source_id, limit=100, offset=0):
         source = self.store.source(source_id)
+        batch = self.store.get(source["batch_id"])
+        editable = self._entry_selection_editable(batch, source)
         if source["child_job_id"]:
             entries = self.onprem.store.entries(source["child_job_id"], limit=limit, offset=offset)
             summary = self._summary_child(source["child_job_id"])
-            return {"entries": entries, "total": summary["total_files"] + summary["total_directories"]}
-        return self.store.entries(source_id, limit, offset)
+            result = {"entries": entries, "total": summary["total_files"] + summary["total_directories"]}
+        else:
+            result = self.store.entries(source_id, limit, offset)
+        for entry in result["entries"]:
+            entry["can_select"] = editable and entry.get("can_select", True)
+        return result
 
     @staticmethod
     def _csv_value(value):
@@ -1044,7 +1182,7 @@ class BatchService:
                          "remote_status", "error_message", "diagnostic_message", "download_attempts",
                          "max_download_attempts", "point_retry_attempts", "max_point_retry_attempts", "retry_at_ms"]
         report_fields = ["source_state", "plan_complete", "total_files", "total_directories", "total_bytes",
-                         "required_bytes", "verified_bytes", "state", "error", "source_path", "destination_path", "kind", "size", "md5"]
+                         "required_bytes", "verified_bytes", "state", "error", "source_path", "destination_path", "kind", "size", "md5", "selected"]
         fields = ["source_id", "type", "email", "vd_hash"] + (CSV_FIELDS + extra_journal if journal else report_fields)
         writer = csv.DictWriter(output, fields, extrasaction="ignore")
         writer.writeheader()

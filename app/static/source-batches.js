@@ -8,6 +8,7 @@
     transfer: "Перенос", running: "Перенос выполняется", paused: "Приостановлено",
     awaiting_credentials: "Введите доступы заново", completed: "Завершено",
     completed_with_issues: "Завершено с ошибками", stopped: "Остановлено", error: "Ошибка",
+    skipped_by_user: "Пропущен пользователем",
     planned: "В плане", verified: "Проверено", done: "Перенесено", saved: "Сохранено",
     skipped: "Пропущено", already_present_verified: "Уже есть, MD5 совпадает", already_verified: "Уже есть, MD5 совпадает",
     conflict: "Конфликт содержимого", destination_conflict: "Конфликт содержимого",
@@ -24,6 +25,9 @@
     batch_not_paused: "Список сейчас не приостановлен. Обновите его состояние.",
     batch_stopped: "Список окончательно остановлен. Нажмите «Начать заново».",
     batch_cannot_replan: "После начала переноса состав списка зафиксирован. Для нового плана используйте общий Dry Run.",
+    selection_not_allowed: "Выбор файлов доступен до начала переноса, после полного Dry Run.",
+    empty_selection: "Выберите хотя бы один файл или папку для переноса.",
+    stale_revision: "План изменился. Выбор обновлён из сохранённого плана; повторите действие.",
     selection_locked: "Состав выполнявшегося списка зафиксирован. Для других источников создайте новый Dry Run.",
     invalid_source_selection: "Выберите хотя бы один источник. После ошибки выбор восстановлен из сохранённого плана.",
     source_busy: "Источник ещё завершает действие. Обновите состояние и повторите позже.",
@@ -110,7 +114,7 @@
     constructor(mode) {
       this.mode = mode; this.batch = null; this.sources = []; this.history = [];
       this.busy = false; this.offset = 0; this.hasMore = false; this.timer = null;
-      this.revision = 0; this.pendingCreate = null; this.plannedCsv = ""; this.entrySource = null; this.entryOffset = 0;
+      this.revision = 0; this.pendingCreate = null; this.plannedCsv = ""; this.entrySource = null; this.entryOffset = 0; this.entryChecks = []; this.entryEntries = [];
       this.choice = get(mode + "-source-input");
       if (!this.choice) return;
       this.choice.addEventListener("change", () => this.toggle());
@@ -271,7 +275,7 @@
       const csvMatches = this.node("csv").value === this.plannedCsv;
       const ready = selected.length > 0 && selected.every((source) => source.plan_complete && ["ready", "completed"].includes(source.state));
       this.node("plan").disabled = locked || (!legacy && activeStates.has(batch?.state)) || !this.valid() || !this.node("csv").value.trim();
-      this.node("start").disabled = locked || legacy || !batch || batch.state !== "ready" || !ready || !csvMatches || !this.matches() || !this.valid();
+      this.node("start").disabled = locked || legacy || !batch || batch.state !== "ready" || !ready || !csvMatches || !this.matches() || !this.valid() || Number(batch?.selection?.selected) === 0;
       this.node("pause").disabled = locked || legacy || !batch || !activeStates.has(batch.state);
       this.node("resume").disabled = locked || legacy || !batch || !["paused", "awaiting_credentials"].includes(batch.state) || !csvMatches || !this.matches() || !this.valid();
       this.node("stop").disabled = locked || !batch || ["stopped", "completed"].includes(batch.state);
@@ -281,6 +285,7 @@
       this.node("history").disabled = locked;
       this.node("history-previous").disabled = locked || this.offset === 0;
       this.node("history-next").disabled = locked || !this.hasMore;
+      this.entryChecks.forEach(({check, entry, sourceId}) => { check.disabled = !this.entrySelectionAvailable(sourceId, entry); });
       this.sources.forEach((source) => {
         if (source._checkbox) source._checkbox.disabled = locked || legacy || !batch || batch.started || !csvMatches || activeStates.has(batch.state) || terminalStates.has(batch.state);
         if (source._plan) source._plan.disabled = locked || legacy || !this.matches() || !this.valid() || !batch || batch.started || !csvMatches || activeStates.has(batch.state) || terminalStates.has(batch.state);
@@ -348,6 +353,31 @@
       try { this.requireStaged(); this.accept(await this.request(this.path("selection"), {method: "PUT", body: {source_ids: ids}})); }
       catch (error) { if (source._checkbox) source._checkbox.checked = Boolean(source.selected); throw error; }
     }
+    entrySelectionAvailable(sourceId, entry) {
+      const source = this.sources.find((item) => item.id === sourceId);
+      return !this.busy && this.enabled() && this.authorized() && this.listMode() && !this.legacy() &&
+        this.entrySource === sourceId && this.entryEntries.includes(entry) &&
+        this.node("csv").value === this.plannedCsv && this.matches() &&
+        source?.summary?.selection?.editable === true && entry.can_select === true;
+    }
+    async selectEntry(sourceId, entry, checked, check) {
+      const batchId = this.batch.id, revision = this.revision;
+      const current = () => this.batch?.id === batchId && this.entrySource === sourceId && this.revision === revision;
+      try {
+        const detail = await this.request(this.path(`sources/${encodeURIComponent(sourceId)}/entries/${encodeURIComponent(entry.id)}/selection`), {
+          method: "POST", body: {selected: checked},
+        });
+        if (!current()) return;
+        if (detail?.batch?.id !== batchId) throw failure("invalid_response");
+        this.accept(detail);
+        await this.loadEntries(sourceId, this.entryOffset);
+      } catch (error) {
+        if (!current()) return;
+        check.checked = entry.selected !== false; check.indeterminate = entry.selection_partial === true;
+        try { await this.refresh(); } catch (_) {}
+        if (current()) throw error;
+      }
+    }
     async replan(source) {
       await this.attach();
       this.accept(await this.request(this.path(`sources/${encodeURIComponent(source.id)}/plan`), {method: "POST", body: {}}));
@@ -387,6 +417,9 @@
     }
     render() {
       const batch = this.batch, summary = batch.summary || {};
+      const selection = this.batch.selection;
+      this.node("entries-selection").textContent = selection
+        ? `Выбрано: ${selection.selected} · исключено: ${selection.excluded} · объём: ${bytes(selection.selected_bytes)} (в списке)` : "";
       this.node("result").hidden = false;
       this.node("date").textContent = date(batch.created_at);
       this.node("state").textContent = batch.state === "stopped" && batch.stop_pending ? "Остановка выполняется · новый Dry Run доступен"
@@ -432,16 +465,36 @@
       const result = await this.request(this.path(`sources/${encodeURIComponent(sourceId)}/entries?limit=100&offset=${offset}`));
       if (revision !== this.revision || this.batch?.id !== batchId) return;
       if (!Array.isArray(result?.entries)) throw failure("invalid_response");
-      this.entrySource = sourceId; this.entryOffset = offset;
+      this.entrySource = sourceId; this.entryOffset = offset; this.entryEntries = result.entries;
       this.node("details").hidden = false;
       const source = this.sources.find((item) => item.id === sourceId);
       this.node("details-name").textContent = `${source?.email || ""}${source?.vd_hash ? " [" + source.vd_hash + "]" : ""}`;
-      const body = this.node("entries"); body.replaceChildren();
+      const body = this.node("entries"); body.replaceChildren(); this.entryChecks = [];
       result.entries.forEach((entry) => {
         const row = document.createElement("tr");
         const labels = ["Источник", "Назначение", "Размер", "Результат"];
-        [entry.source_path, entry.destination_path || entry.relative_path, bytes(entry.size), humanState(entry.state) + (entry.error ? ": " + this.errorText(entry.error) : "")].forEach((value, index) => {
-          const cell = document.createElement("td"); cell.setAttribute("data-label", labels[index]); cell.textContent = String(value ?? "—"); row.appendChild(cell);
+        const excluded = entry.selected === false || entry.state === "skipped_by_user";
+        const state = entry.state === "skipped_by_user" ? humanState(entry.state)
+          : excluded ? "Исключено из переноса" : humanState(entry.state) + (entry.error ? ": " + this.errorText(entry.error) : "");
+        [entry.source_path, entry.destination_path || entry.relative_path, entry.kind === "dir" || entry.kind === "directory" ? "Каталог" : bytes(entry.size), state].forEach((value, index) => {
+          const cell = document.createElement("td"); cell.setAttribute("data-label", labels[index]); cell.textContent = String(value ?? "—");
+          if (index === 0) {
+            const label = document.createElement("label"); label.className = "entry-choice";
+            const check = document.createElement("input"); check.type = "checkbox";
+            check.checked = entry.selected !== false; check.indeterminate = entry.selection_partial === true;
+            check.setAttribute("aria-label", `Включить в перенос: ${entry.source_path}`);
+            check.disabled = !this.entrySelectionAvailable(sourceId, entry);
+            check.addEventListener("change", () => {
+              if (!this.entrySelectionAvailable(sourceId, entry)) {
+                check.checked = entry.selected !== false; check.indeterminate = entry.selection_partial === true; return;
+              }
+              return this.action(() => this.selectEntry(sourceId, entry, check.checked, check));
+            });
+            const path = document.createElement("span"); path.textContent = String(value ?? "—");
+            label.appendChild(check); label.appendChild(path); cell.replaceChildren(label);
+            this.entryChecks.push({check, entry, sourceId});
+          }
+          row.appendChild(cell);
         }); body.appendChild(row);
       });
       this.node("entries-page").textContent = `Страница ${Math.floor(offset / 100) + 1} · объектов: ${result.total ?? result.entries.length}`;

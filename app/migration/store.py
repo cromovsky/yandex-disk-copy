@@ -47,6 +47,7 @@ _EVENT_KEYS = DIAGNOSTIC_KEYS | frozenset({
     "download_attempts", "max_download_attempts", "retry_delay_ms", "retry_at_ms",
     "point_retry_requested", "point_retry_attempts", "max_point_retry_attempts",
     "operation_reference_issue", "retry_enabled",
+    "selected", "plan_complete", "selection_frozen",
 })
 
 
@@ -72,6 +73,15 @@ def _code(value):
 
 def _json(value):
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _parent_paths(path):
+    parent = path.rsplit("/", 1)[0]
+    while parent.startswith("disk:/"):
+        yield parent
+        parent = parent.rsplit("/", 1)[0]
+    if parent == "disk:" and path != "disk:/":
+        yield "disk:/"
 
 
 def canonical_config(config):
@@ -184,7 +194,7 @@ class MigrationStore:
         self._closed = False
         with self._connection() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, 3, 4, 5, 6, 7, 8}:
+            if version not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}:
                 raise ValueError("unsupported_store_version")
             connection.execute("PRAGMA journal_mode=WAL")
             # Rebuild attempts while keeping entries.attempt_id references unchanged.
@@ -202,6 +212,8 @@ class MigrationStore:
                     restart_of TEXT REFERENCES jobs(id),
                     resume_state TEXT, remote_root TEXT NOT NULL,
                     namespace_state TEXT NOT NULL DEFAULT 'unclaimed',
+                    plan_complete INTEGER NOT NULL DEFAULT 0 CHECK(plan_complete IN (0,1)),
+                    selection_frozen INTEGER NOT NULL DEFAULT 0 CHECK(selection_frozen IN (0,1)),
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS entries (
@@ -219,6 +231,7 @@ class MigrationStore:
                         CHECK(point_retry_requested IN (0,1)),
                     point_retry_attempts INTEGER NOT NULL DEFAULT 0
                         CHECK(point_retry_attempts BETWEEN 0 AND 3),
+                    selected INTEGER NOT NULL DEFAULT 1 CHECK(selected IN (0,1)),
                     UNIQUE(job_id, destination_path)
                 );
                 CREATE TABLE IF NOT EXISTS attempts (
@@ -271,6 +284,17 @@ class MigrationStore:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN restart_of TEXT REFERENCES jobs(id)",
                 )
+            for name in ("plan_complete", "selection_frozen"):
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE jobs ADD COLUMN {name} INTEGER "
+                        f"NOT NULL DEFAULT 0 CHECK({name} IN (0,1))",
+                    )
+            if version < 9:
+                connection.execute(
+                    "UPDATE jobs SET plan_complete=1 WHERE state='ready' "
+                    "OR (state='awaiting_credentials' AND resume_state='ready')",
+                )
             entry_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(entries)")
             }
@@ -291,6 +315,14 @@ class MigrationStore:
                     "ALTER TABLE entries ADD COLUMN point_retry_attempts INTEGER "
                     "NOT NULL DEFAULT 0 CHECK(point_retry_attempts BETWEEN 0 AND 3)",
                 )
+            if "selected" not in entry_columns:
+                connection.execute(
+                    "ALTER TABLE entries ADD COLUMN selected INTEGER "
+                    "NOT NULL DEFAULT 1 CHECK(selected IN (0,1))",
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS entries_selection ON entries(job_id,selected)",
+            )
             if version < 7:
                 connection.execute("""
                     CREATE TABLE attempts_v7 (
@@ -312,8 +344,8 @@ class MigrationStore:
                 connection.execute("ALTER TABLE attempts_v7 RENAME TO attempts")
                 if connection.execute("PRAGMA foreign_key_check").fetchone():
                     raise sqlite3.IntegrityError("migration_foreign_key_check_failed")
-            if version < 8:
-                connection.execute("PRAGMA user_version=8")
+            if version < 9:
+                connection.execute("PRAGMA user_version=9")
         os.chmod(self.path, 0o600)
 
     @contextmanager
@@ -349,7 +381,74 @@ class MigrationStore:
         value = dict(row)
         if table == "entries":
             value["point_retry_requested"] = bool(value["point_retry_requested"])
+            value["selected"] = bool(value["selected"])
         return value
+
+    @staticmethod
+    def _selection_prestart(connection, job):
+        state = (job["resume_state"] if job["state"] == "awaiting_credentials"
+                 else job["state"])
+        return bool(
+            job["plan_complete"]
+            and not job["stop_requested"] and state in {"ready", "needs_attention"}
+            and (state == "ready" or job["error"] in {
+                "plan_conflicts", "destination_space_insufficient",
+            })
+            and not connection.execute(
+                "SELECT 1 FROM attempts a JOIN entries e ON e.id=a.entry_id "
+                "WHERE e.job_id=? LIMIT 1", (job["id"],),
+            ).fetchone()
+            and not connection.execute(
+                "SELECT 1 FROM entries WHERE job_id=? AND state NOT IN "
+                "('planned','already_verified','conflict','verification_unavailable',"
+                "'skipped_by_user') LIMIT 1", (job["id"],),
+            ).fetchone()
+        )
+
+    @staticmethod
+    def _selection_editable(connection, job):
+        return bool(not job["selection_frozen"]
+                    and MigrationStore._selection_prestart(connection, job))
+
+    @staticmethod
+    def _selection(connection, job):
+        row = connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(selected),0),"
+            "COALESCE(SUM(CASE WHEN selected=1 AND kind='file' THEN 1 ELSE 0 END),0),"
+            "COALESCE(SUM(CASE WHEN selected=1 AND kind='dir' THEN 1 ELSE 0 END),0),"
+            "COALESCE(SUM(CASE WHEN selected=1 AND kind='file' THEN size ELSE 0 END),0) "
+            "FROM entries WHERE job_id=?", (job["id"],),
+        ).fetchone()
+        return {
+            "total": row[0], "selected": row[1], "excluded": row[0] - row[1],
+            "selected_files": row[2], "selected_directories": row[3],
+            "selected_bytes": row[4],
+            "editable": MigrationStore._selection_editable(connection, job),
+        }
+
+    @staticmethod
+    def _selection_parents(connection, job_id):
+        parents = set()
+        for row in connection.execute(
+            "SELECT source_path FROM entries WHERE job_id=? AND selected=0", (job_id,),
+        ):
+            parents.update(_parent_paths(row[0]))
+        return parents
+
+    @staticmethod
+    def _describe_selection(connection, entry, job, *, editable=None, partial=None):
+        entry = dict(entry)
+        entry["selected"] = bool(entry["selected"])
+        entry["point_retry_requested"] = bool(entry["point_retry_requested"])
+        entry["can_select"] = (MigrationStore._selection_editable(connection, job)
+                               if editable is None else editable)
+        if partial is None:
+            partial = MigrationStore._selection_parents(connection, job["id"])
+        entry["selection_partial"] = bool(
+            entry["kind"] == "dir" and entry["selected"]
+            and entry["source_path"] in partial
+        )
+        return entry
 
     @staticmethod
     def _job(connection, row):
@@ -359,26 +458,36 @@ class MigrationStore:
         value["pause_requested"] = bool(value["pause_requested"])
         value["stop_requested"] = bool(value["stop_requested"])
         value["full_stop_requested"] = bool(value["full_stop_requested"])
+        value["plan_complete"] = bool(value["plan_complete"])
+        value["selection_frozen"] = bool(value["selection_frozen"])
         totals = connection.execute(
-            "SELECT kind,state,COUNT(*),SUM(size) FROM entries "
-            "WHERE job_id=? GROUP BY kind,state", (value["id"],),
+            "SELECT kind,state,selected,COUNT(*),SUM(size) FROM entries "
+            "WHERE job_id=? GROUP BY kind,state,selected", (value["id"],),
         ).fetchall()
         counts, directories = {}, {}
         total_bytes = verified_bytes = total_files = total_directories = 0
-        for kind, state, count, size in totals:
+        for kind, state, selected, count, size in totals:
             if kind == "dir":
-                directories[state] = count
+                if selected or state == "skipped_by_user":
+                    directories[state] = directories.get(state, 0) + count
                 total_directories += count
             else:
-                counts[state] = count
+                if selected or state == "skipped_by_user":
+                    counts[state] = counts.get(state, 0) + count
                 total_files += count
                 total_bytes += size
-                if state in {"done", "already_verified"}:
+                if selected and state in {"done", "already_verified"}:
                     verified_bytes += size
+        selection = MigrationStore._selection(connection, value)
         value.update(
             counts=counts, directory_counts=directories,
             total_bytes=total_bytes, verified_bytes=verified_bytes,
             total_files=total_files, total_directories=total_directories,
+            selection=selection,
+            can_start_transfer=bool(
+                selection["selected"]
+                and MigrationStore._selection_prestart(connection, value)
+            ),
             point_retry_active=bool(connection.execute(
                 "SELECT 1 FROM entries WHERE job_id=? "
                 "AND point_retry_requested=1 LIMIT 1", (value["id"],),
@@ -426,7 +535,10 @@ class MigrationStore:
                         or not minimum <= value <= maximum):
                     raise ValueError("invalid_event_value")
                 continue
-            if key in {"point_retry_requested", "retry_enabled"}:
+            if key in {
+                "point_retry_requested", "retry_enabled", "selected",
+                "plan_complete", "selection_frozen",
+            }:
                 if not isinstance(value, bool):
                     raise ValueError("invalid_event_value")
                 continue
@@ -696,10 +808,11 @@ class MigrationStore:
         if not fields or set(fields) - {
             "state", "error", "pause_requested", "resume_state", "namespace_state",
             "stop_requested",
+            "plan_complete",
         }:
             raise ValueError("invalid_job_fields")
         for key, value in fields.items():
-            if key in {"pause_requested", "stop_requested"}:
+            if key in {"pause_requested", "stop_requested", "plan_complete"}:
                 if not isinstance(value, bool):
                     raise ValueError(f"invalid_{key}")
             elif key == "namespace_state":
@@ -791,7 +904,7 @@ class MigrationStore:
                 payload = {"count": len(values)}
                 if mark_ready:
                     connection.execute(
-                        "UPDATE jobs SET state='ready',error=NULL WHERE id=?",
+                        "UPDATE jobs SET state='ready',error=NULL,plan_complete=1 WHERE id=?",
                         (job_id,),
                     )
                     payload["state"] = "ready"
@@ -812,11 +925,12 @@ class MigrationStore:
                 raise ValueError("plan_already_exists")
             connection.execute("DELETE FROM publications WHERE job_id=?", (job_id,))
             connection.execute("DELETE FROM entries WHERE job_id=?", (job_id,))
+            connection.execute("UPDATE jobs SET plan_complete=0 WHERE id=?", (job_id,))
             self._event(connection, job_id, "plan_reset", {"state": "planning"})
 
     def entries(self, job_id, limit=200, offset=0, state=None):
         with self._connection() as connection:
-            self._required(connection, "jobs", job_id)
+            job = self._required(connection, "jobs", job_id)
             condition, parameters = "job_id=?", [job_id]
             if state is not None:
                 condition += " AND state=?"
@@ -826,8 +940,96 @@ class MigrationStore:
                 + " ORDER BY rowid LIMIT ? OFFSET ?",
                 (*parameters, max(0, limit), max(0, offset)),
             ).fetchall()
-            return [dict(row, point_retry_requested=bool(row["point_retry_requested"]))
+            editable = self._selection_editable(connection, job)
+            partial = self._selection_parents(connection, job_id)
+            return [self._describe_selection(
+                connection, row, job, editable=editable, partial=partial,
+            )
                     for row in rows]
+
+    def set_entry_selection(self, job_id, entry_id, selected, expected_revision):
+        if (type(selected) is not bool or type(expected_revision) is not int
+                or expected_revision < 0):
+            raise ValueError("invalid_selection")
+        with self._connection(write=True) as connection:
+            job = self._required(connection, "jobs", job_id)
+            if job["revision"] != expected_revision:
+                raise ValueError("stale_revision")
+            if not self._selection_editable(connection, job):
+                raise ValueError("selection_not_allowed")
+            entry = self._required(connection, "entries", entry_id)
+            if entry["job_id"] != job_id:
+                raise KeyError(entry_id)
+            prefix = entry["source_path"].rstrip("/") + "/"
+            connection.execute(
+                "UPDATE entries SET selected=?,updated_at=? WHERE job_id=? "
+                "AND (id=? OR (?='dir' AND substr(source_path,1,?)=?))",
+                (selected, _now(), job_id, entry_id, entry["kind"], len(prefix), prefix),
+            )
+            if selected:
+                for parent in _parent_paths(entry["source_path"]):
+                    connection.execute(
+                        "UPDATE entries SET selected=1,updated_at=? WHERE job_id=? "
+                        "AND kind='dir' AND source_path=?", (_now(), job_id, parent),
+                    )
+            issues = bool(connection.execute(
+                "SELECT 1 FROM entries WHERE job_id=? AND selected=1 "
+                "AND state IN ('conflict','verification_unavailable') LIMIT 1",
+                (job_id,),
+            ).fetchone())
+            if issues or job["error"] == "plan_conflicts":
+                state = "needs_attention" if issues else "ready"
+                error = "plan_conflicts" if issues else None
+                if job["state"] == "awaiting_credentials":
+                    connection.execute(
+                        "UPDATE jobs SET resume_state=?,error=? WHERE id=?",
+                        (state, error, job_id),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE jobs SET state=?,error=? WHERE id=?",
+                        (state, error, job_id),
+                    )
+            self._event(connection, job_id, "entry_selection_changed", {
+                "entry_id": entry_id, "selected": selected,
+            })
+            return self._job(connection, self._required(connection, "jobs", job_id))
+
+    def validate_selection(self, job_id, *, allow_empty=False):
+        if type(allow_empty) is not bool:
+            raise ValueError("invalid_selection")
+        with self._connection() as connection:
+            job = self._required(connection, "jobs", job_id)
+            if not self._selection_prestart(connection, job):
+                raise ValueError("selection_not_allowed")
+            if not allow_empty and not self._selection(connection, job)["selected"]:
+                raise ValueError("empty_selection")
+            if connection.execute(
+                "SELECT 1 FROM entries WHERE job_id=? AND selected=1 AND state IN "
+                "('conflict','verification_unavailable') LIMIT 1", (job_id,),
+            ).fetchone():
+                raise ValueError("plan_conflicts")
+
+    def is_prestart_plan(self, job_id):
+        with self._connection() as connection:
+            job = self._required(connection, "jobs", job_id)
+            return self._selection_prestart(connection, job)
+
+    def freeze_selection(self, job_id, *, allow_empty=False):
+        with self._connection(write=True) as connection:
+            self.validate_selection(job_id, allow_empty=allow_empty)
+            job = self._required(connection, "jobs", job_id)
+            if job["selection_frozen"]:
+                return self._job(connection, job)
+            connection.execute(
+                "UPDATE entries SET state='skipped_by_user',error=NULL,retry_at_ms=NULL,"
+                "updated_at=? WHERE job_id=? AND selected=0", (_now(), job_id),
+            )
+            connection.execute("UPDATE jobs SET selection_frozen=1 WHERE id=?", (job_id,))
+            self._event(connection, job_id, "selection_frozen", {
+                "selection_frozen": True,
+            })
+            return self._job(connection, self._required(connection, "jobs", job_id))
 
     def managed_batch_job_ids(self):
         """Keep all batch child generations isolated, including crash-window orphans."""
@@ -840,18 +1042,20 @@ class MigrationStore:
         """Recheck snapshot matches during execution without widening membership."""
         with self._connection(write=True) as connection:
             job = self._required(connection, "jobs", job_id)
-            if job["state"] != "ready" or job["stop_requested"]:
+            if not self._selection_prestart(connection, job):
                 raise ValueError("plan_not_ready")
             count = connection.execute(
                 "UPDATE entries SET state='planned',verification=NULL "
                 "WHERE job_id=? AND kind='file' AND state='already_verified' "
-                "AND attempt_id IS NULL", (job_id,),
+                "AND attempt_id IS NULL AND selected=1", (job_id,),
             ).rowcount
             self._event(connection, job_id, "verification_recheck_requested", {"count": count})
 
     def entry(self, entry_id):
         with self._connection() as connection:
-            return self._required(connection, "entries", entry_id)
+            entry = self._required(connection, "entries", entry_id)
+            job = self._required(connection, "jobs", entry["job_id"])
+            return self._describe_selection(connection, entry, job)
 
     def publications(self, job_id):
         with self._connection() as connection:
@@ -999,7 +1203,7 @@ class MigrationStore:
 
     @staticmethod
     def _point_retry_entry_valid(job_id, entry, attempt):
-        if (entry["job_id"] != job_id or entry["kind"] != "file"
+        if (entry["job_id"] != job_id or not entry["selected"] or entry["kind"] != "file"
                 or entry["state"] not in {"failed", "outcome_unknown"}):
             return False
         if attempt is None:
@@ -1023,6 +1227,8 @@ class MigrationStore:
             job = self._required(connection, "jobs", job_id)
             ready = (not self._point_retry_job_error(job)
                      and not self._point_retry_busy(connection, job_id))
+            editable = self._selection_editable(connection, job)
+            partial = self._selection_parents(connection, job_id)
             result = []
             for item in entries:
                 entry = self._required(connection, "entries", item["id"])
@@ -1031,7 +1237,10 @@ class MigrationStore:
                 attempt = (self._required(connection, "attempts", entry["attempt_id"])
                            if entry["attempt_id"] else None)
                 result.append({
-                    **entry, "can_retry": bool(ready and self._point_retry_entry_valid(
+                    **self._describe_selection(
+                        connection, entry, job, editable=editable, partial=partial,
+                    ),
+                    "can_retry": bool(ready and self._point_retry_entry_valid(
                         job_id, entry, attempt,
                     )),
                 })
@@ -1130,7 +1339,7 @@ class MigrationStore:
                 state, error = "needs_attention", (entry["error"]
                                                    or "transfer_outcome_unknown")
             else:
-                state = ("completed" if states <= {"done", "already_verified"}
+                state = ("completed" if states <= {"done", "already_verified", "skipped_by_user"}
                          else "completed_with_issues")
                 error = None
             resume_state = job["resume_state"]

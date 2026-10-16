@@ -8,10 +8,10 @@
 | Скачать личный или общий Диск на машину запуска | [Сохранить локально](#local-save) |
 | Перенести личные и общие SaaS-Диски на общий Диск On-premises | [SaaS → On-premises][onprem-guide] |
 
-Режим **SaaS → On-premises** доступен в обоих образах релиза **3.1.0**.
+Режим **SaaS → On-premises** доступен в обоих образах релиза **3.2.0**.
 Файлы передаются с временным кешем на машине утилиты. Доступы, кнопки и ошибки
 описаны в [отдельной инструкции][onprem-guide]; порядок обновления —
-в [кратком гайде](https://github.com/cromovsky/yandex-disk-copy/blob/v3.1.0/docs/UPDATE.md).
+в [кратком гайде](https://github.com/cromovsky/yandex-disk-copy/blob/v3.2.0/docs/UPDATE.md).
 
 Это вспомогательная утилита, предоставляемая «как есть», не часть официальной
 поставки Яндекс 360. Организация отвечает за её использование. Перед полным
@@ -164,8 +164,8 @@ curl -X POST "https://oauth.yandex.ru/token" \
 
 Выберите образ:
 
-- `cromovsky/yandex-disk-copy-v2:3.1.0` — одна или разные SaaS-организации;
-- `cromovsky/yandex-disk-copy:3.1.0` — одна SaaS-организация.
+- `cromovsky/yandex-disk-copy-v2:3.2.0` — одна или разные SaaS-организации;
+- `cromovsky/yandex-disk-copy:3.2.0` — одна SaaS-организация.
 
 В обоих образах доступны локальное сохранение и SaaS → On-premises.
 
@@ -176,7 +176,7 @@ curl -X POST "https://oauth.yandex.ru/token" \
 ```yaml
 services:
   disk-copy:
-    image: cromovsky/yandex-disk-copy-v2:3.1.0
+    image: cromovsky/yandex-disk-copy-v2:3.2.0
     ports:
       - "127.0.0.1:8000:8000"
     environment:
@@ -215,7 +215,7 @@ docker compose up -d
 доступа нужны HTTPS и авторизация; вариант с Caddy описан ниже.
 
 Перед обновлением остановите активную работу и сохраните резервную копию
-данных по [гайду обновления](https://github.com/cromovsky/yandex-disk-copy/blob/v3.1.0/docs/UPDATE.md). Журналы доступны в интерфейсе;
+данных по [гайду обновления](https://github.com/cromovsky/yandex-disk-copy/blob/v3.2.0/docs/UPDATE.md). Журналы доступны в интерфейсе;
 для проверки состояния контейнера и веб-сервера:
 
 ```bash
@@ -231,7 +231,7 @@ docker compose logs -f disk-copy
 ### Без Compose
 
 ```bash
-docker pull cromovsky/yandex-disk-copy-v2:3.1.0
+docker pull cromovsky/yandex-disk-copy-v2:3.2.0
 docker run -d \
   --name yandex-disk-copy \
   -p 127.0.0.1:8000:8000 \
@@ -241,7 +241,7 @@ docker run -d \
   -e LOCAL_SAVE_HOST_DIR="$(pwd)/downloads" \
   -e ONPREM_ALLOW_INSECURE_HTTP=1 \
   --restart unless-stopped \
-  cromovsky/yandex-disk-copy-v2:3.1.0
+  cromovsky/yandex-disk-copy-v2:3.2.0
 ```
 
 ### Доступ с других компьютеров через HTTPS
@@ -258,8 +258,8 @@ docker run --rm caddy:2-alpine caddy hash-password --plaintext 'ВАШ_ПАРО�
 (символы `$$` сохраните). Для SaaS → On-premises также задайте
 `ONPREM_ADMIN_TOKEN` — отдельный ключ доступа к этому режиму.
 Этот Compose использует готовый образ v1. Перед запуском укажите
-`image: cromovsky/yandex-disk-copy:3.1.0`; для переноса между организациями —
-`image: cromovsky/yandex-disk-copy-v2:3.1.0`. Затем выполните:
+`image: cromovsky/yandex-disk-copy:3.2.0`; для переноса между организациями —
+`image: cromovsky/yandex-disk-copy-v2:3.2.0`. Затем выполните:
 
 ```bash
 docker compose -f docker-compose.caddy.yml pull
@@ -390,10 +390,19 @@ Client ID, Client secret и **ID организации (ORGID)**. Токен с
    `downloads/<название> (<ID>)/`. Название общего диска фиксируется в плане.
 3. Устраните ошибки и нажмите **«Повторить Dry Run»** у нужного источника
    либо снимите его галочку. Остальные планы сохраняются.
-4. После готовности всех выбранных планов нажмите **«Начать сохранение»**.
+4. В **«Файлы»** снимите галочки с ненужных объектов, затем нажмите **«Начать сохранение»**.
    Одновременно работают максимум четыре источника во всей утилите,
    по одному файлу на источник.
    Пауза, продолжение и полная остановка управляют всем выбранным списком.
+
+Все файлы и папки после полного Dry Run отмечены по умолчанию. Снятие галочки
+с папки исключает всё её содержимое, включая другие страницы плана; выбор вложенного
+файла включает нужные родительские папки. Исключённые объекты не попадают
+в очередь, не считаются ошибками и не повторяются. Выбор сохраняется после
+обновления страницы и перезапуска контейнера и не требует нового Dry Run;
+менять его можно до первого запуска сохранения. Без выбранных объектов запуск
+недоступен, источник с пустым выбором пропускается. Выбор отдельных объектов
+доступен в списках CSV и [SaaS → On-premises][onprem-guide].
 
 **«Остановить полностью»** во время Dry Run прекращает обход и дальнейшие
 повторы запросов. Нажмите **Dry Run** или **«Начать заново»** для нового списка;

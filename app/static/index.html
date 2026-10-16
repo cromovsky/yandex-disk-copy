@@ -233,7 +233,7 @@
     .subtab {
       appearance: none; background: transparent; cursor: pointer;
       padding: 9px 16px; font-size: 13px; font-weight: 600; color: var(--ink-soft);
-      border: 1px solid transparent; border-bottom: none;
+      border: 1px solid transparent; border-bottom: 1px solid transparent;
       border-radius: 10px 10px 0 0; margin-bottom: -1px;
       transition: color .12s, background .12s, border-color .12s;
     }
@@ -273,8 +273,13 @@
     #run-start-recovery[hidden] { display: none !important; }
     #run-journal-cleanup-panel { text-align: center; }
     #run-journal-cleanup-panel .onprem-actions { justify-content: center; }
-    #run-history { min-width: 0; width: 100%; padding: 11px 13px; border: 1px solid var(--line); border-radius: 12px; background: #fbfbfc; color: var(--ink); font: inherit; font-size: 14px; }
-    [data-theme="dark"] #run-history { background: #23272f; border-color: #2b303a; }
+    #run-history, #local-batch-history, #onprem-batch-history {
+      min-width: 0; width: 100%; padding: 11px 13px; border: 1px solid var(--line);
+      border-radius: 12px; background: #fbfbfc; color: var(--ink); font: inherit; font-size: 14px;
+    }
+    [data-theme="dark"] #run-history,
+    [data-theme="dark"] #local-batch-history,
+    [data-theme="dark"] #onprem-batch-history { background: #23272f; border-color: #2b303a; }
     #run-journal-notice { color: #c2410c; }
     [data-theme="dark"] #run-journal-notice { color: #f1cf7e; }
     #log:empty::before { content: attr(data-empty); color: #9a9ba6;
@@ -380,6 +385,10 @@
     [data-theme="dark"] .tabs { border-bottom-color: #2b303a; }
     [data-theme="dark"] .tab { color: #9a9ca6; }
     [data-theme="dark"] .tab:hover:not(.active) { background: #23272f; }
+    [data-theme="dark"] .subtab:hover:not(.active) { background: #23272f; }
+    [data-theme="dark"] .subtab.active {
+      background: #1c1f26; border-color: var(--line); border-bottom-color: #1c1f26;
+    }
     /* копируемые элементы */
     [data-theme="dark"] .copyable,
     [data-theme="dark"] pre.code-block.copyable { border-color: #3a5f8a; }
@@ -451,6 +460,11 @@
     .onprem-summary dd { margin: 4px 0 0; font-weight: 600; overflow-wrap: anywhere; }
     .onprem-path { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
       overflow-wrap: anywhere; white-space: pre-wrap; }
+    .entry-choice { display: flex; align-items: flex-start; gap: 8px; margin: 0;
+      min-width: 0; color: inherit; font: inherit; }
+    .entry-choice input[type="checkbox"] { flex: 0 0 18px; width: 18px; height: 18px;
+      margin: 0; padding: 0; accent-color: var(--accent); }
+    .entry-choice span { min-width: 0; overflow-wrap: anywhere; }
     .onprem-table-wrap { overflow-x: auto; border: 1px solid var(--line);
       border-radius: 6px; margin-top: 14px; }
     .onprem-table { border-collapse: collapse; width: 100%; min-width: 700px;
@@ -990,6 +1004,8 @@
           </div>
           <section id="local-batch-details" data-batch-details hidden>
             <h2>Файлы источника <span id="local-batch-details-name"></span></h2>
+            <p class="field-note">До начала переноса можно выбрать файлы и папки. Выбор папки меняет выбор всего её содержимого.</p>
+            <p id="local-batch-entries-selection" class="field-note" role="status"></p>
             <div class="onprem-table-wrap"><table class="onprem-table batch-entries-table">
               <thead><tr><th>Источник</th><th>Назначение</th><th>Размер</th><th>Результат</th></tr></thead>
               <tbody id="local-batch-entries"></tbody>
@@ -1136,6 +1152,8 @@
           </div>
           <section id="onprem-batch-details" data-batch-details hidden>
             <h2>Файлы источника <span id="onprem-batch-details-name"></span></h2>
+            <p class="field-note">До начала переноса можно выбрать файлы и папки. Выбор папки меняет выбор всего её содержимого.</p>
+            <p id="onprem-batch-entries-selection" class="field-note" role="status"></p>
             <div class="onprem-table-wrap"><table class="onprem-table batch-entries-table">
               <thead><tr><th>Источник</th><th>Назначение</th><th>Размер</th><th>Результат</th></tr></thead>
               <tbody id="onprem-batch-entries"></tbody>
@@ -1193,6 +1211,8 @@
         <div class="onprem-actions">
           <button id="onprem-report" class="secondary-btn" type="button" disabled>Скачать отчёт CSV</button>
         </div>
+        <p class="field-note">До начала переноса можно выбрать файлы и папки. Выбор папки меняет выбор всего её содержимого.</p>
+        <p id="onprem-entry-selection" class="field-note" role="status"></p>
         <div class="onprem-table-wrap">
           <table class="onprem-table">
             <thead><tr><th>Источник</th><th>Назначение</th><th>Размер</th><th>MD5</th><th>Результат</th></tr></thead>
@@ -2103,7 +2123,7 @@
   </script>
   <script src="/static/retry-controls.js?v=80e22866df02"></script>
   <script src="/static/run-journal.js?v=a30f1fa4aa5c"></script>
-  <script src="/static/onprem.js?v=037f58bd0c30"></script>
-  <script src="/static/source-batches.js?v=af4b72b35f25"></script>
+  <script src="/static/onprem.js?v=e24b498416e8"></script>
+  <script src="/static/source-batches.js?v=efb7002965fd"></script>
 </body>
 </html>

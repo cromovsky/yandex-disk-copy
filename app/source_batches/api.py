@@ -46,6 +46,10 @@ class SelectionRequest(StrictModel):
     source_ids: list[str] = Field(min_length=1, max_length=1000)
 
 
+class EntrySelectionRequest(StrictModel):
+    selected: bool = Field(strict=True)
+
+
 async def body(request, model):
     try:
         return model.model_validate(await request.json())
@@ -183,6 +187,13 @@ def plan_source(request: Request, batch_id: str, source_id: str):
 def entries(request: Request, batch_id: str, source_id: str,
             limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0)):
     return source_access(request, batch_id, source_id).entries(source_id, limit, offset)
+
+
+@router.post("/{batch_id}/sources/{source_id}/entries/{entry_id}/selection")
+async def entry_selection(request: Request, batch_id: str, source_id: str, entry_id: str):
+    value = source_access(request, batch_id, source_id)
+    model = await body(request, EntrySelectionRequest)
+    return invoke(value.entry_selection, batch_id, source_id, entry_id, model.selected)
 
 
 def csv_response(value, batch_id, journal):

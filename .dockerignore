@@ -1,5 +1,5 @@
-__pycache__/
-*.pyc
+**/__pycache__/
+**/*.pyc
 *.log
 .git/
 .venv/
@@ -9,5 +9,5 @@ README.md
 .env
 downloads/
 migration-data/
-CONTEXT.md
+CONTEXT*.md
 docs/superpowers/

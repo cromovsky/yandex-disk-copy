@@ -45,6 +45,7 @@ STATUS_LABELS = {
     "paused": "Приостановлено", "stopped": "Остановлено", "done": "Готово",
     "cancelled": "Отменено",
     "already_verified": "Уже перенесено и проверено", "conflict": "Конфликт",
+    "skipped_by_user": "Пропущен пользователем",
     "completed": "Завершено", "completed_with_issues": "Завершено с ошибками",
     "needs_attention": "Нужно вмешательство",
     "awaiting_credentials": "Нужно повторно указать доступы",
@@ -274,6 +275,9 @@ def enrich_event(event, config, remote_root, entry=None, attempt=None):
     if error_message and diagnostic_message:
         error_message += " " + diagnostic_message
     event_labels = {
+        "entry_selection_changed": ("Выбор объекта",
+                                    "Выбран" if payload.get("selected") else "Исключён"),
+        "selection_frozen": ("Выбор объектов", "Подтверждён для переноса"),
         "full_stop_requested": ("Полная остановка задания", "Запрошено"),
         "local_operations_cancelled": ("Отмена локальных действий", "Отменено"),
         "local_cleanup": ("Очистка локального кеша",

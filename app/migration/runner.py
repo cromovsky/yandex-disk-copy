@@ -38,7 +38,7 @@ STOP_ISOLATED_PHASES = {
     "unknown_transfer", "abandoned_transfer", "abandoned_move", "verifying", "verifying_final",
     "succeeded", "failed",
 }
-SUCCESS = {"done", "already_verified"}
+SUCCESS = {"done", "already_verified", "skipped_by_user"}
 ACCEPTED_URL_PHASES = {"waiting_transfer", "waiting_move", "verifying",
                        "verifying_final", "succeeded"}
 RETRYABLE = {"failed"}
@@ -539,12 +539,14 @@ class MigrationRunner:
         required = sum(e["size"] for e in entries)
         largest = max((e["size"] for e in entries), default=0)
         extra = largest if job["remote_root"] else 0
-        if quota is not None and required + extra > quota:
-            raise MigrationError("destination_space_insufficient")
         if quota is None:
             self.store.event(job["id"], "warning", {"error": "quota_unavailable"})
         self._checkpoint(job["id"])
         self.store.add_entries(job["id"], entries, mark_ready=True)
+        if quota is not None and required + extra > quota:
+            self.store.update_job(job["id"], state="needs_attention",
+                                  error="destination_space_insufficient")
+            raise MigrationError("destination_space_insufficient")
 
     def _full_plan(self, job, source, destination, *, checkpoint=None):
         """Persist a read-only inventory incrementally, then fence plan completion."""
@@ -626,15 +628,16 @@ class MigrationRunner:
                 unavailable |= state in {"conflict", "verification_unavailable"}
             check()
             quota = self._quota(info)
-            if quota is not None and required > quota:
-                raise MigrationError("destination_space_insufficient")
             if quota is None:
                 self.store.event(job["id"], "warning", {"error": "quota_unavailable"})
+            self.store.add_entries(job["id"], [], append=True, mark_ready=True)
             if unavailable:
                 self.store.update_job(job["id"], state="needs_attention",
                                       error="plan_conflicts")
-            else:
-                self.store.add_entries(job["id"], [], append=True, mark_ready=True)
+            elif quota is not None and required > quota:
+                self.store.update_job(job["id"], state="needs_attention",
+                                      error="destination_space_insufficient")
+                raise MigrationError("destination_space_insufficient")
         finally:
             with self.store._connection(write=True) as connection:
                 connection.execute("DELETE FROM plan_paths WHERE job_id=?", (job["id"],))
@@ -648,12 +651,34 @@ class MigrationRunner:
         ):
             raise MigrationError("onprem_staged_required")
 
+    def validate_selection(self, job_id):
+        self.store.validate_selection(job_id)
+        job = self.store.get(job_id)
+        files = [e for e in self.store.entries(job_id, limit=1000000)
+                 if e["selected"] and e["kind"] == "file" and e["state"] not in SUCCESS]
+        required = sum(e["size"] for e in files)
+        largest = max((e["size"] for e in files), default=0)
+        if required:
+            destination = self.destination_client(job)
+            info = destination.info()
+            self._identity(job["config"], info)
+            quota = self._quota(info)
+            extra = largest if job["remote_root"] else 0
+            if quota is not None and required + extra > quota:
+                raise MigrationError("destination_space_insufficient")
+        if largest and (
+            largest + self._staging_size() > self.staging_budget
+            or largest + self.reserve_bytes > shutil.disk_usage(self.staging).free
+        ):
+            raise MigrationError("staging_space_insufficient")
+
     def step(self, job_id):
         job = self.store.get(job_id)
         if (job["state"] not in {"queued", "running"}
                 or job.get("stop_requested")):
             return
-        entries = self.store.entries(job_id, limit=1000000)
+        entries = [e for e in self.store.entries(job_id, limit=1000000)
+                   if e["selected"]]
         # Keep saved configuration and attempt evidence; accepted remote work may finish.
         # A stopped/recovered URL job never begins a fresh transfer or Dry Run.
         try:
@@ -754,7 +779,8 @@ class MigrationRunner:
                     raise
                 self.store.update_job(job_id, namespace_state="owned")
             self._checkpoint(job_id)
-            entries = self.store.entries(job_id, limit=1000000)
+            entries = [e for e in self.store.entries(job_id, limit=1000000)
+                       if e["selected"]]
             active = [e for e in entries if e["state"] in ACTIVE]
             if active:
                 entry = active[0]
@@ -959,17 +985,17 @@ class MigrationRunner:
             raise _StopRequested()
 
     def _prepare_publications(self, job, source, *, path=None):
-        pending_roots = None
-        if not self.retry_policy(job["id"]).enabled and path is None:
-            pending_roots = set()
-            for entry in self.store.entries(job["id"], limit=1000000):
-                if entry["state"] in ACTIVE | {"planned"}:
-                    parent = entry["source_path"]
-                    while parent.startswith("disk:/"):
-                        pending_roots.add(parent)
-                        parent = parent.rsplit("/", 1)[0]
+        pending_roots = set()
+        for entry in self.store.entries(job["id"], limit=1000000):
+            if entry["selected"] and (
+                path is not None or entry["state"] in ACTIVE | {"planned"}
+            ):
+                parent = entry["source_path"]
+                while parent.startswith("disk:/"):
+                    pending_roots.add(parent)
+                    parent = parent.rsplit("/", 1)[0]
         for root in self.store.publications(job["id"]):
-            if pending_roots is not None and root["source_path"] not in pending_roots:
+            if root["source_path"] not in pending_roots:
                 continue
             if path is not None and not (
                 path == root["source_path"]
@@ -1034,9 +1060,10 @@ class MigrationRunner:
 
     def _skip_dependants(self, job_id, entry, exc):
         for child in self.store.entries(job_id, limit=1000000):
-            if (child["state"] == "planned" and child["source_path"].startswith(
-                entry["source_path"].rstrip("/") + "/"
-            )):
+            if (child["selected"] and child["state"] == "planned"
+                    and child["source_path"].startswith(
+                        entry["source_path"].rstrip("/") + "/"
+                    )):
                 self.store.update_entry(child["id"], state="failed", error=exc.code, retry_at_ms=None)
                 self._skip_event(job_id, child, exc)
 
@@ -1510,6 +1537,10 @@ class MigrationRunner:
                  else job["state"])
         if state not in allowed:
             raise ValueError("job_not_retryable")
+        if job["selection"]["editable"]:
+            self.validate_selection(job_id)
+            self.store.freeze_selection(job_id)
+            self.store.revalidate_verified_files(job_id)
         entries = self.store.entries(job_id, limit=1000000)
         if any(e["state"] in ACTIVE or e["state"] == "outcome_unknown" for e in entries):
             raise ValueError("active_or_unknown_attempt")
@@ -1525,7 +1556,7 @@ class MigrationRunner:
                          self._destination_available, current,
                          self.destination_client(current))
         for entry in entries:
-            if entry["state"] in RETRYABLE:
+            if entry["selected"] and entry["state"] in RETRYABLE:
                 if entry["kind"] == "file":
                     old = (self.store.attempt(entry["attempt_id"])
                            if entry.get("attempt_id") else None)

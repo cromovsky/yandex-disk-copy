@@ -15,6 +15,7 @@
     awaiting_credentials: "Нужен повторный доступ", needs_attention: "Нужна проверка",
     completed: "Завершено", completed_with_issues: "Завершено с замечаниями",
     stopped: "Остановлено", cancelled: "Отменено",
+    skipped_by_user: "Пропущен пользователем",
     planned: "В плане", transferring: "Передача", downloading: "Скачивание",
     staged: "Сохранён временно", waiting_operation: "Ожидание операции",
     verifying: "Проверка", committing: "Финализация", done: "Перенесено",
@@ -66,6 +67,8 @@
     job_not_awaiting_credentials: "Задание сейчас не принимает доступы. Обновите его состояние.",
     revision_conflict: "Задание изменилось. Обновите его перед повтором.",
     stale_revision: "Задание изменилось. Обновите его перед повтором.",
+    selection_not_allowed: "Выбор файлов доступен до начала переноса, после полного Dry Run.",
+    empty_selection: "Выберите хотя бы один файл или папку для переноса.",
     validation_error: "Проверьте обязательные поля и допустимые пути.",
     network_error: "Соединение прервалось. Обновите задание перед повторным действием.",
     unavailable: "Сервис временно недоступен. Состояние задания сохраняется.",
@@ -217,6 +220,7 @@
   let selected = null;
   let entries = [];
   let pointRetryButtons = [];
+  let entrySelectionChecks = [];
   let entryOffset = 0;
   const entryPageSize = 100;
   let history = [];
@@ -632,7 +636,7 @@
     if (Number(selected.total_directories) > 0) {
       byId("onprem-job-counts").textContent += ` · Каталогов: ${selected.total_directories}`;
     }
-    byId("onprem-job-bytes").textContent = `${bytes(selected.verified_bytes)} / ${bytes(selected.total_bytes)}`;
+    byId("onprem-job-bytes").textContent = `${bytes(selected.verified_bytes)} / ${bytes(selected.selection?.selected_bytes ?? selected.total_bytes)}`;
     const staged = selected.config.strategy === "staged";
     const rates = selected.state === "running" && !oldWorkStopped(selected) ? selected.transfer_rates : null;
     byId("onprem-download-rate-row").hidden = !staged;
@@ -665,6 +669,10 @@
     const body = byId("onprem-entry-body");
     body.replaceChildren();
     pointRetryButtons = [];
+    entrySelectionChecks = [];
+    const selection = selected?.selection;
+    byId("onprem-entry-selection").textContent = selection
+      ? `Выбрано: ${selection.selected} · исключено: ${selection.excluded} · объём: ${bytes(selection.selected_bytes)}` : "";
     if (!entries.length) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
@@ -682,16 +690,29 @@
         const cell = document.createElement("td");
         cell.textContent = value || "—";
         if (index < 2 || index === 3) cell.className = "onprem-path";
+        if (index === 0) {
+          const label = document.createElement("label"); label.className = "entry-choice";
+          const check = document.createElement("input"); check.type = "checkbox";
+          check.checked = entry.selected !== false; check.indeterminate = entry.selection_partial === true;
+          check.setAttribute("aria-label", `Включить в перенос: ${entry.source_path}`);
+          check.disabled = !entrySelectionAvailable(entry);
+          check.addEventListener("change", () => selectEntry(entry, check.checked, check));
+          const path = document.createElement("span"); path.textContent = value || "—";
+          label.appendChild(check); label.appendChild(path); cell.replaceChildren(label);
+          entrySelectionChecks.push({check, entry});
+        }
         row.appendChild(cell);
       });
       const result = document.createElement("td");
       const state = document.createElement("span");
-      const retryAt = entry.state === "downloading" && selected.state === "running" && !oldWorkStopped(selected)
+      const excluded = entry.selected === false || entry.state === "skipped_by_user";
+      const retryAt = !excluded && entry.state === "downloading" && selected.state === "running" && !oldWorkStopped(selected)
         ? retryDate(entry.retry_at_ms) : null;
-      state.className = "onprem-result " + (retryAt ? "attention" : resultClass(entry.state));
-      state.textContent = retryAt ? "Ожидание повтора" : stateLabel(entry.state);
+      state.className = "onprem-result " + (excluded ? "" : retryAt ? "attention" : resultClass(entry.state));
+      state.textContent = entry.state === "skipped_by_user" ? stateLabel(entry.state)
+        : excluded ? "Исключено из переноса" : retryAt ? "Ожидание повтора" : stateLabel(entry.state);
       result.appendChild(state);
-      if (validDownloadAttempts(entry.download_attempts)) {
+      if (!excluded && validDownloadAttempts(entry.download_attempts)) {
         const counter = document.createElement("div");
         counter.textContent = `Скачивание: ${entry.download_attempts}` + (selected.config.retry_enabled === false ? "" : "/5");
         result.appendChild(counter);
@@ -701,28 +722,28 @@
         wait.textContent = `Следующая попытка через ${Math.max(0, Math.ceil((retryAt.getTime() - Date.now()) / 1000))} с (${retryAt.toLocaleString("ru-RU")})`;
         result.appendChild(wait);
       }
-      if (validPointRetryAttempts(entry.point_retry_attempts) && (entry.point_retry_requested || entry.point_retry_attempts > 0)) {
+      if (!excluded && validPointRetryAttempts(entry.point_retry_attempts) && (entry.point_retry_requested || entry.point_retry_attempts > 0)) {
         const counter = document.createElement("div");
         counter.textContent = `Точечный повтор: ${entry.point_retry_attempts}` + (selected.config.retry_enabled === false ? "" : "/3");
         result.appendChild(counter);
       }
-      if (entry.point_retry_requested && !oldWorkStopped(selected) && retryDate(entry.retry_at_ms)) {
+      if (!excluded && entry.point_retry_requested && !oldWorkStopped(selected) && retryDate(entry.retry_at_ms)) {
         const wait = document.createElement("div");
         wait.textContent = `Следующая попытка: ${retryDate(entry.retry_at_ms).toLocaleString("ru-RU")}`;
         result.appendChild(wait);
       }
-      if (entry.error) {
+      if (!excluded && entry.error) {
         const error = document.createElement("span");
         error.textContent = errorText(entry.error);
         result.appendChild(error);
       }
-      if (entry.attempt_id) {
+      if (!excluded && entry.attempt_id) {
         const attempt = document.createElement("div");
         attempt.className = "onprem-path";
         attempt.textContent = `Попытка: ${entry.attempt_id}`;
         result.appendChild(attempt);
       }
-      if (entry.kind === "file" && entry.can_retry === true && !oldWorkStopped(selected) && sharedConfig(selected.config)) {
+      if (!excluded && entry.kind === "file" && entry.can_retry === true && !oldWorkStopped(selected) && sharedConfig(selected.config)) {
         const retry = document.createElement("button");
         retry.type = "button";
         retry.className = "secondary-btn";
@@ -740,6 +761,36 @@
       ? `Объекты ${entryOffset + 1}–${entryOffset + entries.length} из ${total}`
       : `Объектов в плане: ${total}`;
     byId("onprem-entry-page").textContent = `Страница ${Math.floor(entryOffset / entryPageSize) + 1} из ${Math.max(1, Math.ceil(total / entryPageSize))}`;
+  }
+
+  function entrySelectionAvailable(entry) {
+    return !busy && enabled && authorized() && selected && selected.selection?.editable === true &&
+      !oldWorkStopped(selected) && sharedConfig(selected.config) && selected.config.strategy === "staged" &&
+      byId("onprem-source-input")?.value !== "list" && originalConfigMatches() && entries.includes(entry) && entry.can_select === true;
+  }
+
+  function selectEntry(entry, checked, check) {
+    if (!entrySelectionAvailable(entry)) {
+      check.checked = entry.selected !== false; check.indeterminate = entry.selection_partial === true; return;
+    }
+    return action(async () => {
+      const id = selected.id, snapshot = generation;
+      const current = () => selected?.id === id && snapshot === generation;
+      try {
+        const result = await request(`/jobs/${encodeURIComponent(id)}/entries/${encodeURIComponent(entry.id)}/selection`, {
+          method: "POST", body: {selected: checked, revision: selected.revision},
+        });
+        if (!current()) return;
+        if (result?.id !== id) throw failure("invalid_response");
+        selected = result;
+        await refreshSelected();
+      } catch (error) {
+        if (!current()) return;
+        check.checked = entry.selected !== false; check.indeterminate = entry.selection_partial === true;
+        try { await refreshSelected(); } catch (_) {}
+        if (current()) throw error;
+      }
+    });
   }
 
   function entryTotal() {
@@ -837,13 +888,16 @@
       ["intent", "unknown"].includes(selected?.namespace_state);
     const access = accessReady();
     const restoringAccess = ["paused", "awaiting_credentials"].includes(state) && (runnable || pointRetryActive());
+    const prestart = selected?.can_start_transfer ?? selected?.selection?.editable;
+    const startReady = effectiveState() === "ready" || (effectiveState() === "needs_attention" &&
+      selected?.plan_complete === true && prestart === true);
     byId("onprem-plan").disabled = locked || !confirmed;
     byId("onprem-refresh").disabled = locked;
     byId("onprem-history").disabled = locked;
     byId("onprem-history-newer").disabled = locked || historyOffset === 0;
     byId("onprem-history-older").disabled = locked || !historyHasOlder;
     byId("onprem-open-blocker").disabled = locked || !blockingJob(selected);
-    byId("onprem-start").disabled = locked || legacy || !access || stopped || unknown || effectiveState() !== "ready";
+    byId("onprem-start").disabled = locked || legacy || !access || stopped || unknown || !startReady || Number(selected?.selection?.selected) === 0;
     byId("onprem-pause").disabled = locked || legacy || stopped || state !== "running" || selected?.pause_requested;
     byId("onprem-stop").disabled = locked || selected?.full_stop_requested === true ||
       !(["queued", "planning", "ready", "running", "paused", "awaiting_credentials", "needs_attention", "completed_with_issues"].includes(state) || fullStopNeeded);
@@ -858,6 +912,7 @@
     byId("onprem-entry-previous").disabled = locked || !selected || entryOffset === 0;
     byId("onprem-entry-next").disabled = locked || !selected || entryOffset + entries.length >= entryTotal();
     pointRetryButtons.forEach(({button, entry}) => {button.disabled = !pointRetryAvailable(entry);});
+    entrySelectionChecks.forEach(({check, entry}) => {check.disabled = !entrySelectionAvailable(entry);});
 
   }
 
@@ -1052,7 +1107,7 @@
     if (suffix !== "pause" && !originalConfigMatches()) throw failure("credential_binding_mismatch");
     if (oldWorkStopped(selected)) return;
     const result = await request(`/jobs/${encodeURIComponent(selected.id)}/${suffix}`, {method: "POST", body});
-    if (result?.id === selected.id) selected = result;
+    if (result?.id === selected?.id) selected = result;
     await refreshSelected();
     renderJob();
   }
@@ -1142,12 +1197,15 @@
   byId("onprem-start").addEventListener("click", () => {
     if (byId("onprem-start").disabled) return;
     action(async () => {
-      const revision = destinationCheckRevision;
+      const id = selected.id, snapshot = generation, revision = destinationCheckRevision;
+      const current = () => selected?.id === id && generation === snapshot;
       await attachAccess();
+      if (!current()) return;
       if (selected.state === "awaiting_credentials") await mutate("resume");
+      if (!current()) return;
       if (revision !== destinationCheckRevision || !accessReady()) throw failure("credential_binding_mismatch");
-      await mutate("start");
-      notice("Перенос начат.");
+      if (selected.state !== "running") await mutate("start");
+      if (current()) notice("Перенос начат.");
     });
   });
   byId("onprem-entry-previous").addEventListener("click", () => action(async () => {

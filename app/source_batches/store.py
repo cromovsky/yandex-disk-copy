@@ -125,6 +125,7 @@ class BatchStore:
                 kind TEXT NOT NULL, source_path TEXT NOT NULL, destination_path TEXT NOT NULL,
                 size INTEGER NOT NULL, md5 TEXT, modified TEXT, resource_id TEXT,
                 state TEXT NOT NULL, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                selected INTEGER NOT NULL DEFAULT 1 CHECK(selected IN (0,1)),
                 normalized_path TEXT NOT NULL, UNIQUE(source_id,normalized_path)
             );
             CREATE INDEX IF NOT EXISTS entries_source ON entries(source_id,state);
@@ -133,6 +134,10 @@ class BatchStore:
                 source_id TEXT, created_at TEXT NOT NULL, payload TEXT NOT NULL
             );
         """)
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entries)")}
+        if "selected" not in columns:
+            self.db.execute("ALTER TABLE entries ADD COLUMN selected INTEGER "
+                            "NOT NULL DEFAULT 1 CHECK(selected IN (0,1))")
         self.db.commit()
 
     @contextmanager
@@ -267,17 +272,53 @@ class BatchStore:
         self.source(source_id)
         with self.lock:
             total = self.db.execute("SELECT COUNT(*) FROM entries WHERE source_id=?", (source_id,)).fetchone()[0]
-            rows = self.db.execute("SELECT * FROM entries WHERE source_id=? ORDER BY kind, length(destination_path),destination_path LIMIT ? OFFSET ?",
+            rows = self.db.execute("SELECT e.*, CASE WHEN kind='dir' THEN EXISTS("
+                                   "SELECT 1 FROM entries child WHERE child.source_id=e.source_id "
+                                   "AND substr(child.normalized_path,1,length(e.normalized_path)+1)=e.normalized_path||'/' "
+                                   "AND child.selected!=e.selected) ELSE 0 END AS selection_partial "
+                                   "FROM entries e WHERE source_id=? ORDER BY kind, length(destination_path),destination_path LIMIT ? OFFSET ?",
                                    (source_id, limit, offset)).fetchall()
-            return {"entries": [dict(row) for row in rows], "total": total}
+            return {"entries": [dict(row, selected=bool(row["selected"]),
+                                     selection_partial=bool(row["selection_partial"]))
+                                for row in rows], "total": total}
 
-    def revalidate_verified_files(self, source_id):
+    def set_entry_selection(self, source_id, entry_id, selected):
+        if type(selected) is not bool:
+            raise ValueError("invalid_entry_selection")
         with self.connection() as db:
-            db.execute("UPDATE entries SET state='planned',error=NULL WHERE source_id=? AND kind='file' AND state='already_verified'", (source_id,))
+            entry = db.execute("SELECT * FROM entries WHERE source_id=? AND id=?",
+                               (source_id, entry_id)).fetchone()
+            if entry is None:
+                raise KeyError("entry_not_found")
+            target = entry["normalized_path"]
+            db.execute("UPDATE entries SET selected=? WHERE source_id=? AND (id=? "
+                       "OR (?='dir' AND substr(normalized_path,1,length(?)+1)=?||'/'))",
+                       (selected, source_id, entry_id, entry["kind"], target, target))
+            if selected:
+                db.execute("UPDATE entries SET selected=1 WHERE source_id=? AND kind='dir' "
+                           "AND substr(?,1,length(normalized_path)+1)=normalized_path||'/'",
+                           (source_id, target))
+
+    def start_local_transfer(self, batch_id):
+        with self.connection() as db:
+            batch = self._batch(db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone())
+            if batch["mode"] != "local" or batch["state"] != "ready" or batch["started"]:
+                raise ValueError("dry_run_required")
+            selected_sources = "SELECT id FROM sources WHERE batch_id=? AND selected=1"
+            db.execute("UPDATE entries SET state='skipped_by_user',error=NULL "
+                       "WHERE selected=0 AND source_id IN (" + selected_sources + ")", (batch_id,))
+            db.execute("UPDATE entries SET state='planned',error=NULL "
+                       "WHERE selected=1 AND kind='file' AND state='already_verified' "
+                       "AND source_id IN (" + selected_sources + ")", (batch_id,))
+            db.execute("UPDATE sources SET state=CASE WHEN EXISTS("
+                       "SELECT 1 FROM entries WHERE entries.source_id=sources.id AND entries.selected=1) "
+                       "THEN 'running' ELSE 'completed' END,error=NULL WHERE batch_id=? AND selected=1", (batch_id,))
+            db.execute("UPDATE batches SET state='running',phase='transfer',started=1,error=NULL,"
+                       "resume_state='running',updated_at=? WHERE id=?", (now(), batch_id))
 
     def next_entry(self, source_id):
         with self.lock:
-            row = self.db.execute("SELECT * FROM entries WHERE source_id=? AND state IN ('planned','downloading') ORDER BY kind,length(destination_path),destination_path LIMIT 1", (source_id,)).fetchone()
+            row = self.db.execute("SELECT * FROM entries WHERE source_id=? AND selected=1 AND state IN ('planned','downloading') ORDER BY kind,length(destination_path),destination_path LIMIT 1", (source_id,)).fetchone()
             return dict(row) if row else None
 
     def update_entry(self, entry_id, **fields):
@@ -288,19 +329,29 @@ class BatchStore:
 
     def summary(self, source_id):
         with self.lock:
-            rows = self.db.execute("SELECT kind,state,COUNT(*) count,COALESCE(SUM(size),0) bytes,COALESCE(MAX(size),0) largest FROM entries WHERE source_id=? GROUP BY kind,state", (source_id,)).fetchall()
+            rows = self.db.execute("SELECT kind,state,selected,COUNT(*) count,COALESCE(SUM(size),0) bytes,COALESCE(MAX(size),0) largest FROM entries WHERE source_id=? GROUP BY kind,state,selected", (source_id,)).fetchall()
         value = {"total_files": 0, "total_directories": 0, "total_bytes": 0,
                  "required_bytes": 0, "verified_bytes": 0, "largest_file": 0, "largest_required_file": 0, "issues": 0}
+        selection = {"total": 0, "selected": 0, "excluded": 0, "selected_files": 0,
+                     "selected_directories": 0, "selected_bytes": 0, "editable": False}
         for row in rows:
             value["total_files" if row["kind"] == "file" else "total_directories"] += row["count"]
+            selection["total"] += row["count"]
+            selection["selected" if row["selected"] else "excluded"] += row["count"]
             if row["kind"] == "file":
                 value["total_bytes"] += row["bytes"]
                 value["largest_file"] = max(value["largest_file"], row["largest"])
+            if not row["selected"]:
+                continue
+            selection["selected_files" if row["kind"] == "file" else "selected_directories"] += row["count"]
+            if row["kind"] == "file":
+                selection["selected_bytes"] += row["bytes"]
                 value["verified_bytes" if row["state"] in {"done", "already_verified"} else "required_bytes"] += row["bytes"]
                 if row["state"] not in {"done", "already_verified"}:
                     value["largest_required_file"] = max(value["largest_required_file"], row["largest"])
             if row["state"] in {"conflict", "verification_unavailable", "failed"}:
                 value["issues"] += row["count"]
+        value["selection"] = selection
         return value
 
     def event(self, batch_id, source_id, payload):
