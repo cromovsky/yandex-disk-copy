@@ -133,6 +133,7 @@ class MigrationService:
             selection["editable"] = False
             can_start_transfer = False
         return {**job, "selection": selection,
+                "managed_by_batch": job["id"] in self.excluded_job_ids,
                 "can_start_transfer": can_start_transfer, "blocked_by": blocker,
                 "transfer_rates": self.runner.transfer_rates(job["id"]),
                 "stop_blocked": False,

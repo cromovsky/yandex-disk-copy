@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
+from .destination import account_uid, account_upn, bound_oauth_url
 from .diagnostics import DIAGNOSTIC_KEYS, diagnostic_fields
 from .errors import MigrationError, OPERATION_REFERENCE_ISSUES, disk_path
 from .journal import STAGE_LABELS, STAGE_STATUSES, enrich_event
@@ -23,6 +24,7 @@ POINT_RETRY_PHASES = frozenset({
     "failed", "transfer_intent", "unknown_transfer", "move_intent", "unknown_move",
     "abandoned_transfer", "abandoned_move", "waiting_transfer", "waiting_move",
 })
+MAX_PUBLICATION_ATTEMPTS = 3
 
 CONFIG_KEYS = frozenset({
     "source_org_id", "source_client_id", "source_email", "source_path",
@@ -45,6 +47,7 @@ _EVENT_KEYS = DIAGNOSTIC_KEYS | frozenset({
     "stop_requested", "full_stop_requested", "restart_of", "restart_job_id",
     "stage", "http_status", "duration_ms", "remote_status", "source_path",
     "download_attempts", "max_download_attempts", "retry_delay_ms", "retry_at_ms",
+    "publication_attempts", "max_publication_attempts",
     "point_retry_requested", "point_retry_attempts", "max_point_retry_attempts",
     "operation_reference_issue", "retry_enabled",
     "selected", "plan_complete", "selection_frozen",
@@ -84,7 +87,19 @@ def _parent_paths(path):
         yield "disk:/"
 
 
-def canonical_config(config):
+def _valid_config_path(path):
+    if not isinstance(path, str) or not path.startswith("disk:/"):
+        return False
+    if path == "disk:/":
+        return True
+    return len(path.encode("utf-8")) <= 4096 and all(
+        part not in {"", ".", ".."} and "\\" not in part and ":" not in part
+        and not any(ord(c) < 32 or ord(c) == 127 for c in part)
+        and len(part.encode("utf-8")) <= 255 for part in path[6:].split("/")
+    )
+
+
+def canonical_config(config, *, batch_child=False):
     """Explicit whitelist; secret-bearing or signed API addresses are rejected."""
     if not isinstance(config, dict):
         raise ValueError("invalid_config_fields")
@@ -99,9 +114,46 @@ def canonical_config(config):
     if source_kind not in {"personal", "shared"}:
         raise ValueError("invalid_source_shared_disk")
     source_public = value.pop("source_public", False)
-    if not isinstance(source_public, bool) or (source_public and kind != "shared"):
+    auth = value.get("destination_auth")
+    personal = kind == "personal" and auth in ("admin_token", "service_application")
+    if not isinstance(source_public, bool) or (
+        source_public and kind != "shared" and not personal
+    ):
         raise ValueError("invalid_source_public")
     keys = CONFIG_KEYS | SHARED_CONFIG_KEYS if kind == "shared" else CONFIG_KEYS
+    if personal:
+        if (value.get("destination_type") != "personal" or source_kind != "personal"
+                or not source_public or value.get("strategy") != "staged"
+                or value.get("identity_confirmed", False) is not False
+                or not _valid_config_path(value.get("source_path"))
+                or (auth == "service_application" and "destination_oauth_url" not in value
+                    and value["source_path"] != "disk:/")
+                or (value.get("destination_root") != "disk:/" and not (
+                    batch_child and auth == "service_application" and "destination_oauth_url" in value
+                    and _valid_config_path(value.get("destination_root"))))):
+            raise ValueError("invalid_personal_destination")
+    shared_service = kind == "shared" and auth == "service_application"
+    if shared_service and (value.get("strategy") != "staged"
+                           or value.get("identity_confirmed", False) is not False
+                           or not account_upn(value.get("destination_identity"))
+                           or not value.get("destination_oauth_url")):
+        raise ValueError("invalid_shared_service_application")
+    if personal or shared_service:
+        binding_fields = {"destination_identity"}
+        if auth == "service_application":
+            binding_fields.add("destination_client_id")
+        for key in binding_fields:
+            item = _string(value.get(key), limit=256)
+            if any(c.isspace() for c in item) or any(c in item for c in "/\\:"):
+                raise ValueError("invalid_personal_destination")
+        if auth == "service_application" and "destination_oauth_url" in value:
+            keys |= {"destination_oauth_url"}
+            value["destination_oauth_url"] = bound_oauth_url(value)
+        if auth == "admin_token" or "destination_oauth_url" in value:
+            recipient = value["destination_identity"]
+            if account_uid(recipient) is None and account_upn(recipient) is None:
+                raise ValueError("invalid_personal_destination")
+        keys |= binding_fields | {"destination_auth", "destination_type"}
     if source_kind == "shared":
         keys |= SOURCE_CONFIG_KEYS
         if (kind != "shared" or source_public
@@ -144,16 +196,7 @@ def canonical_config(config):
         if (not isinstance(vd_hash, str)
                 or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", vd_hash)):
             raise ValueError("invalid_destination_shared_disk")
-        if not isinstance(base, str) or not base.startswith("disk:/"):
-            raise ValueError("invalid_destination_shared_disk")
-        suffix = base[5:]
-        if (len(base.encode("utf-8")) > 4096
-                or (suffix != "/" and any(
-                    p in {"", ".", ".."} or "\\" in p or ":" in p
-                    or any(ord(c) < 32 or ord(c) == 127 for c in p)
-                    or len(p.encode("utf-8")) > 255
-                    for p in suffix.split("/")[1:]
-                ))):
+        if not _valid_config_path(base):
             raise ValueError("invalid_destination_shared_disk")
         email = value["source_email"]
         folder = value["source_folder"] if source_kind == "shared" else email
@@ -177,7 +220,7 @@ def canonical_config(config):
 
 def config_identity(config):
     """Mutable execution preferences never invalidate a reviewed transfer plan."""
-    value = canonical_config(config)
+    value = canonical_config(config, batch_child=True)
     value.pop("retry_enabled", None)
     return value
 
@@ -194,7 +237,7 @@ class MigrationStore:
         self._closed = False
         with self._connection() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}:
+            if version not in range(12):
                 raise ValueError("unsupported_store_version")
             connection.execute("PRAGMA journal_mode=WAL")
             # Rebuild attempts while keeping entries.attempt_id references unchanged.
@@ -247,7 +290,8 @@ class MigrationStore:
                     job_id TEXT NOT NULL REFERENCES jobs(id),
                     state TEXT NOT NULL CHECK(state IN (
                         'planned','intent','published','failed'
-                    )), error TEXT, updated_at TEXT NOT NULL
+                    )), error TEXT, updated_at TEXT NOT NULL,
+                    denial TEXT
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +306,14 @@ class MigrationStore:
             for statement in schema.split(";"):
                 if statement.strip():
                     connection.execute(statement)
+            if "denial" not in {r["name"] for r in connection.execute("PRAGMA table_info(publications)")}:
+                connection.execute("ALTER TABLE publications ADD COLUMN denial TEXT")
+                # Older jobs stopped at their first confirmed refusal.
+                connection.execute(
+                    "UPDATE publications SET denial=? WHERE state='failed' AND error='source_publication_denied'",
+                    (_json({"status": "waiting", "error": "source_publication_denied",
+                            "error_side": "saas", "publication_attempts": 1}),),
+                )
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(jobs)")
             }
@@ -284,6 +336,8 @@ class MigrationStore:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN restart_of TEXT REFERENCES jobs(id)",
                 )
+            if "destination_verified_uid" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN destination_verified_uid TEXT")
             for name in ("plan_complete", "selection_frozen"):
                 if name not in columns:
                     connection.execute(
@@ -344,8 +398,8 @@ class MigrationStore:
                 connection.execute("ALTER TABLE attempts_v7 RENAME TO attempts")
                 if connection.execute("PRAGMA foreign_key_check").fetchone():
                     raise sqlite3.IntegrityError("migration_foreign_key_check_failed")
-            if version < 9:
-                connection.execute("PRAGMA user_version=9")
+            if version < 11:
+                connection.execute("PRAGMA user_version=11")
         os.chmod(self.path, 0o600)
 
     @contextmanager
@@ -519,13 +573,16 @@ class MigrationStore:
             if key in {
                 "download_attempts", "max_download_attempts", "retry_delay_ms",
                 "retry_at_ms", "point_retry_attempts", "max_point_retry_attempts",
+                "publication_attempts", "max_publication_attempts",
             }:
                 nullable = key in {"retry_delay_ms", "retry_at_ms"}
                 minimum = 1 if key in {
                     "max_download_attempts", "max_point_retry_attempts",
+                    "max_publication_attempts", "publication_attempts",
                 } else 0
                 maximum = (3 if key in {
                     "point_retry_attempts", "max_point_retry_attempts",
+                    "publication_attempts", "max_publication_attempts",
                 } else 5 if key in {
                     "download_attempts", "max_download_attempts",
                 } else 2 ** 63 - 1)
@@ -593,10 +650,10 @@ class MigrationStore:
             "created_at": now, "type": event_type, "payload": dict(payload),
         }
 
-    def create(self, config, idempotency_key, *, initial_state="queued"):
+    def create(self, config, idempotency_key, *, initial_state="queued", batch_child=False):
         if initial_state not in {"queued", "planning"}:
             raise ValueError("invalid_initial_state")
-        config = canonical_config(config)
+        config = canonical_config(config, batch_child=batch_child)
         if not isinstance(idempotency_key, str) or not _OPERATION_ID.fullmatch(
             idempotency_key,
         ):
@@ -618,7 +675,8 @@ class MigrationStore:
     def _create_job(self, connection, config, idempotency_key, *, restart_of=None,
                     initial_state="queued"):
         job_id, now = uuid.uuid4().hex, _now()
-        direct = json.loads(config).get("destination_type") == "shared"
+        decoded = json.loads(config)
+        direct = decoded.get("destination_type") in {"shared", "personal"}
         connection.execute(
             "INSERT INTO jobs(id,idempotency_key,config,state,remote_root,"
             "namespace_state,restart_of,created_at,updated_at) "
@@ -627,7 +685,7 @@ class MigrationStore:
              "" if direct else f"disk:/.disk-copy-transfer-{job_id}",
              "owned" if direct else "unclaimed", restart_of, now, now),
         )
-        retry_enabled = json.loads(config).get("retry_enabled", True)
+        retry_enabled = decoded.get("retry_enabled", True)
         payload = {"state": initial_state, "retry_enabled": retry_enabled}
         if restart_of is not None:
             payload["restart_of"] = restart_of
@@ -646,6 +704,20 @@ class MigrationStore:
             config["retry_enabled"] = enabled
             connection.execute("UPDATE jobs SET config=? WHERE id=?", (_json(config), job_id))
             if not enabled:
+                # A PUT already sent may still return a definitive refusal.
+                connection.execute(
+                    "UPDATE publications SET denial=json_set(coalesce(denial,'{}'),'$.cancelled',1) "
+                    "WHERE job_id=? AND state='intent'", (job_id,),
+                )
+                publications = connection.execute(
+                    "SELECT entry_id,denial FROM publications WHERE job_id=? AND state='failed' "
+                    "AND json_extract(denial,'$.status')='waiting'", (job_id,),
+                ).fetchall()
+                for publication in publications:
+                    cancelled_points.extend(self._save_publication_denial(
+                        connection, job_id, publication["entry_id"],
+                        json.loads(publication["denial"]), enabled=False,
+                    ))
                 waiting = connection.execute(
                     "SELECT entries.*,attempts.phase FROM entries JOIN attempts "
                     "ON attempts.id=entries.attempt_id WHERE entries.job_id=? AND "
@@ -840,7 +912,8 @@ class MigrationStore:
             self._event(connection, job_id, "job_updated", fields)
             return self._job(connection, self._required(connection, "jobs", job_id))
 
-    def add_entries(self, job_id, entries, *, mark_ready=False, append=False):
+    def add_entries(self, job_id, entries, *, mark_ready=False, append=False,
+                    destination_verified_uid=None):
         if not isinstance(mark_ready, bool):
             raise ValueError("invalid_mark_ready")
         values = []
@@ -889,6 +962,17 @@ class MigrationStore:
                     "VALUES(?,?,?,?,?,?,?,?,?,'planned',?,?)", values,
                 )
                 config = json.loads(job["config"])
+                if destination_verified_uid is not None and (
+                    not mark_ready or config.get("destination_auth") != "service_application"
+                    or not isinstance(destination_verified_uid, str)
+                    or account_uid(destination_verified_uid) != destination_verified_uid
+                ):
+                    raise ValueError("invalid_verified_uid")
+                if mark_ready and config.get("destination_auth") == "service_application":
+                    if not config.get("destination_oauth_url") or not destination_verified_uid:
+                        raise ValueError("destination_plan_required")
+                    if job["destination_verified_uid"] not in (None, destination_verified_uid):
+                        raise ValueError("destination_identity_mismatch")
                 if config.get("source_public"):
                     root = config["source_path"]
                     publications = [
@@ -904,8 +988,9 @@ class MigrationStore:
                 payload = {"count": len(values)}
                 if mark_ready:
                     connection.execute(
-                        "UPDATE jobs SET state='ready',error=NULL,plan_complete=1 WHERE id=?",
-                        (job_id,),
+                        "UPDATE jobs SET state='ready',error=NULL,plan_complete=1,"
+                        "destination_verified_uid=? WHERE id=?",
+                        (destination_verified_uid, job_id),
                     )
                     payload["state"] = "ready"
                 self._event(connection, job_id, "plan_created", payload)
@@ -1062,7 +1147,9 @@ class MigrationStore:
             self._required(connection, "jobs", job_id)
             rows = connection.execute(
                 "SELECT p.entry_id,e.source_path,e.kind,e.resource_id,e.size,e.md5,"
-                "e.modified,p.state,p.error,p.updated_at FROM publications p "
+                "e.modified,p.state,p.error,p.updated_at,"
+                "coalesce(json_extract(p.denial,'$.publication_attempts'),0) AS publication_attempts,"
+                "json_extract(p.denial,'$.status') AS denial_status FROM publications p "
                 "JOIN entries e ON e.id=p.entry_id AND e.job_id=p.job_id "
                 "WHERE p.job_id=? ORDER BY e.rowid", (job_id,),
             ).fetchall()
@@ -1091,15 +1178,102 @@ class MigrationStore:
                 raise ValueError("job_stopped")
             if state not in transitions[row["state"]]:
                 raise ValueError("invalid_publication_transition")
+            denial = json.loads(row["denial"]) if row["denial"] else {}
+            if state == "intent" and denial.get("status") == "skipped":
+                # The retry switch can cancel this root during its metadata/limiter wait.
+                return None
             now = _now()
+            if state == "intent" and not json.loads(job["config"]).get("retry_enabled", True):
+                if row["state"] == "failed" and denial.get("status") == "waiting":
+                    self._save_publication_denial(connection, job_id, entry_id, denial, enabled=False)
+                    return None
+                denial["cancelled"] = 1
+            if state in {"published", "failed"}:
+                # A new result supersedes an earlier refusal's pending decision.
+                denial = {"publication_attempts": denial["publication_attempts"]} if (
+                    "publication_attempts" in denial
+                ) else {}
             connection.execute(
-                "UPDATE publications SET state=?,error=?,updated_at=? "
-                "WHERE entry_id=? AND job_id=?", (state, error, now, entry_id, job_id),
+                "UPDATE publications SET state=?,error=?,updated_at=?,denial=? "
+                "WHERE entry_id=? AND job_id=?",
+                (state, error, now, _json(denial) if denial else None, entry_id, job_id),
             )
             self._event(connection, job_id, "publication_checkpoint", {
                 "entry_id": entry_id, "phase": state, "error": error,
             })
             return dict(row, state=state, error=error, updated_at=now)
+
+    def _save_publication_denial(self, connection, job_id, entry_id, payload, *, enabled):
+        count = payload["publication_attempts"]
+        limit = MAX_PUBLICATION_ATTEMPTS if enabled else count
+        retry = count < limit
+        payload = {**payload, "stage": "publish_source", "retry_enabled": enabled,
+                   "max_publication_attempts": limit, "status": "waiting" if retry else "skipped"}
+        now = _now()
+        connection.execute(
+            "UPDATE publications SET state='failed',error=?,denial=?,updated_at=? "
+            "WHERE job_id=? AND entry_id=?",
+            (payload["error"], _json(payload), now, job_id, entry_id),
+        )
+        self._event(connection, job_id, "publication_checkpoint", {
+            "entry_id": entry_id, "phase": "failed", "error": payload["error"],
+        })
+        if retry:
+            self._event(connection, job_id, "transfer_stage", {**payload, "entry_id": entry_id})
+            return []
+
+        root = self._required(connection, "entries", entry_id)["source_path"]
+        # Only pre-download work depends on a share. Preserve verified entries,
+        # staged bytes and submitted operations even when their parent is denied.
+        entries = connection.execute(
+            "SELECT e.id,e.attempt_id,e.point_retry_requested FROM entries e "
+            "LEFT JOIN attempts a ON a.id=e.attempt_id "
+            "WHERE e.job_id=? AND e.selected=1 AND (e.source_path=? OR instr(e.source_path,?)=1) "
+            "AND e.state IN ('planned','transferring','downloading','staged') "
+            "AND (a.id IS NULL OR a.phase IN ('prepared','downloading','download_retry_wait'))",
+            (job_id, root, root + "/"),
+        ).fetchall()
+        for entry in entries:
+            if entry["attempt_id"]:
+                connection.execute(
+                    "UPDATE attempts SET phase='failed',error=?,updated_at=? WHERE id=?",
+                    (payload["error"], now, entry["attempt_id"]),
+                )
+            connection.execute(
+                "UPDATE entries SET state='failed',error=?,retry_at_ms=NULL,updated_at=? WHERE id=?",
+                (payload["error"], now, entry["id"]),
+            )
+            self._event(connection, job_id, "transfer_stage", {
+                **payload, "entry_id": entry["id"], "attempt_id": entry["attempt_id"],
+            })
+        return [entry["id"] for entry in entries if entry["point_retry_requested"]]
+
+    def record_publication_denial(self, job_id, failure):
+        with self._connection(write=True) as connection:
+            entry_id = failure["entry_id"]
+            row = connection.execute(
+                "SELECT state,denial FROM publications WHERE job_id=? AND entry_id=?",
+                (job_id, entry_id),
+            ).fetchone()
+            if not row or row["state"] == "published":
+                raise ValueError("invalid_publication_transition")
+            previous = json.loads(row["denial"]) if row["denial"] else {}
+            count = previous.get("publication_attempts", 0) + 1
+            job = self._required(connection, "jobs", job_id)
+            enabled = json.loads(job["config"]).get("retry_enabled", True) and not previous.get("cancelled")
+            self._event(connection, job_id, "transfer_stage", failure)
+            self._save_publication_denial(connection, job_id, entry_id, {
+                "error": failure["error"], "error_side": "saas", "http_status": failure["http_status"],
+                **diagnostic_fields(failure), "publication_attempts": count,
+            }, enabled=enabled)
+            return enabled and count < MAX_PUBLICATION_ATTEMPTS
+
+    def reset_publication_retries(self, job_id):
+        with self._connection(write=True) as connection:
+            connection.execute(
+                "UPDATE publications SET denial=NULL WHERE job_id=? AND state='failed' AND denial IS NOT NULL",
+                (job_id,),
+            )
 
     def schedule_download_retry(self, entry_id, attempt_id, retry_at_ms, payload):
         """Publish the retry timer and its phase as one cancellable checkpoint."""
@@ -1264,6 +1438,12 @@ class MigrationStore:
                 raise ValueError("attempt_not_retryable")
             if self._point_retry_busy(connection, job_id):
                 raise ValueError("active_or_unknown_attempt")
+            connection.execute(
+                "UPDATE publications SET denial=NULL WHERE job_id=? AND state='failed' "
+                "AND denial IS NOT NULL AND entry_id IN (SELECT id FROM entries WHERE job_id=? "
+                "AND (source_path=? OR instr(?,source_path || '/')=1))",
+                (job_id, job_id, entry["source_path"], entry["source_path"]),
+            )
             now = _now()
             connection.execute(
                 "UPDATE entries SET point_retry_requested=1,point_retry_attempts=0,"

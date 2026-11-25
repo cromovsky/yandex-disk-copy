@@ -1123,6 +1123,47 @@ def test_concurrent_async_preflight_rejects_busy_guard(api, monkeypatch):
     asyncio.run(concurrent())
 
 
+@pytest.mark.parametrize("point_retry", [False, True], ids=["job", "entry"])
+def test_recipient_check_during_retry_allows_status_and_stop(api, monkeypatch, point_retry):
+    client, service = api
+    job_id, entry, attempt = attempted_job(api, phase="failed")
+    service.store.update_entry(entry["id"], state="failed")
+    base = f"/api/onprem/jobs/{job_id}"
+    revision = service.store.get(job_id)["revision"]
+    endpoint = f"{base}/entries/{entry['id']}/retry" if point_retry else f"{base}/retry"
+    payload = {"attempt_id": attempt["id"], "revision": revision} if point_retry else {}
+    entered, release = threading.Event(), threading.Event()
+
+    def check_recipient(job):
+        entered.set()
+        assert release.wait(3), "retry blocked the event loop"
+
+    monkeypatch.setattr(service.runner, "ensure_personal_recipient", check_recipient)
+
+    async def concurrent():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=client.app),
+            base_url=client.base_url, headers=client.headers,
+        ) as caller:
+            retry = asyncio.create_task(caller.post(endpoint, json=payload))
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                assert (await caller.get(base)).status_code == 200
+                selection = await caller.post(f"{base}/entries/{entry['id']}/selection",
+                                              json={"selected": False, "revision": revision})
+                assert (selection.status_code, selection.json()["detail"]) == (409, "job_busy")
+                stop = await caller.post(f"{base}/stop")
+                assert stop.status_code == 200 and stop.json()["stop_requested"]
+            finally:
+                release.set()
+                response = await retry
+            assert (response.status_code, response.json()["detail"]) == (409, "job_stopped")
+
+    asyncio.run(concurrent())
+    assert service.store.entry(entry["id"])["attempt_id"] == attempt["id"]
+    assert not service.store.entry(entry["id"])["point_retry_requested"]
+
+
 def test_stop_is_local_and_works_while_worker_guard_is_held(api, monkeypatch):
     client, service = api
     job_id, entry, attempt = attempted_job(api)

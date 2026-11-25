@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /srv
 
-ARG VERSION=3.3.0
+ARG VERSION=3.4.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="Yandex Disk Copy" \
     org.opencontainers.image.version="${VERSION}" \
@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY docs/INSTRUCTION.md docs/ONPREM.md docs/UPDATE.md ./docs/
+COPY docs/INSTRUCTION.md docs/ONPREM.md docs/ONPREM_ACCESS.md docs/UPDATE.md ./docs/
 
 # Режим «между организациями»: 1 — включён (образ v2), 0 — скрыт (образ v1)
 ARG CROSS_ORG_ENABLED=1

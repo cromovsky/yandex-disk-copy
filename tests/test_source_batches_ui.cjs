@@ -8,34 +8,42 @@ const {loadUi} = require("./helpers/legacy_ui.cjs");
 const code = fs.readFileSync(path.resolve(__dirname, "../app/static/source-batches.js"), "utf8");
 const flush = async () => { for (let count = 0; count < 5; count += 1) await new Promise((resolve) => setImmediate(resolve)); };
 const clone = (value) => JSON.parse(JSON.stringify(value));
-async function setup({mode = "local", enabled = true, state = "ready", complete = true, credentials = true, sourceError = null, started = false, selectionError = null, failFirstPlan = false, strategy = "staged", childStrategy = null, createdBatchId = "list-id", failCreates = false, retryEnabled = true, retryError = null, createdRetryEnabled = null, createGate = null} = {}) {
+async function setup({mode = "local", enabled = true, sharedAvailable = true, state = "ready", complete = true, credentials = true, sourceError = null, started = false, selectionError = null, failFirstPlan = false, strategy = "staged", childStrategy = null, employeeToken = strategy === "url" || childStrategy === "url", createdBatchId = "list-id", failCreates = false, createError = null, retryEnabled = true, retryError = null, createdRetryEnabled = null, createGate = null, waitForOpen, waitForEntries} = {}) {
   const ui = await loadUi({cross_org: true, onprem_enabled: enabled});
   const values = {local_client_id: "client", local_orgid: "org", local_client_secret: "secret-value", local_admin_token: "admin-token-value", local_page_limit: "1000",
     "onprem-source-org": "org", "onprem-source-client": "client", "onprem-source-secret": "secret-value", "onprem-source-admin-token": "admin-token-value",
-    "onprem-destination-url": "https://disk.example.test", "onprem-destination-identity": "operator@example.test",
+    "onprem-destination-url": "https://cloud-api.example.test", "onprem-destination-client-id": "office-app", "onprem-destination-identity": "operator@example.test",
     "onprem-destination-token": "destination-token-value", "onprem-destination-vd-hash": "target", "onprem-strategy": "staged"};
   for (const [id, value] of Object.entries(values)) ui.byId.get(id).value = value;
   ui.byId.get("onprem-identity-confirmed").checked = true;
   const config = {source_org_id: "org", source_client_id: "client", page_limit: 1000, retry_enabled: retryEnabled,
-    ...(mode === "onprem" ? {destination_url: "https://disk.example.test/v1/disk", destination_identity: "operator@example.test", destination_vd_hash: "target", identity_confirmed: true, strategy} : {})};
+    ...(mode === "onprem" ? {destination_url: "https://cloud-api.example.test/v1/disk", destination_identity: "operator@example.test", destination_vd_hash: "target", strategy,
+      ...(employeeToken ? {identity_confirmed: true} : {identity_confirmed: false, destination_type: "shared", destination_auth: "service_application", destination_client_id: "office-app"})} : {})};
   const detail = {batch: {id: "list-id", mode, state, phase: "inventory", created_at: "2026-10-14T10:00:00Z", config,
     credentials_available: credentials, started, summary: {selected_sources: 2, ready_sources: 2, failed_sources: 0, total_files: 2, total_bytes: 2048, required_bytes: 1024, verified_bytes: 1024}},
     sources: [{id: "source-a", type: "personal", email: "user@example.test", path: "disk:/", selected: true, plan_complete: complete, state: sourceError ? "error" : "ready", error: sourceError,
       folder: "user@example.test", summary: {total_files: 1, total_directories: 0, total_bytes: 1024, required_bytes: 1024, largest_file: 1024}},
       {id: "source-b", type: "shared", email: "reader@example.test", vd_hash: "source-vd", path: "disk:/", selected: true, plan_complete: true, state: "ready", folder: "<script>disk</script> (source-vd)", summary: {total_files: 1, total_bytes: 1024, required_bytes: 0, largest_file: 1024}}]};
+  if (mode === "onprem" && !employeeToken) {
+    detail.batch.shared_operator_uid = "1000123";
+    detail.sources.forEach(row => {row.destination_verified_uid = detail.batch.shared_operator_uid;});
+  }
   if (childStrategy) Object.assign(detail.sources[0], {child_job_id: "a".repeat(32), child_strategy: childStrategy});
   const requests = [], events = [], timers = [];
   const listeners = {};
-  const window = {diskCopyRetries: ui.window.diskCopyRetries, diskCopyConfigPromise: Promise.resolve({onprem_enabled: enabled, onprem_auth_required: false}),
+  const window = {diskCopyRetries: ui.window.diskCopyRetries, confirm: () => true, diskCopyConfigPromise: Promise.resolve({onprem_enabled: enabled, onprem_auth_required: false, onprem_personal_service_application_available: true, onprem_shared_service_application_available: sharedAvailable}),
     addEventListener(name, fn) {(listeners[name] ||= []).push(fn);},
     dispatchEvent(event) {events.push(event); (listeners[event.type] || []).forEach((fn) => fn(event));}};
   const fetch = async (address, options = {}) => {
     const url = new URL(address, "http://localhost");
     const method = options.method || "GET", body = options.body ? JSON.parse(options.body) : null;
     requests.push({url, method, body, options});
+    if (waitForOpen && method === "GET" && url.pathname === "/api/source-batches/list-id") await waitForOpen();
+    if (waitForEntries && url.pathname.endsWith("/entries")) await waitForEntries();
     if (createGate && method === "POST" && url.pathname === "/api/source-batches") await createGate;
     if (failCreates && method === "POST" && url.pathname === "/api/source-batches") throw new Error("simulated create response interruption");
     if (method === "POST" && url.pathname === "/api/source-batches") {
+      if (createError) return {ok: false, status: 422, json: async () => ({detail: createError})};
       detail.batch.id = createdBatchId; detail.batch.state = "draft"; detail.batch.credentials_available = true;
       detail.batch.config = clone(body.config); detail.batch.started = false;
       if (createdRetryEnabled !== null) detail.batch.config.retry_enabled = createdRetryEnabled;
@@ -64,14 +72,14 @@ async function setup({mode = "local", enabled = true, state = "ready", complete 
       return {ok: true, status: 200, json: async () => ({retry_enabled: body.enabled})};
     }
     let response = detail;
-    if (url.pathname.endsWith("/entries")) response = {total: 1, entries: [{source_path: "disk:/<unsafe>.txt", destination_path: "/<unsafe>.txt", size: 1024, state: "planned"}]};
+    if (url.pathname.endsWith("/entries")) response = {total: 1, entries: [{id: "file-1", source_path: "disk:/<unsafe>.txt", destination_path: "/<unsafe>.txt", size: 1024, state: "planned"}]};
     else if (url.pathname === "/api/source-batches" && method === "GET") response = {batches: [detail.batch], has_more: false};
     return {ok: true, status: 200, json: async () => clone(response), blob: async () => new Blob(["report"])};
   };
   // Any unsafe HTML renderer makes the test fail, including source/destination/API values.
   for (const node of ui.byId.values()) Object.defineProperty(node, "innerHTML", {set() {throw new Error("unsafe HTML");}});
   vm.runInNewContext(code, {window, document: ui.document, fetch, crypto, Uint8Array, URL, Blob, console,
-    CustomEvent: class {constructor(type, options) {this.type = type; this.detail = options.detail;}},
+    CustomEvent: class {constructor(type, options = {}) {this.type = type; this.detail = options.detail;}},
     setTimeout(fn) {timers.push(fn); return timers.length;}, clearTimeout() {}});
   await flush();
   const tab = ui.document.querySelector(`.mode-tab[data-mode="${mode}"]`); tab.classList.add("active");
@@ -79,7 +87,15 @@ async function setup({mode = "local", enabled = true, state = "ready", complete 
   ui.byId.get(`${mode}-source-input`).value = "list";
   await ui.byId.get(`${mode}-source-input`).fire("change");
   await window.sourceBatches.open(mode, "list-id");
-  if (mode === "onprem") {ui.byId.get("onprem-identity-confirmed").checked = true; await ui.byId.get("onprem-identity-confirmed").fire("change");}
+  if (mode === "onprem" && employeeToken) {
+    ui.byId.get("onprem-destination-token").value = "destination-token-value";
+    ui.byId.get("onprem-identity-confirmed").checked = true;
+    await ui.byId.get("onprem-identity-confirmed").fire("change");
+  } else if (mode === "onprem") {
+    ui.byId.get("onprem-destination-client-secret").value = "app-secret";
+    ui.byId.get("onprem-destination-owner-token").value = "owner";
+    await ui.byId.get("onprem-destination-owner-token").fire("input");
+  }
   return {ui, node, window, requests, events, timers, detail};
 }
 
@@ -142,8 +158,326 @@ test("Onprem list removes hidden per-source required fields and restores them in
   assert.equal(ui.byId.get("onprem-single-run").hidden, false);
 });
 
+for (const edit of ["single", "url", "csv"]) test(`late list history respects new ${edit} input`, async () => {
+  let gate, release;
+  const {ui, node, window} = await setup({mode: "onprem", waitForOpen: () => gate});
+  gate = new Promise(resolve => {release = resolve;});
+  const pending = window.sourceBatches.open("onprem", "list-id");
+  const url = ui.byId.get("onprem-destination-url");
+  url.value = "https://cloud-api.draft.example";
+  node("csv").value = "personal,new@example.test,,/";
+  if (edit === "single") {
+    const choice = ui.byId.get("onprem-source-input");
+    choice.value = "single"; await choice.fire("change");
+  } else await (edit === "url" ? url : node("csv")).fire("input");
+  release(); await pending;
+  assert.equal(url.value, "https://cloud-api.draft.example");
+  assert.equal(node("csv").value, "personal,new@example.test,,/");
+});
+
+test("opening another list clears access only for the changed organization or destination", async () => {
+  const {ui, detail, window} = await setup({mode: "onprem", employeeToken: true});
+  const get = name => ui.byId.get("onprem-" + name);
+  assert.ok(get("destination-token").value, "the same API with /v1/disk keeps its token");
+  detail.batch.config.source_org_id = "another-org";
+  await window.sourceBatches.open("onprem", "list-id");
+  assert.equal(get("source-secret").value, "");
+  assert.equal(get("source-admin-token").value, "");
+  assert.ok(get("destination-token").value);
+  get("source-secret").value = "new-test-only";
+  detail.batch.config.destination_url = "https://cloud-api.other.example/v1/disk";
+  await window.sourceBatches.open("onprem", "list-id");
+  assert.equal(get("destination-token").value, "");
+  assert.equal(get("source-secret").value, "new-test-only");
+});
+
+test("personal history restores both addresses, quoted paths and the verified recipient, including mapping errors", async () => {
+  const {ui, node, detail, window, requests} = await setup({mode: "onprem"});
+  const get = id => ui.byId.get("onprem-" + id);
+  Object.assign(detail.batch.config, {destination_type: "personal", destination_auth: "service_application",
+    destination_url: "https://cloud-api.office.example/v1/disk", destination_client_id: "office-client"});
+  delete detail.batch.config.destination_vd_hash;
+  delete detail.batch.config.destination_identity;
+  Object.assign(detail.sources[0], {csv_row: 1, path: 'disk:/А, "Б"', destination_email: "first@office.example",
+    destination_folder: "disk:/Архив", planned_destination_path: 'disk:/Архив/А, "Б"', destination_verified_uid: "9007199254740993210", mapping_error: "personal_mapping_conflict", conflict_rows: [1, 2]});
+  Object.assign(detail.sources[1], {type: "personal", csv_row: 2, destination_email: "alias@office.example",
+    destination_folder: "disk:/", destination_verified_uid: "9007199254740993210"});
+  await window.sourceBatches.open("onprem", "list-id");
+  assert.equal(get("destination-personal").checked, true);
+  assert.match(node("template").getAttribute("href"), /^\/static\/personal-disk-pairs\.csv(?:\?v=\w+)?$/);
+  assert.match(node("csv").value, /^source_email,path,destination_email,destination_folder\n/);
+  assert.match(node("csv").value, /"user@example.test","\/А, ""Б""","first@office.example","\/Архив"/);
+  assert.deepEqual(node("csv").value.split("\n").slice(2), ['"reader@example.test","/","alias@office.example","/"']);
+  const row = node("sources").children[0];
+  assert.deepEqual(row.children.map(td => td.getAttribute("data-label")), ["№", "Источник SaaS", "Получатель On-premises", "Подробности"]);
+  assert.equal(row.children[0].textContent, "1");
+  assert.match(row.children[0].children[0].getAttribute("aria-label"), /строку 1/);
+  assert.equal(row.children[1].querySelector(".pair-path").textContent, '/А, "Б"');
+  assert.equal(row.children[2].querySelector(".pair-path").textContent, '/Архив/А, "Б"');
+  assert.match(node("sources").children[1].children[2].querySelector(".pair-path").textContent, /после проверки/);
+  for (const value of ["first@office.example", "9007199254740993210", "1, 2", "Общий диск"]) assert.ok(row.textContent.includes(value), value);
+  assert.equal(node("sources-head").hidden, true);
+  assert.equal(node("plan-state").textContent, "Требуется проверка");
+  assert.equal(node("start").disabled, true);
+  assert.equal(node("plan").disabled, true);
+  get("destination-client-secret").value = "office-secret";
+  get("destination-owner-token").value = "owner-access";
+  await get("destination-owner-token").fire("input");
+  assert.equal(node("start").disabled, true, "correct credentials cannot bypass a conflicting pair");
+  Object.assign(detail.sources[0], {mapping_error: "destination_identity_mismatch", credential_check: true, conflict_rows: [1]});
+  detail.sources[1].planned_destination_path = "disk:/";
+  await window.sourceBatches.refresh("onprem");
+  assert.equal(node("start").disabled, false, "Start rechecks corrected credentials against the saved UID");
+  assert.equal(node("start").textContent, "Начать перенос (2)");
+  assert.equal(node("plan").textContent, "Проверить ещё раз");
+  assert.equal(node("plan").disabled, false);
+  await node("plan").fire("click");
+  const body = requests.find(r => r.url.pathname === "/api/source-batches" && r.method === "POST").body;
+  assert.deepEqual(body.credentials, {source_client_secret: "secret-value", source_admin_token: "admin-token-value",
+    destination_client_secret: "office-secret", destination_owner_token: "owner-access"});
+  assert.equal(body.config.destination_type, "personal");
+  assert.equal(body.config.destination_auth, "service_application");
+  assert.equal(body.config.destination_client_id, "office-client");
+  for (const key of ["destination_identity", "destination_vd_hash", "identity_confirmed", "destination_oauth_url"]) assert.ok(!(key in body.config));
+  assert.equal(node("history").children.at(-1).textContent.includes("Личный Диск"), true);
+});
+
+async function personalList(extra = {}) {
+  const result = await setup({mode: "onprem", ...extra});
+  const {detail, window} = result;
+  Object.assign(detail.batch.config, {destination_type: "personal", destination_auth: "service_application", destination_client_id: "recipient-app"});
+  detail.sources.forEach((s, i) => Object.assign(s, {type: "personal", csv_row: i + 1, destination_email: `user${i}@office.example`,
+    destination_folder: "disk:/", planned_destination_path: "disk:/", destination_verified_uid: String(i+20)}));
+  await window.sourceBatches.open("onprem", "list-id");
+  return result;
+}
+
+test("personal CSV error filter keeps CSV numbers, diagnoses and selection of the full plan", async () => {
+  const {ui, node, window, requests, detail} = await personalList();
+  Object.assign(detail.sources[1], {mapping_error: "destination_path_collision", conflict_rows: [2, 5], conflict_path: "disk:/Архив",
+    error: "source_publication_denied", selected: false});
+  await window.sourceBatches.refresh("onprem");
+  const filter = node("filter-errors"), all = node("filter-all"), rows = node("sources");
+  assert.equal(filter.textContent, "С ошибками: 1");
+  assert.equal(filter.getAttribute("aria-pressed"), "false");
+  const before = requests.length;
+  await filter.fire("click");
+  assert.equal(filter.getAttribute("aria-pressed"), "true");
+  assert.equal(all.hidden, false);
+  assert.equal(rows.children.length, 1);
+  const row = rows.children[0];
+  assert.equal(row.querySelector(".pair-number").textContent, "2");
+  assert.match(row.textContent, /Строки CSV: 2, 5.*Архив/);
+  assert.match(row.textContent, /отклонил публикацию/);
+  assert.equal(row.querySelector("#onprem-pair-source-b-plan").closest("details"), null);
+  assert.equal(node("start").textContent, "Начать перенос (1)");
+  assert.equal(node("plan-count").textContent, "Личные Диски · выбрано строк: 1 из 2");
+  await all.fire("click");
+  assert.deepEqual(rows.children.map(r => r.querySelector(".pair-number").textContent), ["1", "2"]);
+  assert.deepEqual(rows.children.map(r => r.querySelector("input").checked), [true, false]);
+  assert.equal(requests.length, before);
+
+  for (const id of ["onprem-destination-client-secret", "onprem-destination-owner-token"]) {
+    const input = ui.byId.get(id); input.value = "test-value"; await input.fire("input");
+  }
+  await filter.fire("click");
+  await rows.children[0].querySelector("#onprem-pair-source-b-plan").fire("click");
+  assert.ok(requests.some(r => r.method === "POST" && r.url.pathname === "/api/source-batches/list-id/sources/source-b/plan"));
+  assert.ok(!requests.some(r => r.url.pathname.endsWith("/selection") || r.url.pathname.endsWith("/start")));
+});
+
+test("personal CSV polling updates filtered rows, clears hidden file panels and resets the filter on a new plan", async () => {
+  const {node, window, timers, detail} = await personalList();
+  detail.sources[1].summary.issues = 2;
+  await timers.at(-1)();
+  await node("sources").children[0].querySelector("#onprem-pair-source-a-files").fire("click");
+  assert.equal(node("details").hidden, false);
+  await node("filter-errors").fire("click");
+  assert.equal(node("details").hidden, true);
+  assert.equal(node("filter-errors").textContent, "С ошибками: 1");
+  assert.match(node("sources").textContent, /Откройте.*«Файлы»/);
+  await node("sources").children[0].querySelector("#onprem-pair-source-b-files").fire("click");
+  await timers.at(-1)();
+  assert.equal(node("details").hidden, false);
+  assert.equal(node("sources").children.length, 1);
+  detail.sources[1].summary.issues = 0;
+  detail.sources[1].state = "completed_with_issues";
+  await timers.at(-1)();
+  assert.equal(node("filter-errors").textContent, "С ошибками: 1");
+  detail.sources[1].state = "ready";
+  await timers.at(-1)();
+  assert.equal(node("details").hidden, true);
+  assert.equal(node("filter-errors").textContent, "С ошибками: 0");
+  assert.equal(node("filter-errors").getAttribute("aria-pressed"), "true");
+  assert.match(node("sources").textContent, /Строк с ошибками нет/);
+  await node("filter-all").fire("click");
+  assert.equal(node("sources").children.length, 2);
+  detail.sources[0].state = "error";
+  await timers.at(-1)();
+  await node("filter-errors").fire("click");
+  detail.batch.id = "another-list";
+  await window.sourceBatches.open("onprem", detail.batch.id);
+  assert.equal(node("sources").children.length, 2);
+  assert.equal(node("filter-errors").getAttribute("aria-pressed"), "false");
+});
+
+test("a late file list update cannot reopen a row hidden by the personal CSV error filter", async () => {
+  let pendingRead, releaseRead, startedRead;
+  const {node, detail, timers, requests} = await personalList({waitForEntries: () => {
+    if (startedRead) startedRead();
+    return pendingRead;
+  }});
+  detail.sources[1].error = "source_auth_failed";
+  await timers.at(-1)();
+  await node("sources").children[0].querySelector("#onprem-pair-source-a-files").fire("click");
+  pendingRead = new Promise(resolve => { releaseRead = resolve; });
+  const reading = new Promise(resolve => { startedRead = resolve; });
+  const refresh = timers.at(-1)();
+  await reading;
+  await node("filter-errors").fire("click");
+  releaseRead();
+  await refresh;
+  assert.equal(node("details").hidden, true);
+  const checkbox = node("sources").querySelector("input");
+  checkbox.checked = false;
+  await checkbox.fire("change");
+  assert.deepEqual(requests.at(-1).body, {source_ids: ["source-a"]});
+  assert.equal(node("plan-count").textContent, "Личные Диски · выбрано строк: 1 из 2");
+});
+
+test("editing a reviewed personal list hides the stale routes and ready action until restored", async () => {
+  const {ui, node} = await personalList();
+  const root = ui.byId.get("onprem-source-batches");
+  assert.ok(root.classList.contains("personal-plan-active"));
+  assert.equal(node("start").disabled, true, "history alone cannot start transfer");
+  assert.match(node("start-hint").textContent, /Параметры и доступы/);
+  assert.equal(node("publish-warning").hidden, false);
+  const selected = node("sources").children[0].children[0].children[0];
+  selected.checked = false; await selected.fire("change");
+  assert.equal(node("start").textContent, "Начать перенос (1)");
+  assert.equal(node("plan-count").textContent, "Личные Диски · выбрано строк: 1 из 2");
+  const reviewed = node("csv").value;
+  node("csv").value += "\nthird@example.test,other@example.test"; await node("csv").fire("input");
+  assert.equal(node("result").hidden, true);
+  assert.equal(node("start").hidden, true);
+  assert.equal(node("publish-warning").hidden, true);
+  assert.equal(node("plan").textContent, "Проверить план");
+  assert.equal(root.classList.contains("personal-plan-active"), false);
+  node("csv").value = reviewed; await node("csv").fire("input");
+  assert.equal(node("result").hidden, false);
+  assert.equal(node("plan-title").hidden, false);
+  assert.ok(node("plan-state").classList.contains("is-ready"));
+});
+
+for (const change of ["csv", "shared"]) test(`a different ${change} draft cannot control or export a hidden personal batch`, async () => {
+  const {ui, node, requests, detail} = await personalList({state: "running", started: true});
+  assert.equal(node("pause").hidden, false);
+  assert.equal(node("stop").disabled, false);
+  assert.equal(node("plan-state").classList.contains("is-ready"), false);
+  if (change === "csv") {
+    node("csv").value += "\nother@cloud.example,other@office.example"; await node("csv").fire("input");
+  } else {
+    ui.byId.get("onprem-destination-personal").checked = false;
+    const shared = ui.byId.get("onprem-destination-shared"); shared.checked = true; await shared.fire("change");
+  }
+  assert.equal(node("result").hidden, true);
+  assert.equal(node("history").value, "");
+  const baseline = requests.length;
+  for (const k of ["pause", "resume", "start", "stop", "restart", "report", "journal"]) {
+    assert.ok(node(k).disabled, k);
+    await node(k).dispatch("click");
+  }
+  const retry = ui.byId.get("retry-onprem"); retry.checked = false; await retry.fire("change");
+  assert.equal(requests.length, baseline);
+  assert.equal(detail.batch.config.retry_enabled, true);
+});
+
+test("personal batch polling keeps an open disclosure and keyboard focus on the same control or file", async () => {
+  const {ui, node, timers} = await personalList();
+  const freshElement = ui.document.createElement;
+  ui.document.createElement = tag => {
+    const el = freshElement(tag);
+    el.focus = opts => { assert.equal(opts.preventScroll, true); ui.document.activeElement = el; };
+    return el;
+  };
+  const panel = node("sources").children[0].querySelector("details"); panel.open = true;
+  const summary = panel.querySelector("summary"); ui.document.activeElement = summary;
+  await timers.at(-1)();
+  const refreshed = node("sources").children[0].querySelector("details");
+  assert.notEqual(refreshed, panel);
+  assert.equal(refreshed.open, true);
+  assert.equal(ui.document.activeElement, refreshed.querySelector("summary"));
+  await refreshed.querySelector("#onprem-pair-source-a-files").fire("click");
+  const file = node("entries").querySelector("input");
+  ui.document.activeElement = file;
+  await timers.at(-1)();
+  const currentFile = node("entries").querySelector("input");
+  assert.notEqual(file, currentFile);
+  assert.equal(ui.document.activeElement, currentFile);
+});
+
+for (const mode of ["local", "onprem"]) test(`${mode} list stop requires confirmation, pause does not`, async () => {
+  const {node, window, requests} = await setup({mode, state:"running", started:true});
+  let decisions = 0;
+  window.confirm = prompt => { decisions++; assert.match(prompt, /Остановить весь список от/); return false; };
+  await node("stop").fire("click");
+  assert.equal(decisions, 1);
+  assert.equal(requests.some(r => r.url.pathname.endsWith("/stop")), false);
+  await node("pause").fire("click");
+  assert.equal(decisions, 1);
+  assert.ok(requests.some(r => r.url.pathname.endsWith("/pause")));
+});
+
+test("switching the list destination keeps separate CSV drafts and the old shared template", async () => {
+  const {ui, node} = await setup({mode: "onprem"});
+  const get = id => ui.byId.get("onprem-destination-" + id);
+  const sharedCsv = node("csv").value;
+  get("personal").checked = true; get("shared").checked = false; await get("personal").fire("change");
+  assert.equal(node("csv").value, "");
+  const pairs = "source_email,destination_email\nuser@cloud.example,user@office.example";
+  node("csv").value = pairs; await node("csv").fire("input");
+  get("personal").checked = false; get("shared").checked = true; await get("shared").fire("change");
+  assert.equal(node("csv").value, sharedCsv);
+  assert.equal(node("template").getAttribute("href"), "/static/source-list-template.csv");
+  get("personal").checked = true; get("shared").checked = false; await get("personal").fire("change");
+  assert.equal(node("csv").value, pairs);
+  const templatePath = new URL(node("template").getAttribute("href"), "http://localhost").pathname;
+  const template = fs.readFileSync(path.join(__dirname, "../app", templatePath), "utf8").trimEnd();
+  assert.equal(node("csv").placeholder, template);
+  const [header, withFolder, wholeDisk] = template.split("\n");
+  assert.equal(header, "source_email,path,destination_email,destination_folder");
+  assert.deepEqual(withFolder.split(","), ["aivanov@cloud.example", "/Документы", "apetrov@office.example", "/Архив/2026"]);
+  assert.deepEqual(wholeDisk.split(","), ["olga@cloud.example", "", "osokolova@office.example", ""]);
+});
+
+for (const [code, csvRow, message] of [
+  ["invalid_sources_columns", null, /^В заголовке CSV.*source_email.*destination_email/],
+  ["invalid_sources_row", 1, /^Строка 1\. .*email/],
+]) test(`a malformed personal CSV identifies the header or the account (${code})`, async () => {
+  const {ui, node} = await setup({mode: "onprem", createError: {code, csv_row: csvRow}});
+  const get = id => ui.byId.get("onprem-destination-" + id);
+  get("personal").checked = true; get("shared").checked = false; await get("personal").fire("change");
+  get("client-id").value = "office-client"; get("client-secret").value = "office-secret"; get("owner-token").value = "owner-token";
+  node("csv").value = csvRow ? "source_email,destination_email\n\na@cloud.example,?" : "source,destination\na@cloud.example,b@office.example";
+  await node("csv").fire("input");
+  await node("plan").fire("click");
+  assert.match(node("notice").textContent, message);
+  assert.doesNotMatch(node("notice").textContent, /vd_hash/);
+});
+
+test("returning to a cached page resumes polling the active list", async () => {
+  const {window, timers, requests} = await setup({mode: "onprem"});
+  window.dispatchEvent({type: "pagehide", persisted: true});
+  const before = timers.length;
+  window.dispatchEvent({type: "pageshow", persisted: true});
+  assert.equal(timers.length, before + 1);
+  const reads = requests.length;
+  await timers.at(-1)();
+  assert.ok(requests.length > reads);
+});
+
 test("restart credential recovery automatically attaches entered secrets then resumes", async () => {
-  const {node, requests, ui, detail} = await setup({mode: "onprem", state: "awaiting_credentials", credentials: false});
+  const {node, requests, ui, detail} = await setup({mode: "onprem", employeeToken: true, sharedAvailable: false, state: "awaiting_credentials", credentials: false});
   detail.batch.resume_state = "running";
   assert.equal(node("resume").disabled, false);
   await node("resume").fire("click");
@@ -415,13 +749,25 @@ test("Onprem CSV Dry Run uses staged despite DOM strategy tampering", async () =
   assert.equal(create.body.config.strategy, "staged", "the source-list payload cannot select URL import");
 });
 
+async function enterServiceAccessAfterLegacyPlan(ui, node) {
+  assert.equal(ui.byId.get("onprem-destination-token").value, "");
+  assert.equal(ui.byId.get("onprem-identity-confirmed").checked, false);
+  ui.byId.get("onprem-destination-client-id").value = "office-app";
+  ui.byId.get("onprem-destination-client-secret").value = "office-secret";
+  ui.byId.get("onprem-destination-owner-token").value = "owner";
+  await ui.byId.get("onprem-destination-owner-token").fire("input");
+  assert.equal(node("plan").disabled, false);
+  await node("plan").fire("click");
+}
+
 test("restoring an old URL source list prepares a new staged Dry Run", async () => {
   const {ui, node, requests} = await setup({mode: "onprem", strategy: "url"});
   assert.equal(ui.byId.get("onprem-strategy").value, "staged");
   assert.equal(node("start").disabled, true, "an old URL list cannot start with new staged settings");
   assert.equal(node("report").disabled, false, "history still supports export");
   await node("plan").fire("click");
-  await flush();
+  assert.ok(requests.every(request => request.method === "GET"));
+  await enterServiceAccessAfterLegacyPlan(ui, node);
   const create = requests.find((request) => request.method === "POST" && request.url.pathname === "/api/source-batches");
   assert.ok(create);
   assert.equal(create.body.config.strategy, "staged");
@@ -507,9 +853,11 @@ test("historical URL lists retain history files exports and stop without attachi
 test("historical URL lists can create an independent staged Dry Run from active and terminal states", async () => {
   for (const options of [{strategy: "url"}, {childStrategy: "url"}]) {
     for (const [state, action] of [["running", "plan"], ["stopped", "restart"]]) {
-      const {node, requests, detail} = await setup({mode: "onprem", state, createdBatchId: "fresh-staged-list", ...options});
+      const {ui, node, requests, detail} = await setup({mode: "onprem", state, createdBatchId: "fresh-staged-list", ...options});
       assert.equal(node(action).disabled, false, "new staged plan is the recovery path");
       await node(action).fire("click");
+      assert.ok(requests.every(request => request.method === "GET"));
+      await enterServiceAccessAfterLegacyPlan(ui, node);
       const mutations = requests.filter((request) => request.method !== "GET");
       assert.deepEqual(mutations.map((request) => request.url.pathname), ["/api/source-batches", "/api/source-batches/fresh-staged-list/plan"]);
       assert.equal(mutations[0].body.config.strategy, "staged");
@@ -587,4 +935,68 @@ for (const mode of ["local", "onprem"]) for (const switchContext of [false, true
   assert.equal(changes.length, switchContext ? 0 : 1);
   assert.equal(detail.batch.config.retry_enabled, switchContext);
   assert.equal(check.checked, false);
+});
+
+test("shared CSV uses one delegated operator for all sources and restores the access method from history", async () => {
+  const {ui, node, requests, detail, window} = await setup({mode: "onprem", employeeToken: true});
+  const get = suffix => ui.byId.get("onprem-" + suffix);
+  assert.equal(get("shared-auth"), undefined);
+  assert.equal(window.sourceBatches.usesEmployeeToken(), true);
+  get("destination-token").value = "";
+  get("identity-confirmed").checked = false;
+  await get("identity-confirmed").fire("change");
+  await node("plan").fire("click");
+  assert.equal(window.sourceBatches.usesEmployeeToken(), false);
+  assert.ok(requests.every(r => r.method === "GET"), "switching an old plan never creates a new transfer");
+  assert.equal(node("start").disabled, true, "old manual-token list is detached");
+  get("destination-url").value = "https://cloud-api.office.test";
+  get("destination-identity").value = "writer@office.test";
+  get("destination-client-id").value = "app";
+  get("destination-client-secret").value = "app-secret";
+  get("destination-owner-token").value = "owner";
+  get("identity-confirmed").checked = false;
+  await get("destination-owner-token").fire("input");
+  assert.equal(node("plan").disabled, false);
+  await node("plan").fire("click");
+  const body = requests.find(r => r.url.pathname === "/api/source-batches" && r.method === "POST").body;
+  assert.equal(body.config.destination_auth, "service_application");
+  assert.equal(body.config.destination_type, "shared");
+  assert.equal(body.config.destination_identity, "writer@office.test");
+  assert.equal(body.config.destination_vd_hash, "target");
+  assert.equal(body.config.identity_confirmed, false);
+  assert.deepEqual(body.credentials, {source_client_secret:"secret-value", source_admin_token:"admin-token-value",
+    destination_client_secret:"app-secret", destination_owner_token:"owner"});
+  assert.match(body.sources_csv, /^type,email,vd_hash,path/);
+  detail.batch.state = "ready"; detail.batch.shared_operator_uid = "1000123";
+  detail.sources.forEach(row => { row.destination_verified_uid = "1000123"; });
+  get("destination-owner-token").value = "";
+  get("destination-client-secret").value = "";
+  await window.sourceBatches.open("onprem", detail.batch.id);
+  assert.equal(window.sourceBatches.usesEmployeeToken(), false);
+  assert.match(node("operator").textContent, /writer@office.test.*1000123/);
+  assert.equal(get("destination-owner-token").value, "");
+  assert.equal(node("start").disabled, true);
+  get("destination-client-secret").value = "restored-secret";
+  get("destination-owner-token").value = "restored-owner";
+  await get("destination-owner-token").fire("input");
+  assert.equal(node("start").disabled, false);
+  await node("start").fire("click");
+  assert.deepEqual(requests.at(-2).body.credentials, {...body.credentials, destination_client_secret:"restored-secret", destination_owner_token:"restored-owner"});
+  assert.match(requests.at(-1).url.pathname, /\/start$/);
+});
+
+
+test("new shared list stays unavailable without delegated access, even with saved employee credentials", async () => {
+  const {ui, node, requests, window} = await setup({mode: "onprem", employeeToken: true, sharedAvailable: false});
+  assert.equal(window.sourceBatches.usesEmployeeToken(), true);
+  assert.equal(node("start").disabled, false);
+  node("history").value = ""; await node("history").fire("change");
+  assert.equal(window.sourceBatches.usesEmployeeToken(), false);
+  assert.equal(ui.byId.get("onprem-destination-token").value, "");
+  ui.byId.get("onprem-destination-token").value = "injected-token";
+  ui.byId.get("onprem-identity-confirmed").checked = true;
+  await ui.byId.get("onprem-identity-confirmed").fire("change");
+  assert.equal(node("plan").disabled, true);
+  await node("plan").fire("click");
+  assert.ok(requests.every(request => request.method === "GET"));
 });

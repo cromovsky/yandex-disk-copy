@@ -7,6 +7,10 @@
   if (!panel || !tab) return;
 
   const fields = Array.from(panel.querySelectorAll("[data-onprem-config]"));
+  const lastConfigValues = new Map();
+  const draftKey = "diskCopyPersonalDraft:v1";
+  const draftFields = ["onprem-source-org", "onprem-source-client", "onprem-source-email", "onprem-source-path",
+    "onprem-recipient", "onprem-destination-url", "onprem-destination-client-id"];
   const operationReferencePattern = /^(?:\?id=)?[A-Za-z0-9_-]{1,256}$/;
   const jobIdPattern = /^[a-f0-9]{32}$/;
   const labels = {
@@ -35,16 +39,28 @@
   const errors = {
     onprem_access_required: "Нужен действующий ключ доступа к режиму on-premises.",
     credentials_required: "Проверьте Client secret и токен в форме, затем нажмите «Продолжить».",
+    onprem_personal_token_unavailable: "Установленная версия сервера утилиты не поддерживает доступ к личному Диску по токену администратора.",
+    invalid_shared_service_application: "Укажите полный email сотрудника с доступом к общему Диску и параметры сервисного приложения On-premises.",
+    onprem_shared_grant_unavailable: "Эта версия утилиты не поддерживает сервисное приложение для общих Дисков.",
+    invalid_personal_disk_api_url: "Укажите HTTPS-адрес Disk API вашей установки в формате https://cloud-api.<домен>/v1/disk.",
+    invalid_destination_oauth_url: "Адрес OAuth не соответствует адресу Disk API этой установки. Проверьте адрес Disk API и составьте новый план.",
+    onprem_personal_grant_unavailable: "Проверьте поддержку сервисного приложения в установке On-premises.",
+    destination_service_credentials_required: "Введите Client secret и токен владельца организации On-premises.",
+    destination_plan_required: "План не содержит подтверждённого UID. Выполните новый Dry Run.",
+    invalid_personal_destination: "Проверьте email или UID получателя и параметры переноса на личный Диск On-premises.",
+    transfer_not_started: "Сначала выполните Dry Run, проверьте план и нажмите «Начать перенос».",
+    destination_identity_unverified: "Disk API не подтвердил владельца личного Диска. Проверьте сведения о получателе в поле user ответа GET /v1/disk/.",
+    destination_admin_token_required: "Введите токен администратора On-premises для доступа к личному Диску.",
     source_credentials_required: "Введите Client secret источника.",
     destination_credentials_required: "Введите токен сотрудника с доступом к общему диску.",
     identity_confirmation_required: "Подтвердите владельца токена назначения.",
-    destination_identity_mismatch: "Учётная запись On-premises не совпала с выбором.",
+    destination_identity_mismatch: "Сервер открыл Диск другой учётной записи On-premises. Проверьте токен и идентификатор получателя.",
     invalid_destination_shared_disk: "Укажите корректную метку существующего общего диска из его адреса.",
     destination_shared_access_required: "Нет доступа к выбранному общему диску On-premises.",
     destination_shared_disk_mismatch: "Ответ API относится к другому общему диску. Проверьте метку назначения.",
     destination_read_only: "On-premises отклонил запрос: ресурс заблокирован или доступ ограничен.",
     onprem_staged_required: "Это историческое задание с прежним способом переноса. Доступны просмотр, остановка и экспорт. Для переноса выполните новый Dry Run.",
-    legacy_personal_job: "Это историческое задание на личный Диск. Доступны просмотр, остановка и CSV. Для общего диска подготовьте новое задание.",
+    legacy_personal_job: "Это историческое задание на личный Диск. Доступны просмотр, остановка и CSV. Для нового переноса выполните Dry Run.",
     credential_binding_mismatch: "Доступы не соответствуют настройкам задания.",
     credentials_binding_mismatch: "Доступы не соответствуют настройкам задания.",
     source_changed: "Исходный файл SaaS изменился после подготовки плана.",
@@ -217,8 +233,12 @@
   };
 
   let enabled = false;
+  let personalAvailable = false;
+  let serviceAvailable = false;
+  let sharedServiceAvailable = false;
   let authRequired = false;
   let selected = null;
+  let selectedFormBinding = null;
   let entries = [];
   let pointRetryButtons = [];
   let entrySelectionChecks = [];
@@ -238,6 +258,18 @@
   let verifiedDestination = null;
   let verifiedBinding = null;
   let destinationCheckRevision = 0;
+  let listFormActive = false;
+  let inactiveForm = null;
+  const browser = byId("onprem-browser");
+  const browseSource = byId("onprem-browse-source");
+  const browsePath = byId("onprem-source-path");
+  const browserStatus = byId("onprem-browser-status");
+  const browserItems = byId("onprem-browser-list");
+  const browserMore = byId("onprem-browser-more");
+  const browserSelect = byId("onprem-browser-select");
+  let browseRevision = 0, browseOffset = 0, browseFolder = "/";
+  let browseFolderRevision = 0;
+  let browseAccount = null;
 
   function errorCode(value) {
     if (typeof value === "string") return value;
@@ -257,7 +289,9 @@
         ? ` (HTTP ${value.status})` : "";
       return `Запрос отклонён${status}. Обновите задание и проверьте доступность действия.`;
     }
-    const text = errors[errorCode(value)] || "Операция не выполнена. Проверьте доступы и состояние задания.";
+    const text = errorCode(value) === "destination_identity_unverified" && sharedServiceForm()
+      ? "Disk API не подтвердил UID сотрудника с доступом к общему Диску. Проверьте его email."
+      : errors[errorCode(value)] || "Операция не выполнена. Проверьте доступы и состояние задания.";
     const diagnostic = Object.hasOwn(errors, errorCode(value)) ? journalDiagnostic(value?.diagnostic_message) : "";
     return diagnostic ? `${text} ${diagnostic}` : text;
   }
@@ -331,9 +365,23 @@
     fields.forEach((field) => { config[field.dataset.onpremConfig] = field.value.trim(); });
     config.retry_enabled = window.diskCopyRetries?.value("onprem") !== false;
     config.strategy = "staged";
+    if (personalForm()) {
+      config.destination_type = "personal";
+      config.destination_auth = adminPersonal(selected?.config) ? "admin_token" : "service_application";
+      if (adminPersonal(config)) {
+        delete config.destination_client_id;
+      }
+      config.destination_identity = byId("onprem-recipient").value.trim();
+      config.source_public = true;
+      config.identity_confirmed = false;
+      delete config.destination_vd_hash;
+      return config;
+    }
+    if (sharedServiceForm()) config.destination_auth = "service_application";
+    else delete config.destination_client_id;
     config.destination_type = "shared";
     config.destination_base = "/";
-    config.identity_confirmed = byId("onprem-identity-confirmed").checked;
+    config.identity_confirmed = !sharedServiceForm() && byId("onprem-identity-confirmed").checked;
     config.source_public = true;
     if (selected?.config?.source_type === "shared" && config.source_email === selected.config.source_email) {
       config.source_type = "shared";
@@ -347,10 +395,252 @@
 
   function sharedConfig(config) { return config?.destination_type === "shared"; }
 
+  function sharedServiceForm() {
+    return !byId("onprem-destination-personal").checked && !employeeTokenContext(byId("onprem-source-input").value === "list");
+  }
+
+  function employeeTokenContext(list) {
+    return list ? Boolean(window.sourceBatches?.usesEmployeeToken?.()) : manualShared(selected?.config);
+  }
+
+  function personalForm() {
+    return byId("onprem-source-input").value !== "list" && byId("onprem-destination-personal").checked;
+  }
+
+  function draftValue(id, value) {
+    if (id === "onprem-destination-url" && !/^https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/(?:v1\/disk\/?)?)?$/i.test(value)) return "";
+    return value;
+  }
+
+  function saveDraft() {
+    try {
+      const values = Object.fromEntries(draftFields.map(id => [id, draftValue(id, byId(id).value)]));
+      if (!byId("onprem-destination-personal").checked) {
+        values.destinationKind = "shared";
+        const hash = byId("onprem-destination-vd-hash").value;
+        values.vdHash = /^[A-Za-z0-9_-]{1,256}$/.test(hash) ? hash : "";
+        values.operator = byId("onprem-destination-identity").value;
+      }
+      window.sessionStorage.setItem(draftKey, JSON.stringify(values));
+    } catch (_) {}
+  }
+
+  function restoreDraft() {
+    try {
+      const values = JSON.parse(window.sessionStorage.getItem(draftKey));
+      if (values?.destinationKind === "shared" || ["token", "service_application"].includes(values?.sharedAuth)) {
+        byId("onprem-destination-personal").checked = false;
+        byId("onprem-destination-shared").checked = true;
+        byId("onprem-destination-vd-hash").value = values.vdHash || "";
+        byId("onprem-destination-identity").value = values.operator || "";
+      }
+      for (const id of draftFields) {
+        if (typeof values?.[id] === "string") byId(id).value = draftValue(id, values[id]);
+      }
+    } catch (_) {}
+  }
+
+  function rememberConfigValues() {
+    [...fields, byId("onprem-recipient")].forEach(field => lastConfigValues.set(field, field.value));
+  }
+
+  function adminPersonal(config) {
+    return config?.destination_type === "personal" && config.destination_auth === "admin_token";
+  }
+
+  function servicePersonal(config) {
+    return config?.destination_type === "personal" && config.destination_auth === "service_application";
+  }
+
+  function manualShared(config) {
+    return sharedConfig(config) && config.destination_auth !== "service_application";
+  }
+
+  function hasPlanUid(job) {
+    return typeof job?.destination_verified_uid === "string" && /^[0-9]{1,20}$/.test(job.destination_verified_uid);
+  }
+
+  function supportedJob(job) {
+    if (job?.config?.destination_auth !== "service_application") return manualShared(job?.config) || adminPersonal(job?.config);
+    if (!job.config.destination_oauth_url) return false;
+    return hasPlanUid(job) || (job.plan_complete === false && job.selection_frozen === false &&
+      ["queued", "planning", "needs_attention"].includes(effectiveState(job)));
+  }
+
+  function personalAccessAvailable() {
+    return adminPersonal(selected?.config) ? personalAvailable : serviceAvailable;
+  }
+
+  function updateDestinationForm() {
+    const list = byId("onprem-source-input").value === "list";
+    byId("onprem-list-publication-note").hidden = !list;
+    const personal = byId("onprem-destination-personal").checked;
+    const setup = personal && (list ? serviceAvailable : personalAccessAvailable());
+    const adminAccess = setup && !list && adminPersonal(selected?.config);
+    const employeeToken = !personal && !sharedServiceForm();
+    const serviceAccess = (setup && !adminAccess) || (sharedServiceForm() && sharedServiceAvailable);
+    byId("onprem-shared-unavailable").hidden = !sharedServiceForm() || sharedServiceAvailable;
+    byId("onprem-token-label").hidden = byId("onprem-token-field").hidden = !employeeToken;
+    byId("onprem-destination-token").disabled = byId("onprem-identity-confirmed").disabled = !employeeToken;
+    byId("onprem-identity-label").textContent = sharedServiceForm() ? "Email сотрудника с доступом к общему Диску" : "Владелец токена назначения";
+    const identity = byId("onprem-destination-identity");
+    identity.type = sharedServiceForm() ? "email" : "text";
+    identity.placeholder = sharedServiceForm() ? "name@company.ru" : "Логин или email владельца токена";
+    byId("onprem-service-access").hidden = !serviceAccess;
+    for (const suffix of ["client-id", "client-secret", "owner-token"]) {
+      const field = byId("onprem-destination-" + suffix);
+      field.disabled = !serviceAccess;
+      field.required = serviceAccess;
+    }
+    byId("onprem-personal-fields").hidden = !personal || list;
+    byId("onprem-admin-access").hidden = !adminAccess;
+    byId("onprem-shared-fields").hidden = personal;
+    byId("onprem-shared-confirm").hidden = !employeeToken;
+    byId("onprem-source-access").hidden = byId("onprem-target-access").hidden = personal && !setup;
+    byId("onprem-personal-unavailable").hidden = !personal || setup;
+    for (const id of ["onprem-destination-vd-hash", "onprem-destination-identity"]) {
+      byId(id).disabled = personal;
+    }
+    byId("onprem-recipient").disabled = !personal || list;
+    byId("onprem-recipient").required = personal && !list;
+    const token = byId("onprem-destination-admin-token");
+    token.disabled = !adminAccess;
+    token.required = adminAccess;
+    const note = byId("onprem-source-folder-note");
+    const config = selected?.config;
+    browseSource.hidden = list || config?.source_type === "shared";
+    byId("onprem-source-email-label").textContent = (!personal && config?.source_type === "shared")
+      ? "Email сотрудника с доступом к общему диску SaaS" : "Email владельца личного Диска SaaS";
+    if (personal) note.textContent = "Файлы сохранят исходные пути на личном Диске получателя.";
+    else if (config?.source_type === "shared") note.textContent = `Источник: общий диск [${config.source_vd_hash || ""}]. Папка назначения: ${config.source_folder || ""}.`;
+    else note.textContent = "Для каждого email создаётся собственная папка на общем диске; структура исходных папок сохраняется.";
+  }
+
   function friendlyPath(value) {
     const path = String(value || "/");
     return path.startsWith("disk:") ? path.slice(5) || "/" : path;
   }
+
+  function browseAccess() {
+    const access = {
+      source_email: byId("onprem-source-email").value.trim(),
+      source_org_id: byId("onprem-source-org").value.trim(),
+      source_client_id: byId("onprem-source-client").value.trim(),
+      source_client_secret: byId("onprem-source-secret").value,
+    };
+    const admin = byId("onprem-source-admin-token").value;
+    if (admin) access.source_admin_token = admin;
+    return access;
+  }
+
+  function browseCurrent() {
+    if (!browser.open || !browseAccount || browseSource.hidden || !active() || !authorized()) return false;
+    const current = browseAccess();
+    return Object.keys(current).length === Object.keys(browseAccount).length &&
+      Object.keys(current).every(key => current[key] === browseAccount[key]);
+  }
+
+  function closeBrowser() {
+    browseRevision++;
+    browseAccount = null;
+    browserItems.replaceChildren();
+    byId("onprem-browser-account").textContent = "";
+    if (browser.open) browser.close();
+  }
+
+  function chooseSourcePath(path) {
+    if (!browseCurrent()) return;
+    closeBrowser();
+    browsePath.value = path;
+    browsePath.dispatchEvent(new Event("input", {bubbles: true}));
+  }
+
+  async function loadSourceFolder(path, offset = 0) {
+    if (!browseCurrent()) return;
+    const revision = ++browseRevision;
+    const current = () => revision === browseRevision && browseCurrent();
+    browseFolder = path;
+    browseOffset = offset;
+    byId("onprem-browser-path").textContent = path === "/" ? "Весь Диск сотрудника" : path;
+    byId("onprem-browser-up").hidden = path === "/";
+    browserSelect.textContent = path === "/" ? "Выбрать весь Диск" : "Выбрать эту папку";
+    if (offset === 0) {
+      browseFolderRevision++;
+      browserItems.replaceChildren();
+      browserSelect.disabled = true;
+    }
+    const folderRevision = browseFolderRevision;
+    browserMore.hidden = true;
+    browserStatus.textContent = "Загружаем список…";
+    try {
+      const page = await request("/source/browse", {method: "POST", body: {...browseAccount, path, offset}});
+      if (!current()) return;
+      if (!page || typeof page.path !== "string" || page.path !== "disk:" + path || !Array.isArray(page.items) ||
+          (page.next_offset !== null && (!Number.isSafeInteger(page.next_offset) || page.next_offset <= offset))) {
+        throw failure("invalid_response");
+      }
+      const rows = page.items.map(item => {
+        const child = friendlyPath(item?.path);
+        if (!["file", "dir"].includes(item?.type) || typeof item.name !== "string" || !item.name ||
+            item.name.includes("/") || child !== (path === "/" ? "/" : path + "/") + item.name) {
+          throw failure("invalid_response");
+        }
+        const folder = item.type === "dir";
+        const row = document.createElement("li"), button = document.createElement("button");
+        const kind = document.createElement("small");
+        button.type = "button";
+        button.textContent = item.name;
+        kind.textContent = folder ? "Папка ›" : "Файл";
+        button.appendChild(kind);
+        button.setAttribute("aria-label", (folder ? "Открыть папку " : "Выбрать файл ") + item.name);
+        button.addEventListener("click", () => {
+          if (browseFolderRevision !== folderRevision || !browseCurrent()) return;
+          if (folder) { loadSourceFolder(child); byId("onprem-browser-path").focus(); }
+          else chooseSourcePath(child);
+        });
+        row.appendChild(button);
+        return row;
+      });
+      rows.forEach(row => browserItems.appendChild(row));
+      browseOffset = page.next_offset;
+      browserMore.hidden = browseOffset === null;
+      browserMore.textContent = "Показать ещё";
+      browserSelect.disabled = false;
+      browserStatus.textContent = !offset && !rows.length ? "Папка пуста." : "";
+    } catch (error) {
+      if (!current()) return;
+      browserStatus.textContent = errorText(error);
+      browserMore.textContent = "Повторить";
+      browserMore.hidden = false;
+    }
+  }
+
+  browseSource.addEventListener("click", () => {
+    if (!active() || !authorized() || browseSource.hidden || browseSource.disabled) return;
+    for (const id of ["onprem-source-email", "onprem-source-org", "onprem-source-client", "onprem-source-secret"]) {
+      const field = byId(id);
+      if (!field.value.trim() || !field.checkValidity()) {
+        if (id !== "onprem-source-email") byId("onprem-source-access").open = true;
+        field.focus();
+        field.reportValidity();
+        return;
+      }
+    }
+    browseAccount = browseAccess();
+    byId("onprem-browser-account").textContent = browseAccount.source_email;
+    browser.showModal();
+    loadSourceFolder("/");
+  });
+  byId("onprem-browser-close").addEventListener("click", closeBrowser);
+  browser.addEventListener("close", () => { if (!browser.open) closeBrowser(); });
+  byId("onprem-browser-up").addEventListener("click", () => {
+    loadSourceFolder(browseFolder.slice(0, browseFolder.lastIndexOf("/")) || "/");
+    byId("onprem-browser-path").focus();
+  });
+  browserMore.addEventListener("click", () => {
+    if (!browserMore.hidden) loadSourceFolder(browseFolder, browseOffset);
+  });
+  browserSelect.addEventListener("click", () => { if (!browserSelect.disabled) chooseSourcePath(browseFolder); });
 
   function comparable(key, value) {
     let text = String(value ?? "").trim();
@@ -371,10 +661,9 @@
   }
 
   function bindingKey(config) {
-    return JSON.stringify(fields.map((field) => {
-      const key = field.dataset.onpremConfig;
-      return [key, comparable(key, config[key])];
-    }));
+    const keys = fields.map(field => field.dataset.onpremConfig);
+    keys.push("destination_type", "destination_auth");
+    return JSON.stringify(keys.map(key => [key, comparable(key, config[key])]));
   }
 
   function checkedDestination(config) {
@@ -382,7 +671,7 @@
   }
 
   function destinationLabel(config) {
-    if (!sharedConfig(config)) return "Личный Диск On-premises";
+    if (!sharedConfig(config)) return "Личный Диск On-premises" + (config?.destination_identity ? " · " + config.destination_identity : "");
     const name = checkedDestination(config)?.name;
     return `Общий диск On-premises ${name ? "«" + name + "» " : ""}[${config.destination_vd_hash || "метка не указана"}]`;
   }
@@ -404,7 +693,30 @@
     const node = byId("onprem-destination-preview");
     if (!node) return;
     const config = readConfig();
+    const personal = config.destination_type === "personal";
+    byId("onprem-personal-preview").hidden = !personal;
+    node.hidden = personal || byId("onprem-source-input").value === "list";
+    if (personal) {
+      byId("onprem-preview-source").textContent = config.source_email || "укажите email";
+      byId("onprem-preview-recipient").textContent = config.destination_identity || "укажите email";
+      const path = config.source_path ? comparable("source_path", config.source_path) : "укажите исходный путь";
+      byId("onprem-preview-source-path").textContent = path;
+      byId("onprem-preview-destination-path").textContent = path;
+      if (servicePersonal(selected?.config) && hasPlanUid(selected) && originalConfigMatches()) {
+        const check = byId("onprem-destination-check");
+        check.textContent = `Получатель ${selected.config.destination_identity} · подтверждённый UID ${selected.destination_verified_uid}`;
+        check.hidden = false;
+        const file = entries.find(entry => entry.source_path === selected.config.source_path);
+        const prefix = friendlyPath(selected.config.destination_root).replace(/\/$/, "");
+        byId("onprem-preview-destination-path").textContent = file ? friendlyPath(file.destination_path)
+          : prefix + (path === "/" && prefix ? "" : path);
+      }
+      return;
+    }
     node.textContent = "Для нового переноса: " + destinationPath(destinationFolder(config), config);
+    if (sharedServiceForm() && hasPlanUid(selected) && originalConfigMatches()) {
+      node.textContent += ` · Сотрудник: ${config.destination_identity} · UID: ${selected.destination_verified_uid}`;
+    }
     if (selected && sharedConfig(selected.config) && originalConfigMatches() &&
         comparable("destination_base", selected.config.destination_base) !== "/") {
       node.textContent += ". Текущее задание: " + destinationPath(selected.config.destination_root, selected.config);
@@ -427,14 +739,31 @@
       throw failure("credential_binding_mismatch");
     }
     const target = result?.destination;
+    if (config.destination_type === "personal") {
+      if (target?.type !== "personal" || typeof target.identity !== "string" || !target.identity.trim()) {
+        throw failure("destination_identity_unverified");
+      }
+      if (target.identity !== config.destination_identity) throw failure("destination_identity_mismatch");
+      if (servicePersonal(config) && (typeof target.verified_uid !== "string" || !/^[0-9]{1,20}$/.test(target.verified_uid))) {
+        throw failure("destination_identity_unverified");
+      }
+      const node = byId("onprem-destination-check");
+      node.textContent = `Владелец личного Диска подтверждён · ${target.identity}`;
+      node.hidden = false;
+      return;
+    }
     if (target?.type !== "shared" || target.vd_hash !== config.destination_vd_hash) {
       throw failure("destination_shared_disk_mismatch");
+    }
+    if (config.destination_auth === "service_application" && (!/^[0-9]{1,20}$/.test(target.verified_uid || "") || target.identity !== config.destination_identity)) {
+      throw failure("destination_identity_unverified");
     }
     const permissions = target.permissions;
     const read = Array.isArray(permissions) ? permissions.includes("read")
       : typeof permissions?.read === "boolean" ? permissions.read : null;
     const write = Array.isArray(permissions) ? permissions.includes("write")
       : typeof permissions?.write === "boolean" ? permissions.write : null;
+    if (config.destination_auth === "service_application" && (read !== true || write !== true)) throw failure("destination_shared_access_required");
     if (read === false) throw failure("destination_shared_access_required");
     if (write === false) throw failure("destination_read_only");
     const rights = read === true && write === true ? "Чтение и запись разрешены" : "API не указал права";
@@ -453,31 +782,71 @@
   function credentials() {
     const value = {
       source_client_secret: byId("onprem-source-secret").value,
-      destination_token: byId("onprem-destination-token").value,
     };
+    if (sharedServiceForm() || (personalForm() && !adminPersonal(selected?.config))) {
+      value.destination_client_secret = byId("onprem-destination-client-secret").value;
+      value.destination_owner_token = byId("onprem-destination-owner-token").value;
+    } else {
+      value.destination_token = byId(personalForm() ? "onprem-destination-admin-token" : "onprem-destination-token").value;
+    }
     const admin = byId("onprem-source-admin-token").value;
     if (admin.trim()) value.source_admin_token = admin;
     return value;
   }
 
-  function clearCredentials() {
+  function clearSourceCredentials() {
     byId("onprem-source-secret").value = "";
     byId("onprem-source-admin-token").value = "";
+  }
+
+  function clearDestinationCredentials() {
     byId("onprem-destination-token").value = "";
+    byId("onprem-destination-admin-token").value = "";
+    byId("onprem-destination-client-secret").value = "";
+    byId("onprem-destination-owner-token").value = "";
+  }
+
+  function clearCredentials() {
+    clearSourceCredentials();
+    clearDestinationCredentials();
+  }
+
+  function switchSourceMode(list) {
+    if (list === listFormActive) return;
+    const current = Object.fromEntries(fields.map(field => [field.dataset.onpremConfig, field.value]));
+    current.personal = byId("onprem-destination-personal").checked;
+    const tokenContextChanged = employeeTokenContext(listFormActive) !== employeeTokenContext(list);
+    if (inactiveForm) {
+      if (["source_org_id", "source_client_id"].some(key => current[key] !== inactiveForm[key])) clearSourceCredentials();
+      fields.forEach(field => { field.value = inactiveForm[field.dataset.onpremConfig]; });
+      byId("onprem-destination-personal").checked = inactiveForm.personal;
+      byId("onprem-destination-shared").checked = !inactiveForm.personal;
+    }
+    if (tokenContextChanged || (inactiveForm && ["personal", "destination_url", "destination_client_id", "destination_identity"].some(key =>
+      comparable(key, current[key]) !== comparable(key, inactiveForm[key])))) {
+      clearDestinationCredentials();
+      byId("onprem-identity-confirmed").checked = false;
+    }
+    inactiveForm = current;
+    listFormActive = list;
+    generation++;
+    rememberConfigValues();
+    schedulePoll();
   }
 
   function fillConfig(config) {
+    const personal = config.destination_type === "personal";
+    byId("onprem-destination-personal").checked = personal;
+    byId("onprem-destination-shared").checked = !personal;
+    byId("onprem-recipient").value = personal ? config.destination_identity : "";
+    updateDestinationForm();
     fields.forEach((field) => {
       const key = field.dataset.onpremConfig;
       const value = key === "strategy" ? "staged" : config[key] || (["source_path", "destination_base"].includes(key) ? "/" : "");
       field.value = ["source_path", "destination_base"].includes(key) ? friendlyPath(value) : value;
     });
+    if (personal) byId("onprem-destination-identity").value = "";
     byId("onprem-identity-confirmed").checked = false;
-    const sharedSource = config.source_type === "shared";
-    const label = byId("onprem-source-email-label");
-    if (label) label.textContent = sharedSource ? "Email сотрудника с доступом к общему диску SaaS" : "Email владельца личного Диска SaaS";
-    const note = byId("onprem-source-folder-note");
-    if (note) note.textContent = sharedSource ? `Источник: общий диск [${config.source_vd_hash || ""}]. Папка назначения: ${config.source_folder || ""}.` : "Для каждого email создаётся собственная папка на общем диске; структура исходных папок сохраняется.";
     clearDestinationCheck();
     updateDestinationPreview();
     clearCredentials();
@@ -594,7 +963,9 @@
     jobs.forEach((job) => {
       const option = document.createElement("option");
       option.value = job.id;
-      option.textContent = `Задание ${jobDateLabel(job)} · ${job.config?.source_email || "Источник не указан"} · ${jobStateLabel(job)}`;
+      const route = (job.config?.source_email || "Источник не указан") +
+        (job.config?.destination_type === "personal" ? " → " + job.config.destination_identity : "");
+      option.textContent = `Задание ${jobDateLabel(job)} · ${route} · ${jobStateLabel(job)}`;
       select.appendChild(option);
     });
     select.value = selected ? selected.id : "";
@@ -606,7 +977,8 @@
 
   function renderJob() {
     renderBlocked();
-    const legacy = selected && (!sharedConfig(selected.config) || selected.config.strategy !== "staged");
+    updateDestinationPreview();
+    const legacy = selected && (!supportedJob(selected) || selected.config.strategy !== "staged");
     byId("onprem-legacy-note").hidden = !legacy;
     byId("onprem-legacy-note").textContent = legacy
       ? !sharedConfig(selected.config) ? errors.legacy_personal_job : errors.onprem_staged_required : "";
@@ -744,7 +1116,7 @@
         attempt.textContent = `Попытка: ${entry.attempt_id}`;
         result.appendChild(attempt);
       }
-      if (!excluded && entry.kind === "file" && entry.can_retry === true && !oldWorkStopped(selected) && sharedConfig(selected.config)) {
+      if (!excluded && entry.kind === "file" && entry.can_retry === true && !oldWorkStopped(selected) && supportedJob(selected)) {
         const retry = document.createElement("button");
         retry.type = "button";
         retry.className = "secondary-btn";
@@ -766,7 +1138,7 @@
 
   function entrySelectionAvailable(entry) {
     return !busy && enabled && authorized() && selected && selected.selection?.editable === true &&
-      !oldWorkStopped(selected) && sharedConfig(selected.config) && selected.config.strategy === "staged" &&
+      !oldWorkStopped(selected) && supportedJob(selected) && selected.config.strategy === "staged" &&
       byId("onprem-source-input")?.value !== "list" && originalConfigMatches() && entries.includes(entry) && entry.can_select === true;
   }
 
@@ -808,8 +1180,8 @@
       entries.some((entry) => entry.state === state);
   }
 
-  function effectiveState() {
-    return selected?.state === "awaiting_credentials" ? selected.resume_state : selected?.state;
+  function effectiveState(job = selected) {
+    return job?.state === "awaiting_credentials" ? job.resume_state : job?.state;
   }
 
   function hasRunnableEntries() {
@@ -822,9 +1194,15 @@
   }
 
   function accessReady() {
-    return originalConfigMatches() && byId("onprem-identity-confirmed").checked &&
-      Boolean(credentials().source_client_secret.trim() && credentials().destination_token.trim()) &&
-      sharedConfig(selected?.config) && byId("onprem-form").checkValidity();
+    const secret = credentials();
+    const targetReady = sharedServiceForm()
+      ? sharedServiceAvailable && secret.destination_client_secret.trim() && secret.destination_owner_token.trim()
+      : personalForm()
+      ? personalAccessAvailable() && (adminPersonal(selected?.config) ? secret.destination_token.trim() :
+        secret.destination_client_secret.trim() && secret.destination_owner_token.trim())
+      : secret.destination_token.trim() && byId("onprem-identity-confirmed").checked;
+    return originalConfigMatches() && supportedJob(selected) && Boolean(targetReady && secret.source_client_secret.trim()) &&
+      byId("onprem-form").checkValidity();
   }
 
   function validPointRetryAttempts(value) {
@@ -836,7 +1214,7 @@
   }
 
   function pointRetryAvailable(entry) {
-    return !busy && enabled && authorized() && selected && sharedConfig(selected.config) && selected.config.strategy === "staged" &&
+    return !busy && enabled && authorized() && selected && supportedJob(selected) && selected.config.strategy === "staged" &&
       !oldWorkStopped(selected) && accessReady() && !pointRetryActive() &&
       entries.includes(entry) && entry?.kind === "file" && entry.can_retry === true;
   }
@@ -868,7 +1246,7 @@
       window.diskCopyRetries?.bind("onprem", {
         id: "onprem:" + (id || "new"), enabled: selected?.config?.retry_enabled !== false,
         loading: false,
-        editable: Boolean(selected && sharedConfig(selected.config) && selected.config.strategy === "staged" &&
+        editable: Boolean(selected && supportedJob(selected) && selected.config.strategy === "staged" &&
           !oldWorkStopped(selected) && !["completed", "completed_with_issues"].includes(selected.state)),
         save: async (enabled) => {
           const result = await request(`/jobs/${encodeURIComponent(id)}/retries`, {method: "POST", body: {enabled}});
@@ -878,8 +1256,9 @@
       });
     }
     const locked = busy || !enabled || !authorized();
-    const legacy = selected && (!sharedConfig(selected.config) || selected.config.strategy !== "staged");
-    const confirmed = byId("onprem-identity-confirmed").checked;
+    browseSource.disabled = locked;
+    const legacy = selected && (!supportedJob(selected) || selected.config.strategy !== "staged");
+    const canCreate = personalForm() ? serviceAvailable : sharedServiceAvailable;
     const state = selected?.state;
     const stopped = oldWorkStopped(selected);
     const fullStopNeeded = requiresFullStop(selected);
@@ -888,24 +1267,34 @@
     const namespaceBlocked = ["technical_namespace_exists", "technical_namespace_outcome_unknown"].includes(errorCode(selected?.error)) ||
       ["intent", "unknown"].includes(selected?.namespace_state);
     const access = accessReady();
+    const restartReady = manualShared(selected?.config) ? sharedServiceAvailable :
+      adminPersonal(selected?.config) ? personalForm() && serviceAvailable && originalConfigMatches() : access;
     const restoringAccess = ["paused", "awaiting_credentials"].includes(state) && (runnable || pointRetryActive());
     const prestart = selected?.can_start_transfer ?? selected?.selection?.editable;
     const startReady = effectiveState() === "ready" || (effectiveState() === "needs_attention" &&
       selected?.plan_complete === true && prestart === true);
-    byId("onprem-plan").disabled = locked || !confirmed;
+    const managed = selected?.managed_by_batch === true;
+    const waitingForBatchStart = managed && selected.selection_frozen === false;
+    const emptySelection = Number(selected?.selection?.selected) === 0;
+    byId("onprem-plan").disabled = locked || !canCreate;
     byId("onprem-refresh").disabled = locked;
     byId("onprem-history").disabled = locked;
     byId("onprem-history-newer").disabled = locked || historyOffset === 0;
     byId("onprem-history-older").disabled = locked || !historyHasOlder;
     byId("onprem-open-blocker").disabled = locked || !blockingJob(selected);
-    byId("onprem-start").disabled = locked || legacy || !access || stopped || unknown || !startReady || Number(selected?.selection?.selected) === 0;
+    byId("onprem-start").title = managed ? "Начните перенос в плане списка CSV." : "";
+    byId("onprem-start").disabled = locked || legacy || !access || stopped || unknown || !startReady ||
+      emptySelection || managed || selected?.can_start_transfer === false;
     byId("onprem-pause").disabled = locked || legacy || stopped || state !== "running" || selected?.pause_requested;
     byId("onprem-stop").disabled = locked || selected?.full_stop_requested === true ||
       !(["queued", "planning", "ready", "running", "paused", "awaiting_credentials", "needs_attention", "completed_with_issues"].includes(state) || fullStopNeeded);
-    byId("onprem-restart").disabled = locked || legacy || isStopping(selected) || !access ||
+    const restartInBatch = managed && (selected.config.destination_type === "personal" || selected.config.destination_auth);
+    byId("onprem-restart").title = restartInBatch ? "Начните перенос заново в истории списков CSV." : "";
+    byId("onprem-restart").disabled = locked || legacy || restartInBatch || isStopping(selected) || !restartReady ||
       !["stopped", "completed", "completed_with_issues"].includes(state);
-    byId("onprem-resume").disabled = locked || legacy || !originalConfigMatches() || (!access && !restoringAccess) || stopped ||
-      (unknown && !pointRetryActive() && !runnable) || namespaceBlocked ||
+    byId("onprem-resume").title = waitingForBatchStart ? byId("onprem-start").title : "";
+    byId("onprem-resume").disabled = locked || legacy || waitingForBatchStart || (personalForm() && !personalAccessAvailable()) ||
+      !originalConfigMatches() || (!access && !restoringAccess) || stopped || (unknown && !pointRetryActive() && !runnable) || namespaceBlocked ||
       !(state === "paused" || state === "needs_attention" || state === "awaiting_credentials" || retryFailedEntries());
     byId("onprem-report").disabled = locked || !selected;
     byId("onprem-journal").disabled = locked || !selected;
@@ -915,6 +1304,17 @@
     pointRetryButtons.forEach(({button, entry}) => {button.disabled = !pointRetryAvailable(entry);});
     entrySelectionChecks.forEach(({check, entry}) => {check.disabled = !entrySelectionAvailable(entry);});
 
+    byId("onprem-plan").textContent = selected ? "Составить новый план" : "Проверить план";
+    const formConfig = readConfig();
+    const transferConfig = selected && bindingKey(formConfig) === selectedFormBinding ? selected.config : formConfig;
+    byId("onprem-publish-warning").hidden = transferConfig.source_public !== true;
+    const jobActions = ["start", "pause", "resume", "restart"];
+    const candidates = selected ? jobActions : ["plan"];
+    const primary = candidates.find(name => !byId(`onprem-${name}`).disabled &&
+      !(name === "resume" && startReady && emptySelection && state !== "awaiting_credentials"));
+    for (const name of ["plan", ...jobActions]) {
+      byId(`onprem-${name}`).classList.toggle("is-primary", name === primary);
+    }
   }
 
   function journalPath(value) {
@@ -927,7 +1327,7 @@
     if (!(typeof value === "string" && value.length <= 1200 &&
       !/[\x00-\x1f\x7f<>]|[a-z][a-z0-9+.-]*:\/\/|bearer\s|oauth\s|(?:token|secret|password|signature|authorization|assertion|credential)s?\s*[:=]/i.test(value)
     )) return "";
-    const secrets = [...Object.values(credentials()), byId("onprem-access-key")?.value];
+    const secrets = ["onprem-source-secret", "onprem-source-admin-token", "onprem-destination-admin-token", "onprem-destination-client-secret", "onprem-destination-owner-token", "onprem-destination-token", "onprem-access-key"].map(id => byId(id).value);
     for (const secret of secrets) {
       if (secret && secret.length >= 4) value = value.split(secret).join("[скрыто]");
     }
@@ -985,6 +1385,10 @@
       if (Number.isSafeInteger(payload.duration_ms) && payload.duration_ms >= 0) {
         detail.push(`${payload.duration_ms} мс`);
       }
+      if (Number.isInteger(payload.publication_attempts) && payload.publication_attempts >= 1 &&
+          [1, 2, 3].includes(payload.max_publication_attempts) && payload.publication_attempts <= payload.max_publication_attempts) {
+        detail.push(`Попытка публикации ${payload.publication_attempts} из ${payload.max_publication_attempts}`);
+      }
       if (validPointRetryAttempts(payload.point_retry_attempts) && [1, 3].includes(payload.max_point_retry_attempts)) {
         detail.push(`Точечный повтор: ${payload.point_retry_attempts}/${payload.max_point_retry_attempts}`);
       }
@@ -1018,15 +1422,30 @@
     log.scrollTop = log.scrollHeight;
   }
 
+  function discardPersonalPlan() {
+    if (selected?.config?.destination_type !== "personal" || !(selected.selection?.editable ||
+        ["queued", "planning", "ready"].includes(effectiveState()))) return false;
+    if (adminPersonal(selected.config)) clearDestinationCredentials();
+    selectJob(null);
+    renderHistory();
+    return true;
+  }
+
   function selectJob(job, restore = false) {
+    closeBrowser();
     generation += 1;
+    if (!job && selected?.config?.source_type === "shared") byId("onprem-source-email").value = "";
     selected = job;
+    updateDestinationForm();
     entries = [];
     entryOffset = 0;
     eventSequence = 0;
     logLines = [];
     byId("onprem-log").textContent = "";
     if (restore) fillConfig(job.config || {});
+    // The form always shows staged, including when viewing a historical URL transfer.
+    selectedFormBinding = job ? bindingKey(readConfig()) : null;
+    rememberConfigValues();
     updateDestinationPreview();
     renderJob();
   }
@@ -1040,7 +1459,14 @@
   }
 
   async function openJob(id) {
+    const revision = destinationCheckRevision;
+    const selection = generation;
+    const wasActive = tab.classList.contains("active");
     const job = await request(`/jobs/${encodeURIComponent(id)}`);
+    if (revision !== destinationCheckRevision || selection !== generation || (wasActive && !tab.classList.contains("active"))) {
+      renderHistory();
+      return;
+    }
     if (job?.id !== id) throw failure("job_not_found");
     selectJob(job, true);
     await refreshSelected();
@@ -1103,36 +1529,48 @@
 
   async function mutate(suffix, body = {}) {
     if (!selected) return;
-    if (!sharedConfig(selected.config)) throw failure("legacy_personal_job");
+    if (!supportedJob(selected)) throw failure("legacy_personal_job");
     if (selected.config.strategy !== "staged") throw failure("onprem_staged_required");
     if (suffix !== "pause" && !originalConfigMatches()) throw failure("credential_binding_mismatch");
     if (oldWorkStopped(selected)) return;
     const result = await request(`/jobs/${encodeURIComponent(selected.id)}/${suffix}`, {method: "POST", body});
-    if (result?.id === selected?.id) selected = result;
+    if (selected && result?.id === selected.id) selected = {managed_by_batch: selected.managed_by_batch, ...result};
     await refreshSelected();
     renderJob();
+  }
+
+  function selectedAccessConfig() {
+    const config = {...selected.config, strategy: "staged", identity_confirmed: manualShared(selected.config)};
+    // The server derives OAuth from the displayed Disk API and checks the saved binding.
+    delete config.destination_oauth_url;
+    return config;
   }
 
   async function attachAccess(pointRetryEntryId = null) {
     if (selected.config.strategy !== "staged") throw failure("onprem_staged_required");
     if (!originalConfigMatches()) throw failure("credential_binding_mismatch");
-    if (!byId("onprem-identity-confirmed").checked) throw failure("identity_confirmation_required");
+    if (adminPersonal(selected.config) && !personalAvailable) throw failure("onprem_personal_token_unavailable");
+    if (manualShared(selected.config) && !byId("onprem-identity-confirmed").checked) throw failure("identity_confirmation_required");
     const secret = credentials();
     if (!secret.source_client_secret.trim()) throw failure("source_credentials_required");
-    if (!secret.destination_token.trim()) throw failure("destination_credentials_required");
-    if (sharedConfig(selected.config) && !byId("onprem-form").reportValidity()) throw failure("validation_error");
+    if (selected.config.destination_auth === "service_application") {
+      if (!secret.destination_client_secret.trim() || !secret.destination_owner_token.trim()) throw failure("destination_service_credentials_required");
+    } else if (!secret.destination_token.trim()) {
+      throw failure(adminPersonal(selected.config) ? "destination_admin_token_required" : "destination_credentials_required");
+    }
+    if (!byId("onprem-form").reportValidity()) throw failure("validation_error");
     const id = selected.id;
     const snapshot = generation;
     const revision = destinationCheckRevision;
     notice("Проверяю доступ к дискам…");
     const result = await request(`/jobs/${encodeURIComponent(id)}/credentials`, {
       method: "PUT", body: {
-        config: {...selected.config, strategy: "staged", identity_confirmed: true}, credentials: secret,
+        config: selectedAccessConfig(), credentials: secret,
         ...(pointRetryEntryId ? {point_retry_entry_id: pointRetryEntryId} : {}),
       },
     });
     if (!selected || selected.id !== id || snapshot !== generation || revision !== destinationCheckRevision || !accessReady() ||
-        credentials().source_client_secret !== secret.source_client_secret || credentials().source_admin_token !== secret.source_admin_token || credentials().destination_token !== secret.destination_token) {
+        Object.entries(secret).some(([key, value]) => credentials()[key] !== value)) {
       throw failure("credential_binding_mismatch");
     }
     if (result?.id !== id) throw failure("invalid_response");
@@ -1148,15 +1586,40 @@
     return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
   }
 
+  function newServiceApplicationPlan() {
+    const sharedSource = selected?.config?.source_type === "shared";
+    clearDestinationCredentials();
+    byId("onprem-identity-confirmed").checked = false;
+    clearDestinationCheck();
+    pendingCreate = null;
+    selectJob(null);
+    renderHistory();
+    saveDraft();
+    notice(sharedSource
+      ? "Метка общего диска SaaS задаётся в CSV. Выберите «Список дисков из CSV» и укажите метку источника в колонке vd_hash."
+      : "Введите доступы сервисного приложения и выполните Dry Run нового переноса.");
+  }
+
+  function prepareServiceApplicationForm(event) {
+    if (byId("onprem-source-input").value === "list" || (personalForm()
+        ? !adminPersonal(selected?.config) || !serviceAvailable
+        : !manualShared(selected?.config) || !sharedServiceAvailable)) return false;
+    event.preventDefault();
+    newServiceApplicationPlan();
+    return true;
+  }
+  byId("onprem-plan").addEventListener("click", prepareServiceApplicationForm);
   byId("onprem-form").addEventListener("submit", (event) => {
     event.preventDefault();
-    if (byId("onprem-source-input")?.value === "list") return;
+    if (byId("onprem-source-input")?.value === "list" || prepareServiceApplicationForm(event)) return;
     if (byId("onprem-plan").disabled || !byId("onprem-form").reportValidity()) return;
     action(async () => {
       const retryIntent = window.diskCopyRetries.track("onprem");
       try {
         const config = readConfig();
+        if (servicePersonal(config)) discardPersonalPlan();
         await checkDestination(config);
+        const revision = destinationCheckRevision;
         const fingerprint = JSON.stringify({...config, retry_enabled: undefined});
         if (!pendingCreate || pendingCreate.fingerprint !== fingerprint) pendingCreate = {fingerprint, key: uuid()};
         const job = await request("/jobs", {method: "POST", body: {
@@ -1164,6 +1627,7 @@
         }});
         await synchronizeRetries(job, retryIntent);
         pendingCreate = null;
+        if (config.destination_auth === "service_application" && revision !== destinationCheckRevision) throw failure("credential_binding_mismatch");
         selectJob(job);
         notice("Dry Run запущен. Дождитесь готовности плана и проверьте итоговые пути.");
         await refreshAll();
@@ -1179,14 +1643,12 @@
   byId("onprem-history").addEventListener("change", () => {
     const id = byId("onprem-history").value;
     if (!id) {
-      selected = null;
-      entries = [];
-        entryOffset = 0;
-      generation += 1;
       clearCredentials();
+      try { window.sessionStorage.removeItem(draftKey); } catch (_) {}
+      clearDestinationCheck();
+      byId("onprem-recipient").value = "";
       byId("onprem-identity-confirmed").checked = false;
-      updateDestinationPreview();
-      renderJob();
+      selectJob(null);
       return;
     }
     action(() => openJob(id));
@@ -1229,7 +1691,7 @@
       const snapshot = generation;
       const job = await request(`/jobs/${encodeURIComponent(id)}/stop`, {method: "POST"});
       if (!selected || selected.id !== id || snapshot !== generation) return;
-      if (job?.id === id) selected = job;
+      if (job?.id === id) selected = {managed_by_batch: selected.managed_by_batch, ...job};
       renderJob();
       await refreshAll();
       if (selected?.id === id && snapshot === generation) {
@@ -1239,15 +1701,17 @@
       }
     });
   });
-  byId("onprem-restart").addEventListener("click", () => {
-    if (byId("onprem-restart").disabled || !byId("onprem-form").reportValidity()) return;
+  byId("onprem-restart").addEventListener("click", (event) => {
+    if (byId("onprem-restart").disabled) return;
+    if (prepareServiceApplicationForm(event)) return;
+    if (!byId("onprem-form").reportValidity()) return;
     action(async () => {
       const retryIntent = window.diskCopyRetries.track("onprem");
       try {
         const id = selected.id;
         const snapshot = generation;
         if (selected.config.strategy !== "staged") throw failure("onprem_staged_required");
-        const config = {...selected.config, strategy: "staged", identity_confirmed: true, retry_enabled: window.diskCopyRetries.value("onprem")};
+        const config = {...selectedAccessConfig(), retry_enabled: window.diskCopyRetries.value("onprem")};
         const fingerprint = JSON.stringify({...config, retry_enabled: undefined});
         let pending = pendingRestarts.get(id);
         if (!pending || pending.fingerprint !== fingerprint) {
@@ -1263,7 +1727,8 @@
         pendingRestarts.delete(id);
         selectJob(job);
         await refreshAll(0);
-        notice("Создан новый перенос в папку email в корне общего диска, с публикацией источника. Дождитесь плана, проверьте его и нажмите «Начать перенос».");
+        notice(config.destination_type === "personal" ? "Создан новый перенос на личный Диск получателя. Дождитесь плана и проверьте итоговые пути."
+          : "Создан новый перенос в папку email в корне общего диска, с публикацией источника. Дождитесь плана, проверьте его и нажмите «Начать перенос».");
       } finally {retryIntent.close();}
     });
   });
@@ -1273,12 +1738,14 @@
       await attachAccess();
       const retry = retryFailedEntries();
       await mutate(retry ? "retry" : "resume", retry ? {strategy: "staged"} : {});
-      notice(retry ? "Повтор ошибочных объектов запущен." : selected.state === "ready"
+      notice(retry ? "Повтор ошибочных объектов запущен." : ["queued", "planning"].includes(selected.state)
+        ? "Dry Run продолжен. Дождитесь плана и проверьте итоговые пути." : selected.state === "ready"
         ? "План готов. Проверьте его и нажмите «Начать перенос»." : "Перенос продолжен.");
     });
   });
   byId("onprem-cleanup").addEventListener("click", () => {
     if (busy || !enabled || !authorized()) return;
+    if (!window.confirm("Очистить временные файлы всех заданий SaaS → On-premises?\n\nПри продолжении переноса утилита скачает нужные файлы заново. История заданий и файлы на Дисках сохранятся.")) return;
     return action(async () => {
       const output = byId("onprem-cleanup-result");
       output.className = "field-note";
@@ -1316,23 +1783,70 @@
   })));
 
 
+  // A shared Disk URL identifies both the installation and the disk.
+  const sharedHash = byId("onprem-destination-vd-hash");
+  const apiField = byId("onprem-destination-url");
+  for (const field of [sharedHash, apiField]) field.addEventListener("change", () => {
+    if (byId("onprem-destination-personal").checked) return;
+    const value = field.value.trim();
+    const short = /^([A-Za-z0-9_-]{1,256})\/disk\/?$/.exec(value);
+    if (field === sharedHash && short) { sharedHash.value = short[1]; return; }
+    const link = /^https:\/\/disk\.([a-z0-9.-]+)(?::443)?\/client\/vd\/([A-Za-z0-9_-]{1,256})(?:\/disk)?\/?$/i.exec(value);
+    if (!link) return;
+    const api = "https://cloud-api." + link[1].toLowerCase() + "/v1/disk";
+    if (field === sharedHash && apiField.value && comparable("destination_url", apiField.value) !== api) return;
+    if (field === apiField && sharedHash.value && sharedHash.value !== link[2]) return;
+    const peer = field === sharedHash ? apiField : sharedHash;
+    const oldPeer = peer.value;
+    sharedHash.value = link[2];
+    apiField.value = api;
+    if (peer.value !== oldPeer) peer.dispatchEvent(new Event("input", {bubbles: true}));
+  });
+
   panel.querySelectorAll("input, select, textarea").forEach((field) => {
     if (field.id === "retry-onprem") return;
     const changed = () => {
-      if (fields.includes(field) || ["onprem-source-secret", "onprem-source-admin-token", "onprem-destination-token", "onprem-identity-confirmed"].includes(field.id)) {
+      const modeChange = ["onprem-destination-personal", "onprem-destination-shared", "onprem-source-input"].includes(field.id);
+      if (browser.open && (modeChange || field.id.startsWith("onprem-source-") || field.id === "onprem-access-key")) closeBrowser();
+      const configKey = field.dataset.onpremConfig || (field.id === "onprem-recipient" && "destination_identity");
+      const previousValue = lastConfigValues.get(field);
+      const configChanged = configKey && previousValue !== field.value;
+      const bindingChanged = configChanged && comparable(configKey, previousValue) !== comparable(configKey, field.value);
+      if (configChanged) lastConfigValues.set(field, field.value);
+      if (field.id === "onprem-source-input") switchSourceMode(field.value === "list");
+      if (modeChange && byId("onprem-destination-personal").checked !== byId("onprem-shared-fields").hidden) {
+        clearDestinationCredentials();
+        byId("onprem-identity-confirmed").checked = false;
+      }
+      if (bindingChanged && ["onprem-source-client", "onprem-source-org"].includes(field.id)) clearSourceCredentials();
+      if (bindingChanged && ["onprem-destination-url", "onprem-destination-client-id", "onprem-destination-identity"].includes(field.id)) {
+        clearDestinationCredentials();
+      }
+      if (modeChange) updateDestinationForm();
+      if (configChanged || modeChange || ["onprem-source-secret", "onprem-source-admin-token", "onprem-destination-token", "onprem-identity-confirmed", "onprem-destination-client-secret", "onprem-destination-owner-token", "onprem-destination-admin-token"].includes(field.id)) {
+        if (personalForm()) pendingCreate = null;
         clearDestinationCheck();
+        if (!listFormActive && manualShared(selected?.config) &&
+            (bindingChanged || (modeChange && field.id !== "onprem-source-input")) && !originalConfigMatches()) {
+          newServiceApplicationPlan();
+        } else if (!listFormActive && !originalConfigMatches() && discardPersonalPlan()) {
+          notice("Параметры переноса изменились. Выполните Dry Run, чтобы подготовить новый план.");
+        }
         updateDestinationPreview();
       }
+      if (!selected && !listFormActive && (personalForm() || sharedServiceAvailable) &&
+          (draftFields.includes(field.id) || modeChange || ["onprem-destination-vd-hash", "onprem-destination-identity"].includes(field.id))) saveDraft();
       updateActions();
     };
     field.addEventListener("input", changed);
     field.addEventListener("change", changed);
   });
-  byId("onprem-source-input")?.addEventListener("change", updateActions);
+  updateDestinationForm();
   updateDestinationPreview();
 
   function modeChanged() {
     const onprem = tab.classList.contains("active") && enabled;
+    if (!onprem && browser.open) closeBrowser();
     document.querySelectorAll("[data-legacy-output]").forEach((element) => { element.hidden = onprem; });
     clearTimeout(pollTimer);
     if (!onprem || byId("onprem-source-input")?.value === "list") return;
@@ -1342,6 +1856,11 @@
 
   document.querySelectorAll(".mode-tab").forEach((mode) => mode.addEventListener("click", modeChanged));
   document.addEventListener("visibilitychange", schedulePoll);
+  window.addEventListener("onprem-batch-config-loaded", () => {
+    rememberConfigValues();
+    clearDestinationCheck();
+    updateDestinationForm();
+  });
   window.addEventListener("open-onprem-job", (event) => {
     const id = event.detail?.jobId;
     if (!enabled || !authorized() || typeof id !== "string" || !jobIdPattern.test(id)) return;
@@ -1349,15 +1868,30 @@
     if (choice) { choice.value = "single"; choice.dispatchEvent(new Event("change")); }
     action(async () => { await openJob(id); byId("onprem-job")?.scrollIntoView?.({behavior: "smooth", block: "start"}); });
   });
-  window.addEventListener("pagehide", () => {
+  window.addEventListener("pagehide", (event) => {
+    closeBrowser();
     clearTimeout(pollTimer);
-    clearCredentials();
-    byId("onprem-access-key").value = "";
+    if (!event.persisted) {
+      clearCredentials();
+      byId("onprem-access-key").value = "";
+    }
   });
+  window.addEventListener("pageshow", event => { if (event.persisted) schedulePoll(); });
 
   Promise.resolve(window.diskCopyConfigPromise).then((config) => {
     if (!config?.onprem_enabled) return;
     enabled = true;
+    personalAvailable = config.onprem_personal_available === true;
+    serviceAvailable = config.onprem_personal_service_application_available === true;
+    sharedServiceAvailable = config.onprem_shared_service_application_available === true;
+    if (serviceAvailable) {
+      byId("onprem-destination-personal").checked = true;
+      byId("onprem-destination-shared").checked = false;
+    }
+    if (serviceAvailable || sharedServiceAvailable) restoreDraft();
+    rememberConfigValues();
+    updateDestinationForm();
+    updateDestinationPreview();
     authRequired = Boolean(config.onprem_auth_required);
     panel.hidden = false;
     tab.disabled = false;

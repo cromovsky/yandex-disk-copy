@@ -141,6 +141,11 @@ ERROR_MESSAGES = {
         "Нет доступа к выбранному общему диску On-premises."
     ),
     "destination_identity_mismatch": "Учётная запись On-premises не совпала с выбором.",
+    "destination_identity_unverified": "Disk API On-premises не подтвердил учётную запись сотрудника.",
+    "onprem_shared_grant_unavailable": "В этой установке недоступен доступ к общему Диску через сервисное приложение.",
+    "onprem_personal_grant_unavailable": (
+        "В этой версии утилиты недоступна выдача токена получателя через приложение On-premises."
+    ),
     "invalid_upload_url": "Диск On-premises вернул некорректную ссылку загрузки.",
     "directory_confirmation_pending": (
         "On-premises ещё не подтвердил создание папки метаданными."

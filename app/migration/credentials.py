@@ -7,6 +7,16 @@ import threading
 from .store import config_identity
 
 
+def credential_fields(config):
+    destination = ("destination_client_secret"
+                   if config.get("destination_auth") == "service_application"
+                   else "destination_token")
+    fields = {"source_client_secret", destination}
+    if config.get("destination_oauth_url"):
+        fields.add("destination_owner_token")
+    return fields
+
+
 class CredentialRegistry:
     def __init__(self):
         self._lock = threading.RLock()
@@ -15,7 +25,7 @@ class CredentialRegistry:
 
     def put(self, job_id, config, credentials):
         binding = config_identity(config)
-        required = {"source_client_secret", "destination_token"}
+        required = credential_fields(config)
         if (not isinstance(credentials, dict)
                 or not required <= set(credentials)
                 or set(credentials) - required - {"source_admin_token"}):

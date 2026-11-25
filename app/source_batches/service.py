@@ -14,16 +14,19 @@ import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from itertools import combinations, groupby
 from pathlib import Path
 
+from app.migration.api import personal_available, shared_service_available
+from app.migration.credentials import credential_fields
+from app.migration.destination import bound_oauth_url
 from app.migration.errors import MigrationError
 from app.migration.runner import SaasDiskSource, disk_path, join_path, file_access_denied
 from app.migration.source import shared_source_folder
 from app.run_journal import CSV_FIELDS, JournalError, Redactor
-from .store import BatchStore, parse_sources
+from .store import BatchStore, clean_config, parse_sources
 from app.retry_policy import RetryPolicy
-from app.file_cooldown import FileCooldown
 
 TERMINAL = {"completed", "completed_with_issues", "stopped"}
 OUTAGES = {"destination_unavailable", "destination_timeout", "destination_connection_failed",
@@ -62,7 +65,6 @@ class BatchService:
         self._redactors = {}
         self._active = {}
         self._planning_checks = set()
-        self._file_cooldown = FileCooldown()
         self._rates = {}
         self._rate_lock = threading.Lock()
         self._local_reserved = {}
@@ -129,11 +131,12 @@ class BatchService:
     def create(self, mode, sources_csv, config, credentials, idempotency_key):
         if mode == "onprem" and self.onprem is None:
             raise ValueError("onprem_disabled")
-        sources = parse_sources(sources_csv)
-        credentials = self._valid_credentials(mode, credentials)
+        config = clean_config(mode, config)
+        sources = parse_sources(sources_csv, personal=config.get("destination_type") == "personal")
+        credentials = self._valid_credentials(mode, config, credentials)
+        batch = self.store.create(mode, config, sources, idempotency_key)
+        self.attach_credentials(batch["id"], credentials)
         with self.guard:
-            batch = self.store.create(mode, config, sources, idempotency_key)
-            self.attach_credentials(batch["id"], credentials)
             if not self.store.last_sequence(batch["id"]):
                 for source in self.store.sources(batch["id"]):
                     self._event(batch, source, "retry_settings", "succeeded",
@@ -141,9 +144,13 @@ class BatchService:
                                 max_attempts=5 if self.retry_policy(batch["id"]).enabled else 1)
             return self.detail(batch["id"])
 
-    @staticmethod
-    def _valid_credentials(mode, credentials):
-        required = {"source_client_secret"} | ({"destination_token"} if mode == "onprem" else set())
+    def _valid_credentials(self, mode, config, credentials):
+        if config.get("destination_type") == "shared" and config.get("destination_auth"):
+            if not shared_service_available(self.onprem):
+                raise ValueError("onprem_shared_grant_unavailable")
+        elif config.get("destination_auth") and not personal_available(self.onprem, config["destination_auth"]):
+            raise ValueError("onprem_personal_grant_unavailable")
+        required = credential_fields(config) if mode == "onprem" else {"source_client_secret"}
         if (not isinstance(credentials, dict) or not required <= set(credentials)
                 or set(credentials) - required - {"source_admin_token"}) or any(
             not isinstance(v, str) or not v or len(v) > 8192
@@ -159,26 +166,35 @@ class BatchService:
             self._require_staged(batch, check_children=True)
             if batch["state"] == "stopped":
                 raise ValueError("batch_stopped")
-            credentials = self._valid_credentials(batch["mode"], credentials)
-            if self._credentials.get(batch_id) == credentials and batch["state"] != "awaiting_credentials":
+            credentials = self._valid_credentials(batch["mode"], batch["config"], credentials)
+            previous = self._credentials.get(batch_id)
+            if (previous == credentials and batch["state"] != "awaiting_credentials"
+                    and not any(issue.get("credential_check") for issue in batch["mapping_issues"].values())):
                 return self.detail(batch_id)
-            if any(s["id"] in self._active for s in self.store.sources(batch_id)):
+            sources = self.store.sources(batch_id)
+            if any(s["id"] in self._active for s in sources):
                 raise ValueError("source_busy")
+            delegated = batch["config"].get("destination_auth") == "service_application"
+            finished = {s["id"] for s in sources if not s["selected"] or s["state"] in TERMINAL} if delegated and batch["started"] else set()
+            verify = delegated or batch["config"].get("destination_type") == "personal"
+            planned = [s for s in sources if verify and s["selected"] and s["plan_complete"] and s["id"] not in finished]
+        with self._verified_access(batch, sources, planned, credentials, previous):
             self._credentials[batch_id] = credentials
             redactor = self._redactors.setdefault(batch_id, Redactor())
             for secret in credentials.values():
                 redactor.add_secret(secret)
             if self.onprem and batch["mode"] == "onprem":
-                for source in self.store.sources(batch_id):
+                for source in sources:
                     if source["child_job_id"]:
-                        with self.onprem.job_guard(source["child_job_id"]):
-                            job = self.onprem.store.get(source["child_job_id"])
-                            self.onprem.runner.release_clients(job["id"])
-                            self.onprem.registry.put(job["id"], job["config"], credentials)
-                            if job["state"] == "awaiting_credentials":
-                                state = "paused" if job["resume_state"] in {"running", "paused"} else job["resume_state"] or "ready"
-                                error = job["error"] if state == "needs_attention" else None
-                                self.onprem.store.update_job(job["id"], state=state, error=error)
+                        job = self.onprem.store.get(source["child_job_id"])
+                        self.onprem.runner.release_clients(job["id"])
+                        if source["id"] in finished:
+                            continue
+                        self.onprem.registry.put(job["id"], job["config"], credentials)
+                        if job["state"] == "awaiting_credentials":
+                            state = "paused" if job["resume_state"] in {"running", "paused"} else job["resume_state"] or "ready"
+                            error = job["error"] if state == "needs_attention" else None
+                            self.onprem.store.update_job(job["id"], state=state, error=error)
             if batch["state"] == "awaiting_credentials":
                 resume = batch["resume_state"] or "draft"
                 # Reattachment never starts work without the user's action.
@@ -187,11 +203,7 @@ class BatchService:
             current = self.store.get(batch_id)
             if current["mode"] == "onprem" and not current["started"] and current["state"] in {"ready", "needs_attention"}:
                 sources = self.store.sources(batch_id)
-                with ExitStack() as child_guards:
-                    for source in sources:
-                        if source["child_job_id"]:
-                            child_guards.enter_context(self.onprem.job_guard(source["child_job_id"]))
-                    self._restore_unstarted_children(current, sources)
+                self._restore_unstarted_children(current, sources)
             self.notify()
             return self.detail(batch_id)
 
@@ -214,14 +226,21 @@ class BatchService:
         if batch["mode"] == "onprem":
             if batch["config"].get("strategy") != "staged":
                 raise ValueError("onprem_staged_required")
+            endpoint = None
+            if batch["config"].get("destination_auth") == "service_application":
+                if not batch["config"].get("destination_oauth_url"):
+                    raise MigrationError("invalid_destination_oauth_url")
+                endpoint = bound_oauth_url(batch["config"])
             if not check_children:
                 return
             for source in self.store.sources(batch["id"]):
                 if source["child_job_id"]:
                     try:
-                        self.onprem.runner.require_staged_job(
-                            self.onprem.store.get(source["child_job_id"]),
-                        )
+                        job = self.onprem.store.get(source["child_job_id"])
+                        self.onprem.runner.require_staged_job(job)
+                        if endpoint and (not job["config"].get("destination_oauth_url")
+                                         or bound_oauth_url(job["config"]) != endpoint):
+                            raise MigrationError("invalid_destination_oauth_url")
                     except MigrationError as exc:
                         raise ValueError(exc.code) from None
 
@@ -229,6 +248,12 @@ class BatchService:
         self._require_staged(batch)
         value = self._config(batch, source)
         common = batch["config"]
+        if common.get("destination_auth") == "service_application":
+            value.update({k: common[k] for k in ("destination_auth", "destination_client_id", "destination_oauth_url")})
+        if common["destination_type"] == "personal":
+            value.update(destination_url=common["destination_url"], destination_type="personal")
+            return dict(value, destination_root=source["destination_folder"], destination_identity=source["destination_email"],
+                        source_public=True, strategy="staged")
         value.update({k: common[k] for k in ("destination_url", "destination_identity", "destination_type", "destination_vd_hash", "destination_base", "identity_confirmed")})
         value.update(destination_root=join_path("disk:/", source["folder"]),
                      strategy="staged" if source["type"] == "shared" else common["strategy"])
@@ -236,7 +261,7 @@ class BatchService:
             value["source_public"] = True
         return value
 
-    def _checkpoint(self, batch_id, *, planning=False):
+    def _checkpoint(self, batch_id, *, planning=False, child_id=None):
         if self.stop_event.is_set():
             raise Interrupted()
         batch = self.store.get(batch_id)
@@ -244,6 +269,10 @@ class BatchService:
         if batch["state"] != expected:
             raise Interrupted()
         if batch_id not in self._credentials:
+            if (child_id and batch["config"].get("destination_auth") == "service_application"
+                    and self.onprem.registry.get(child_id)
+                    and self.onprem.store.active_point_retry_entry(child_id)):
+                return
             raise MigrationError("credentials_required", auth=True)
 
     def _event(self, batch, source_record, stage, status, **fields):
@@ -412,19 +441,36 @@ class BatchService:
                     config = self._child_config(batch, source)
                     with self.onprem.guard:
                         self._checkpoint(batch["id"], planning=True)
-                        child = self.onprem.store.create(config, "batch-" + source_id + "-" + uuid.uuid4().hex, initial_state="planning")
+                        child = self.onprem.store.create(config, "batch-" + source_id + "-" + uuid.uuid4().hex,
+                                                         initial_state="planning", batch_child=True)
                         self.onprem.excluded_job_ids.add(child["id"])
                         source = self.store.update_source(source_id, child_job_id=child["id"])
                     self._bind_child_policy(batch["id"], child["id"])
                     with self.onprem.job_guard(child["id"]):
                         self.onprem.registry.put(child["id"], child["config"], self._credentials_for(batch["id"]))
-                        _, destination = self.onprem.runner.clients(child)
+                        delegated = config.get("destination_auth") == "service_application"
+                        if delegated:
+                            destination = self.onprem.runner.destination_factory(child["config"], self._credentials_for(batch["id"]))
+                            destination.retry_policy = self.retry_policy(batch["id"])
+                            if config["destination_type"] == "shared":
+                                destination.expected_uid = self.store.get(batch["id"])["shared_operator_uid"]
+                        else:
+                            _, destination = self.onprem.runner.clients(child)
                         destination.checkpoint = checkpoint
                         try:
                             self.onprem.runner.plan(child, source_client, destination, full_compare=True,
                                                     checkpoint=checkpoint)
+                        except MigrationError as exc:
+                            # The batch checks the selected bytes against each target's quota.
+                            if not delegated or exc.code != "destination_space_insufficient":
+                                raise
                         finally:
                             destination.checkpoint = None
+                            if delegated:
+                                destination.close()
+                        if delegated and config["destination_type"] == "shared":
+                            uid = self.onprem.store.get(child["id"])["destination_verified_uid"]
+                            self.store.bind_shared_operator(batch["id"], uid)
                     summary = self._summary_child(child["id"])
                 with self.guard:
                     checkpoint()
@@ -508,7 +554,9 @@ class BatchService:
                 self.store.update_source(source["id"], selected=source["id"] in source_ids)
             selected = [s for s in self.store.sources(batch_id) if s["selected"]]
             if batch["state"] != "planning" and any(not s["plan_complete"] for s in selected):
-                self.store.update(batch_id, state="needs_attention", error="plan_incomplete")
+                issues = self._mapping_conflicts(selected) if batch["config"].get("destination_type") == "personal" else {}
+                error = next((i["mapping_error"] for i in issues.values()), "plan_incomplete")
+                self.store.update(batch_id, state="needs_attention", error=error, mapping_issues=issues)
             else:
                 # Fence any destination check that captured the previous selection.
                 self.store.update(batch_id, state="planning", error=None, resume_state="planning")
@@ -561,66 +609,225 @@ class BatchService:
                        failed_sources=sum(s["state"] == "error" for s in selected), selected_sources=len(selected))
         return summary
 
+    @staticmethod
+    def _row_issue(issues, code, rows, path=None):
+        numbers = {r["csv_row"] for r in rows}
+        for row in rows:
+            issue = issues.setdefault(row["id"], {"mapping_error": code, "conflict_rows": set()})
+            if issue["mapping_error"] == code:
+                issue["conflict_rows"].update(numbers)
+                if path:
+                    issue.setdefault("conflict_path", path)
+
+    @staticmethod
+    def _overlap(left, right):
+        return left == right or right.startswith(left.rstrip("/") + "/") or left.startswith(right.rstrip("/") + "/")
+
+    def _mapping_conflicts(self, sources):
+        issues, by_source, by_email, by_uid = {}, {}, {}, {}
+        for row in sources:
+            if not row["selected"]:
+                continue
+            by_source.setdefault(row["email"].strip().casefold(), []).append(row)
+            by_email.setdefault(row["destination_email"].strip().casefold(), []).append(row)
+            uid = row.get("destination_verified_uid")
+            if uid is not None:
+                by_uid.setdefault(uid, []).append(row)
+        for rows in by_source.values():
+            if (len({r["destination_email"].strip().casefold() for r in rows}) > 1
+                    or len({r["destination_verified_uid"] for r in rows if r.get("destination_verified_uid")}) > 1):
+                self._row_issue(issues, "personal_mapping_conflict", rows)
+        for rows in (*by_email.values(), *by_uid.values()):
+            if len({r["email"].strip().casefold() for r in rows}) > 1:
+                self._row_issue(issues, "personal_mapping_conflict", rows)
+        for rows in by_source.values():
+            paths = [(r, unicodedata.normalize("NFC", r["path"])) for r in rows]
+            for (left, p), (right, q) in combinations(paths, 2):
+                if self._overlap(p, q):
+                    self._row_issue(issues, "overlapping_source_paths", [left, right], min(p, q, key=len))
+        for issue in issues.values():
+            issue["conflict_rows"] = sorted(issue["conflict_rows"])
+        return issues
+
+    def _target_conflicts(self, rows, issues, checkpoint):
+        roots = [(r, unicodedata.normalize("NFC", join_path(r["destination_folder"], r["path"][6:]))) for r in rows]
+        by_job = {}
+        for (left, p), (right, q) in combinations(roots, 2):
+            if self._overlap(p, q):
+                by_job[left["child_job_id"]] = left
+                by_job[right["child_job_id"]] = right
+        if not by_job:
+            return
+        # Sort only potentially overlapping jobs on this UID. A file and all its descendants
+        # are adjacent with the trailing slash, so only the ancestor files stay in memory.
+        with self.onprem.store._connection() as db:
+            db.create_function("nfc", 1, lambda path: unicodedata.normalize("NFC", path))
+            entries = db.execute("SELECT nfc(destination_path) AS path,kind,job_id FROM entries "
+                                 "WHERE selected=1 AND job_id IN (" + ",".join("?" for _ in by_job)
+                                 + ") ORDER BY nfc(destination_path)||'/'", tuple(by_job))
+            parents = []
+            for path, matches in groupby(entries, key=lambda e: e["path"]):
+                if checkpoint:
+                    checkpoint()
+                matches = list(matches)
+                paths = [by_job[e["job_id"]] for e in matches]
+                files = [by_job[e["job_id"]] for e in matches if e["kind"] == "file"]
+                while parents and not path.startswith(parents[-1][0] + "/"):
+                    parents.pop()
+                for ancestor, owners in parents:
+                    self._row_issue(issues, "destination_path_collision", owners + paths, ancestor)
+                if files:
+                    if len(paths) > 1:
+                        self._row_issue(issues, "destination_path_collision", paths, path)
+                    parents.append((path, files))
+
+    def _check_disk(self, batch, source, credentials, checkpoint=None):
+        job = self.onprem.store.get(source["child_job_id"])
+        runner = self.onprem.runner
+        config = job["config"]
+        client = runner.destination_factory(config, credentials)
+        try:
+            client.expected_uid = runner.plan_uid(job)
+            client.checkpoint = checkpoint
+            client.retry_policy = self.retry_policy(batch["id"])
+            info = client.check_available()
+            runner._identity(config, info, client)
+            permissions = info.get("permissions")
+            if isinstance(permissions, dict) and permissions.get("write") is False:
+                raise MigrationError("destination_read_only")
+            runner.clear_destination_outage(config)
+            return runner._quota(info)
+        finally:
+            client.close()
+
+    def _require_current_check(self, batch, previous):
+        if (self._credentials.get(batch["id"]) is not previous
+                or self.store.get(batch["id"])["updated_at"] != batch["updated_at"]):
+            raise ValueError("source_busy")
+
+    @contextmanager
+    def _verified_access(self, batch, sources, planned, credentials, previous):
+        # Remote checks run unlocked. Apply their results only to the same plan and credentials.
+        issues = dict(batch.get("mapping_issues", {}))
+        error = None
+
+        def checkpoint():
+            self._require_current_check(batch, previous)
+
+        if batch["config"].get("destination_type") == "personal":
+            for source in planned:
+                checkpoint()
+                try:
+                    self._check_disk(batch, source, credentials, checkpoint)
+                except MigrationError as exc:
+                    issue = issues.get(source["id"], {})
+                    if not issue or issue.get("credential_check"):
+                        issues[source["id"]] = {"mapping_error": exc.code, "conflict_rows": [source["csv_row"]],
+                                                "credential_check": True}
+                    error = exc
+                    break
+                if issues.get(source["id"], {}).get("credential_check"):
+                    issues.pop(source["id"])
+        elif planned:
+            self._check_shared_disk(batch, planned, credentials, checkpoint)
+        with self.guard, self._child_guards(sources):
+            checkpoint()
+            if (self.store.sources(batch["id"]) != sources or
+                    any((future := self._active.get(s["id"])) is not None and not future.done() for s in sources)):
+                raise ValueError("source_busy")
+            if issues != batch["mapping_issues"]:
+                self.store.update(batch["id"], mapping_issues=issues)
+            if error:
+                raise error
+            yield
+
+    def _check_shared_disk(self, batch, sources, credentials, checkpoint=None):
+        if batch["config"].get("destination_auth") == "service_application":
+            uid = batch["shared_operator_uid"]
+            if not uid:
+                raise MigrationError("destination_identity_unverified", auth=True)
+            for source in sources:
+                child = self.onprem.store.get(source["child_job_id"])
+                if self.onprem.runner.plan_uid(child) != uid:
+                    raise MigrationError("destination_identity_mismatch", auth=True)
+        # All rows name the same shared Disk and operator. One fresh access check covers them.
+        return self._check_disk(batch, sources[0], credentials, checkpoint)
+
+    def _check_personal_disks(self, batch, rows, checkpoint):
+        issues = self._mapping_conflicts(rows)
+        groups = {}
+        plan_error = None
+        credentials = self._credentials_for(batch["id"])
+        for row in rows:
+            if checkpoint:
+                checkpoint()
+            if row["id"] in issues:
+                continue
+            if not row["plan_complete"] or not row["child_job_id"]:
+                plan_error = "plan_incomplete"
+                continue
+            if row["summary"]["issues"]:
+                plan_error = plan_error or "plan_conflicts"
+                continue
+            try:
+                quota = self._check_disk(batch, row, credentials, checkpoint)
+            except MigrationError as exc:
+                self._row_issue(issues, exc.code, [row])
+                continue
+            uid = row["destination_verified_uid"]
+            groups.setdefault(uid, []).append((row, quota))
+        for members in groups.values():
+            group = [r for r, _ in members if r["summary"]["selection"]["selected"]]
+            self._target_conflicts(group, issues, checkpoint)
+            available = [q for _, q in members if q is not None]
+            if available and sum(r["summary"]["required_bytes"] for r in group) > min(available):
+                self._row_issue(issues, "destination_space_insufficient", group)
+        for issue in issues.values():
+            issue["conflict_rows"] = sorted(issue["conflict_rows"])
+        return (next(iter(issues.values()))["mapping_error"] if issues else plan_error), issues
+
     def _group_check(self, batch, sources, *, checkpoint=None):
         self._require_staged(batch, check_children=True)
         if checkpoint:
             checkpoint()
         included = [s for s in sources if s["selected"]]
         selected = [s for s in included if not s["plan_complete"] or s["summary"]["selection"]["selected"]]
-        folders = []
-        for source in selected:
-            if not source["folder"]:
-                return "plan_incomplete"
-            normalized = unicodedata.normalize("NFC", source["folder"])
-            if batch["mode"] == "local":
-                normalized = normalized.casefold()
-            if normalized in folders:
-                return "target_folder_collision"
-            folders.append(normalized)
-        if any(not s["plan_complete"] or s["state"] not in {"ready", "completed"} for s in included):
-            return "plan_incomplete"
-        if any(s["summary"]["issues"] for s in selected):
-            return "plan_conflicts"
-        if not selected:
-            return None
-        required = self._aggregate(selected)["required_bytes"]
-        if batch["mode"] == "local":
-            if shutil.disk_usage(self.local_root).free < required:
-                return "local_space_insufficient"
+        if batch["config"].get("destination_type") == "personal":
+            error, issues = self._check_personal_disks(batch, included, checkpoint)
+            if error:
+                return error, issues
         else:
-            credentials = self._credentials_for(batch["id"])
-            first = selected[0]
-            client = self.onprem.runner.destination_factory(self._child_config(batch, first), credentials)
-            client.checkpoint = checkpoint
-            client.retry_policy = self.retry_policy(batch["id"])
-            try:
-                info = client.info()
-                if checkpoint:
-                    checkpoint()
-                self.onprem.runner._identity(self._child_config(batch, first), info)
-                client.check_available()
-                if checkpoint:
-                    checkpoint()
-                if hasattr(self.onprem.runner, "clear_destination_outage"):
-                    self.onprem.runner.clear_destination_outage(self._child_config(batch, first))
-                permissions = info.get("permissions")
-                if isinstance(permissions, dict) and permissions.get("write") is False:
-                    return "destination_read_only"
-                available = self.onprem.runner._quota(info)
-                if available is not None and required > available:
-                    return "destination_space_insufficient"
-                cached = [s for s in selected
-                          if s["type"] == "shared" or batch["config"]["strategy"] == "staged"]
-                largest = sorted((s["summary"].get("largest_required_file", s["summary"].get("largest_file", 0))
-                                  for s in cached), reverse=True)[:self.slots.limit]
-                needed = sum(largest)
-                if cached:
-                    retained = sum(p.stat().st_size for p in self.onprem.runner.staging.iterdir() if p.is_file() and not p.is_symlink())
-                    if needed + retained > self.onprem.runner.staging_budget or needed + self.onprem.runner.reserve_bytes > shutil.disk_usage(self.onprem.runner.staging).free:
-                        return "local_cache_space_insufficient"
-            finally:
-                client.close()
-        return None
+            folders = set()
+            for source in selected:
+                if not source["folder"]:
+                    return "plan_incomplete", {}
+                normalized = unicodedata.normalize("NFC", source["folder"])
+                if batch["mode"] == "local":
+                    normalized = normalized.casefold()
+                if normalized in folders:
+                    return "target_folder_collision", {}
+                folders.add(normalized)
+            if any(not s["plan_complete"] or s["state"] not in {"ready", "completed"} for s in included):
+                return "plan_incomplete", {}
+            if any(s["summary"]["issues"] for s in selected):
+                return "plan_conflicts", {}
+            if selected:
+                required = self._aggregate(selected)["required_bytes"]
+                if batch["mode"] == "local":
+                    if shutil.disk_usage(self.local_root).free < required:
+                        return "local_space_insufficient", {}
+                else:
+                    quota = self._check_shared_disk(batch, selected, self._credentials_for(batch["id"]), checkpoint)
+                    if quota is not None and required > quota:
+                        return "destination_space_insufficient", {}
+        if batch["mode"] == "onprem" and selected:
+            largest = sorted((s["summary"].get("largest_required_file", s["summary"].get("largest_file", 0))
+                              for s in selected), reverse=True)[:self.slots.limit]
+            needed = sum(largest)
+            runner = self.onprem.runner
+            if needed + runner._staging_size() > runner.staging_budget or needed + runner.reserve_bytes > shutil.disk_usage(runner.staging).free:
+                return "local_cache_space_insufficient", {}
+        return None, {}
 
     def _finish_planning(self, batch_id):
         with self.guard:
@@ -631,23 +838,25 @@ class BatchService:
             selected = [s for s in sources if s["selected"]]
             if not selected or any(s["state"] in {"pending", "planning"} for s in selected):
                 return
+            previous = self._credentials.get(batch_id)
             self._planning_checks.add(batch_id)
 
         def checkpoint():
             current = self.store.get(batch_id)
-            if self.stop_event.is_set() or current["updated_at"] != batch["updated_at"]:
+            if (self.stop_event.is_set() or current["updated_at"] != batch["updated_at"]
+                    or self._credentials.get(batch_id) is not previous):
                 raise Interrupted()
 
         try:
             try:
-                error = self._group_check(batch, sources, checkpoint=checkpoint)
+                error, issues = self._group_check(batch, sources, checkpoint=checkpoint)
             except Interrupted:
                 return
             except Exception as exc:
-                error = exc.code if isinstance(exc, MigrationError) else "destination_check_failed"
+                error, issues = exc.code if isinstance(exc, MigrationError) else "destination_check_failed", {}
             with self.guard:
                 checkpoint()
-                self.store.update(batch_id, state="ready" if error is None else "needs_attention", error=error)
+                self.store.update(batch_id, state="ready" if error is None else "needs_attention", error=error, mapping_issues=issues)
         except Interrupted:
             return
         finally:
@@ -693,8 +902,19 @@ class BatchService:
             self.store.update_source(source["id"], state="error" if summary["issues"] else "ready",
                                      error="plan_conflicts" if summary["issues"] else None, summary=summary)
 
+    @contextmanager
+    def _child_guards(self, sources):
+        with ExitStack() as locks:
+            for source in sources:
+                if source["child_job_id"]:
+                    lock = self.onprem.job_guard(source["child_job_id"])
+                    if not lock.acquire(blocking=False):
+                        raise ValueError("source_busy")
+                    locks.callback(lock.release)
+            yield
+
     def start_transfer(self, batch_id):
-        with self.guard, ExitStack() as child_guards:
+        with self.guard:
             batch = self.store.get(batch_id)
             self._require_staged(batch, check_children=True)
             sources = self.detail(batch_id)["sources"]
@@ -704,17 +924,25 @@ class BatchService:
             if batch["state"] != "ready":
                 raise ValueError("dry_run_required")
             self._credentials_for(batch_id)
-            for source in sources:
-                if source["child_job_id"]:
-                    child_guards.enter_context(self.onprem.job_guard(source["child_job_id"]))
-            self._restore_unstarted_children(batch, sources)
-            sources = self.detail(batch_id)["sources"]
-            for source in sources:
-                if source["selected"] and source["child_job_id"]:
-                    self.onprem.store.validate_selection(source["child_job_id"], allow_empty=True)
-            error = self._group_check(batch, sources)
+            previous = self._credentials[batch_id]
+            with self._child_guards(sources):
+                self._restore_unstarted_children(batch, sources)
+                sources = self.detail(batch_id)["sources"]
+                rows = self.store.sources(batch_id)
+                for source in sources:
+                    if source["selected"] and source["child_job_id"]:
+                        self.onprem.store.validate_selection(source["child_job_id"], allow_empty=True)
+
+        def checkpoint():
+            self._require_current_check(batch, previous)
+
+        error, issues = self._group_check(batch, sources, checkpoint=checkpoint)
+        with self.guard, self._child_guards(sources):
+            checkpoint()
+            if self.store.sources(batch_id) != rows:
+                raise ValueError("source_busy")
             if error:
-                self.store.update(batch_id, state="needs_attention", error=error)
+                self.store.update(batch_id, state="needs_attention", error=error, mapping_issues=issues)
                 raise ValueError(error)
             if batch["mode"] == "local":
                 self.store.start_local_transfer(batch_id)
@@ -762,20 +990,25 @@ class BatchService:
             self._require_staged(batch, check_children=True)
             if batch["state"] != "paused":
                 raise ValueError("batch_not_paused")
-            self._credentials_for(batch_id)
+            credentials = self._credentials_for(batch_id)
+            previous = self._credentials[batch_id]
             state = batch["resume_state"] or ("running" if batch["started"] else "planning")
+            sources = self.store.sources(batch_id)
+            planned = []
             if batch["mode"] == "onprem" and state == "running":
-                self._probe_destination(batch)
+                planned = [s for s in sources if s["selected"] and s["state"] not in TERMINAL]
+        with self._verified_access(batch, sources, planned, credentials, previous):
             self.store.update(batch_id, state=state, error=None)
             if state == "running":
-                for source in self.store.sources(batch_id):
+                for source in sources:
                     if not source["selected"] or source["state"] in TERMINAL:
                         continue
-                    self.store.update_source(source["id"], state="running")
+                    self.store.update_source(source["id"], state="running", error=None)
                     if batch["mode"] == "local":
                         self._new_local_journal(batch, source)
                     if source["child_job_id"]:
-                        self.onprem.store.update_job(source["child_job_id"], state="running", pause_requested=False, error=None)
+                        self.onprem.store.update_job(source["child_job_id"], state="running", pause_requested=False,
+                                                     resume_state=None, error=None)
             self.notify()
             return self.detail(batch_id)
 
@@ -799,13 +1032,19 @@ class BatchService:
             self.notify()
             return self.detail(batch_id)
 
-    def require_child_active(self, child_id):
+    def require_child_active(self, child_id, *, recovering_point=False):
         for batch in self.store.batches(limit=1000000)["batches"]:
             for source in self.store.sources(batch["id"]):
                 if source["child_job_id"] == child_id:
                     if not batch["started"] or batch["state"] == "stopped" or not source["selected"]:
                         raise ValueError("managed_batch_not_active")
                     if batch["state"] == "awaiting_credentials":
+                        if (recovering_point and batch["config"].get("destination_auth") == "service_application"
+                                and batch["resume_state"] == "running"):
+                            child = self.onprem.store.get(child_id)
+                            if (child["point_retry_active"] and not child["pause_requested"]
+                                    and not child["stop_requested"]):
+                                return True
                         raise ValueError("managed_batch_credentials_required")
                     if batch["state"] == "paused" and batch.get("error") not in OUTAGES:
                         raise ValueError("managed_batch_paused")
@@ -815,14 +1054,23 @@ class BatchService:
         return False
 
     def prepare_child_retry(self, child_id):
-        if not self.require_child_active(child_id):
+        if not self.require_child_active(child_id, recovering_point=True):
             return False
-        for batch in self.store.batches(limit=1000000)["batches"]:
-            if any(s["child_job_id"] == child_id for s in self.store.sources(batch["id"])):
-                if batch.get("error") in OUTAGES:
-                    self._probe_destination(batch)
-                return True
-        return False
+        batch = self.store.batch_for_child(child_id)
+        source = next(s for s in self.store.sources(batch["id"]) if s["child_job_id"] == child_id)
+        credentials = self.onprem.registry.get(child_id)
+        delegated = batch["config"].get("destination_auth") == "service_application"
+        restore = delegated and credentials is None
+        shared_service = delegated and batch["config"].get("destination_type") == "shared"
+        if restore or shared_service or batch.get("error") in OUTAGES or source.get("error") in OUTAGES:
+            credentials = credentials or self._credentials_for(batch["id"])
+            if shared_service:
+                self._check_shared_disk(batch, [source], credentials)
+            else:
+                self._check_disk(batch, source, credentials)
+            if restore:
+                self.onprem.registry.put(child_id, self.onprem.store.get(child_id)["config"], credentials)
+        return True
 
     def activate_child_retry(self, child_id):
         with self.guard:
@@ -830,10 +1078,11 @@ class BatchService:
                 for source in self.store.sources(batch["id"]):
                     if source["child_job_id"] != child_id:
                         continue
-                    self.require_child_active(child_id)
+                    self.require_child_active(child_id, recovering_point=True)
                     self.store.update(batch["id"], state="running", phase="transfer", error=None)
                     self.store.update_source(source["id"], state="running", error=None)
-                    if batch.get("error") in OUTAGES:
+                    if (batch.get("error") in OUTAGES and batch["config"].get("destination_type") == "shared"
+                            and batch["id"] in self._credentials):
                         for sibling in self.store.sources(batch["id"]):
                             if sibling["selected"] and sibling["state"] == "paused":
                                 self.store.update_source(sibling["id"], state="running", error=None)
@@ -841,19 +1090,6 @@ class BatchService:
                     self.notify()
                     return True
         return False
-
-    def _probe_destination(self, batch):
-        source = next(s for s in self.store.sources(batch["id"]) if s["selected"])
-        config = self._child_config(batch, source)
-        client = self.onprem.runner.destination_factory(config, self._credentials_for(batch["id"]))
-        client.retry_policy = self.retry_policy(batch["id"])
-        try:
-            info = client.check_available()
-            self.onprem.runner._identity(config, info)
-            if hasattr(self.onprem.runner, "clear_destination_outage"):
-                self.onprem.runner.clear_destination_outage(config)
-        finally:
-            client.close()
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -890,6 +1126,11 @@ class BatchService:
                         if selected and all(s["state"] in TERMINAL | {"error"} for s in selected):
                             issues = any(s["state"] != "completed" for s in selected)
                             self.store.update(batch["id"], state="completed_with_issues" if issues else "completed")
+                        elif (batch["config"].get("destination_type") == "personal" and selected
+                              and all(s["state"] in TERMINAL | {"error", "paused", "awaiting_credentials"} for s in selected)):
+                            waiting = [s for s in selected if s["state"] in {"paused", "awaiting_credentials"}]
+                            blocked = next((s for s in waiting if s["state"] == "awaiting_credentials"), waiting[0])
+                            self.store.update(batch["id"], state=blocked["state"], error=blocked["error"], resume_state="running")
             for batch_id in planning:
                 self._finish_planning(batch_id)
             self.wake.wait(0.2)
@@ -899,16 +1140,17 @@ class BatchService:
         batch = self.store.get(source["batch_id"])
         client = None
         owner = "onprem:" + source["child_job_id"] if source["child_job_id"] else "batch:" + source_id
+        checkpoint = lambda: self._checkpoint(batch["id"], child_id=source["child_job_id"])
         try:
-            with self.slots.lease(owner, checkpoint=lambda: self._checkpoint(batch["id"])):
-                self._checkpoint(batch["id"])
+            with self.slots.lease(owner, checkpoint=checkpoint):
+                checkpoint()
                 if source["child_job_id"]:
                     self._transfer_child(batch, source)
                 else:
                     client = self.source_factory(self._config(batch, source), self._credentials_for(batch["id"]))
                     client.page_limit = batch["config"]["page_limit"]
                     client.retry_policy = self.retry_policy(batch["id"])
-                    client.checkpoint = lambda: self._checkpoint(batch["id"])
+                    client.checkpoint = checkpoint
                     self._transfer_local(batch, source, client)
         except Interrupted:
             current = self.store.get(batch["id"])
@@ -936,27 +1178,36 @@ class BatchService:
         child_id = source["child_job_id"]
         self._bind_child_policy(batch["id"], child_id)
         while True:
-            self._checkpoint(batch["id"])
+            self._checkpoint(batch["id"], child_id=child_id)
             with self.onprem.job_guard(child_id):
                 old_failures = {(e["id"], e["updated_at"]) for e in self.onprem.store.entries(child_id, limit=1000000, state="failed")}
                 self.onprem.runner.step(child_id)
                 job = self.onprem.store.get(child_id)
+                if (job["state"] == "running" and batch["id"] not in self._credentials
+                        and not job["point_retry_active"] and batch["config"].get("destination_auth") == "service_application"):
+                    # The named file finished. The remaining queue requires the batch's credentials.
+                    job = self.onprem.store.update_job(child_id, state="awaiting_credentials",
+                                                       resume_state="running", error="credentials_required")
                 summary = self._summary_child(child_id)
                 self.store.update_source(source["id"], summary=summary)
                 entries = self.onprem.store.entries(child_id, limit=1000000, state="failed")
                 outage = next((e["error"] for e in entries if e.get("error") in OUTAGES
                                and (e["id"], e["updated_at"]) not in old_failures), None)
                 if outage and self.retry_policy(batch["id"]).enabled:
-                    self._pause_destination(batch, outage)
+                    if batch["config"].get("destination_type") == "personal":
+                        self.onprem.store.update_job(child_id, state="paused", resume_state="running", error=outage)
+                    else:
+                        self._pause_destination(batch, outage)
                     self.store.update_source(source["id"], state="paused", error=outage)
                     return
                 if job["state"] != "running":
-                    mapped = {"needs_attention": "completed_with_issues", "awaiting_credentials": "awaiting_credentials"}.get(job["state"], job["state"])
-                    self.store.update_source(source["id"], state=mapped, error=job["error"])
-                    if job["state"] == "awaiting_credentials":
-                        self.store.update(batch["id"], state="awaiting_credentials", resume_state="running", error=job["error"])
-                    elif job["state"] == "paused":
-                        self.store.update(batch["id"], state="paused", resume_state="running")
+                    state = job["state"]
+                    if state == "needs_attention":
+                        state = "paused" if job["resume_state"] == "running" else "completed_with_issues"
+                    self.store.update_source(source["id"], state=state, error=job["error"])
+                    if batch["config"].get("destination_type") != "personal" and state in {"paused", "awaiting_credentials"}:
+                        fields = {"error": job["error"]} if job["error"] else {}
+                        self.store.update(batch["id"], state=state, resume_state="running", **fields)
                     return
             if self.stop_event.wait(0.2):
                 raise Interrupted()
@@ -964,8 +1215,9 @@ class BatchService:
     def _pause_destination(self, batch, code):
         for other in self.store.batches(mode="onprem", limit=1000000)["batches"]:
             if (other["state"] == "running" and self.retry_policy(other["id"]).enabled
+                    and other["config"].get("destination_type") == "shared"
                     and all(other["config"][key] == batch["config"][key]
-                    for key in ("destination_url", "destination_vd_hash"))):
+                            for key in ("destination_url", "destination_vd_hash"))):
                 self.store.update(other["id"], state="paused", resume_state="running", error=code)
                 for source in self.store.sources(other["id"]):
                     if source["child_job_id"]:
@@ -984,8 +1236,6 @@ class BatchService:
         self._local_path(source["folder"]).mkdir(parents=True, exist_ok=True)
         while entry := self.store.next_entry(source["id"]):
             checkpoint()
-            if self._file_cooldown.after_error(source["id"]):
-                self._wait_local_file_pause(batch, source, entry, checkpoint)
             relative = entry["destination_path"][len(source["folder"]) + 1:]
             stage = "check_source"
             try:
@@ -1012,9 +1262,7 @@ class BatchService:
                         raise MigrationError("destination_conflict")
                 else:
                     stage = "downloading"
-                    self._wait_local_file_pause(batch, source, entry, checkpoint)
                     self._download_local(batch, source, entry, client, target, checkpoint)
-                    self._file_cooldown.mark(source["id"])
             except Interrupted:
                 self.store.update_entry(entry["id"], state="planned")
                 raise
@@ -1033,7 +1281,6 @@ class BatchService:
                                 destination=entry["destination_path"], error=code,
                                 http_status=getattr(exc, "http_status", None), retry_enabled=False,
                                 **details)
-                    self._file_cooldown.mark(source["id"], after_error=True)
             self.store.update_source(source["id"], summary=self.store.summary(source["id"]))
         summary = self.store.summary(source["id"])
         state = "completed_with_issues" if summary["issues"] else "completed"
@@ -1043,15 +1290,6 @@ class BatchService:
             self.journal.finish(source["journal_id"], "done" if not summary["issues"] else "error",
                                 summary={"saved": selected_files - summary["issues"], "failed": summary["issues"],
                                          "skipped": summary["total_files"] - selected_files, "total": summary["total_files"]})
-
-    def _wait_local_file_pause(self, batch, source, entry, checkpoint):
-        delay = self._file_cooldown.remaining(source["id"])
-        if delay > 0:
-            self._event(batch, source, "file_pause", "waiting",
-                        source=entry["source_path"], retry_delay_ms=int(delay * 1000),
-                        message="Пауза между передачами: 20 с. Очередь продолжится автоматически.")
-            self._delay(delay, checkpoint)
-            checkpoint()
 
     def _download_local(self, batch, source, entry, client, target, checkpoint):
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1143,9 +1381,16 @@ class BatchService:
 
     def detail(self, batch_id):
         batch, sources = self.store.get(batch_id), self.store.sources(batch_id)
+        personal = batch["config"].get("destination_type") == "personal"
         for source in sources:
             if source["child_job_id"] and self.onprem:
-                source["child_strategy"] = self.onprem.store.get(source["child_job_id"])["config"]["strategy"]
+                child = self.onprem.store.get(source["child_job_id"])
+                source["child_strategy"] = child["config"]["strategy"]
+                if batch["config"].get("destination_auth") == "service_application":
+                    source["destination_verified_uid"] = child["destination_verified_uid"]
+                if personal and source["plan_complete"]:
+                    config = child["config"]
+                    source["planned_destination_path"] = join_path(config["destination_root"], config["source_path"][6:])
                 source["summary"] = self._summary_child(source["child_job_id"])
                 source["transfer_rates"] = self.onprem.runner.transfer_rates(source["child_job_id"])
             else:
@@ -1156,6 +1401,10 @@ class BatchService:
             selection["editable"] = self._entry_selection_editable(batch, source) and (
                 selection["editable"] if source["child_job_id"] else True
             )
+        if personal:
+            issues = self._mapping_conflicts(sources) if batch["state"] == "draft" else batch["mapping_issues"]
+            for source in sources:
+                source.update(issues.get(source["id"], {}))
         batch["summary"] = self._aggregate(sources)
         batch["selection"] = {"total": sum(s["summary"]["selection"]["total"] for s in sources),
                               "editable": any(s["summary"]["selection"]["editable"] for s in sources)}
@@ -1190,22 +1439,35 @@ class BatchService:
         return "'" + value if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")) else value
 
     def export(self, batch_id, *, journal=False):
-        sources = self.detail(batch_id)["sources"]
+        detail = self.detail(batch_id)
+        sources = detail["sources"]
         batch_cutoff = self.store.last_sequence(batch_id)
         spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
         output = io.TextIOWrapper(spool, encoding="utf-8-sig", newline="")
         extra_journal = ["job_id", "stage_label", "status_label", "strategy", "attempt_id", "remote_path",
                          "remote_status", "error_message", "diagnostic_message", "download_attempts",
                          "max_download_attempts", "point_retry_attempts", "max_point_retry_attempts", "retry_at_ms"]
+        if detail["batch"]["mode"] == "onprem":
+            extra_journal.extend(["publication_attempts", "max_publication_attempts"])
         report_fields = ["source_state", "plan_complete", "total_files", "total_directories", "total_bytes",
                          "required_bytes", "verified_bytes", "state", "error", "source_path", "destination_path", "kind", "size", "md5", "selected"]
-        fields = ["source_id", "type", "email", "vd_hash"] + (CSV_FIELDS + extra_journal if journal else report_fields)
+        mapping_fields = []
+        if detail["batch"]["config"].get("destination_type") == "personal":
+            mapping_fields = ["csv_row", "destination_email", "destination_folder", "destination_verified_uid",
+                              "mapping_error", "conflict_rows", "conflict_path", "source_error"]
+        fields = ["source_id", "type", "email", "vd_hash"] + mapping_fields + (
+            CSV_FIELDS + extra_journal if journal else report_fields
+        )
         writer = csv.DictWriter(output, fields, extrasaction="ignore")
         writer.writeheader()
         try:
             for source in sources:
                 context = {k: source[k] for k in ("type", "email", "vd_hash")}
                 context["source_id"] = source["id"]
+                if mapping_fields:
+                    context.update({key: source.get(key) for key in mapping_fields})
+                    context["source_error"] = source["error"]
+                    context["conflict_rows"] = ", ".join(map(str, source.get("conflict_rows", [])))
                 if not journal:
                     context.update(source_state=source["state"], plan_complete=source["plan_complete"], **source["summary"])
                 offset = 0
@@ -1229,6 +1491,8 @@ class BatchService:
                         rows = self.entries(source["id"], 500, offset)["entries"]
                     if not rows:
                         if not journal and not emitted:
+                            if mapping_fields:
+                                context["source_path"] = source["path"]
                             writer.writerow({k: self._csv_value(v) for k, v in context.items()})
                         break
                     for row in rows:

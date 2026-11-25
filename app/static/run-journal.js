@@ -51,7 +51,7 @@
     journal_write_failed: "Не удалось сохранить журнал. Проверьте свободное место и права доступа к хранилищу утилиты.",
     journal_storage_unavailable: "Хранилище журналов недоступно. Проверьте свободное место и права доступа.",
     journal_unavailable: "Хранилище журналов недоступно. Проверьте свободное место и права доступа.",
-    journal_cleanup_failed: "Не удалось полностью очистить журнальный кеш. Проверьте хранилище и повторите попытку.",
+    journal_cleanup_failed: "Не удалось полностью удалить историю. Проверьте хранилище и повторите попытку.",
     journal_origin_rejected: "Запрос отклонён: откройте утилиту по её обычному адресу и повторите действие.",
   };
   const clean = (value, limit = 1500) => typeof value === "string" && value.length <= limit &&
@@ -327,7 +327,9 @@
   get("run-journal-cleanup").addEventListener("click", async () => {
     const key = mode, current = data[key];
     if (!current || cleanupBusy || exportBusy || activity[key] > 0) return;
-    cleanupBusy = true; current.cleanupError = false; current.cleanup = "Очищаю журнальный кеш…"; render();
+    const csvNote = key === "local" ? " События списков CSV также удалятся. Планы списков CSV сохранятся." : "";
+    if (!window.confirm(`Удалить историю режима «${names[key]}»?\n\nЖурналы всех запусков этого режима и их события будут удалены безвозвратно.${csvNote} Файлы и история других режимов сохранятся.`)) return;
+    cleanupBusy = true; current.cleanupError = false; current.cleanup = "Удаляю историю режима…"; render();
     try {
       const result = await request("/api/history/cleanup", {method: "POST", body: {mode: key}});
       if (![result?.removed_jobs, result?.removed_events, result?.removed_bytes].every((value) => Number.isSafeInteger(value) && value >= 0)) throw apiError("invalid_response");

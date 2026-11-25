@@ -18,7 +18,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from .destination import destination_path, normalize_destination_url
+from .credentials import credential_fields
+from .destination import bound_oauth_url, destination_path, normalize_destination_url
 from .diagnostics import describe_diagnostics
 from .errors import MigrationError
 from .runner import ACTIVE, disk_path, join_path
@@ -86,10 +87,20 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class Configuration(StrictModel):
+class SourceAccount(StrictModel):
     source_org_id: str = Field(min_length=1, max_length=256)
     source_client_id: str = Field(min_length=1, max_length=256)
     source_email: str = Field(min_length=3, max_length=254)
+
+
+class SourceBrowseRequest(SourceAccount):
+    source_client_secret: SecretStr
+    source_admin_token: SecretStr | None = None
+    path: str = Field(default="/", max_length=4096)
+    offset: int = Field(default=0, ge=0, le=2**53 - 1, strict=True)
+
+
+class Configuration(SourceAccount):
     source_path: str = "/"
     source_type: Literal["personal", "shared"] = "personal"
     source_vd_hash: str = ""
@@ -98,17 +109,22 @@ class Configuration(StrictModel):
     destination_identity: str = Field(min_length=1, max_length=256)
     destination_root: str = ""
     destination_type: Literal["personal", "shared"] = "personal"
+    destination_auth: Literal["service_application", "admin_token"] | None = None
+    destination_oauth_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    destination_client_id: str | None = Field(default=None, min_length=1, max_length=256)
     destination_vd_hash: str = ""
     destination_base: str = "disk:/"
     strategy: Literal["url", "staged"] = "staged"
     source_public: bool = Field(default=False, strict=True)
     retry_enabled: bool = Field(default=True, strict=True)
-    identity_confirmed: Literal[True]
+    identity_confirmed: bool = Field(default=False, strict=True)
 
 
 class Credentials(StrictModel):
     source_client_secret: SecretStr
-    destination_token: SecretStr
+    destination_token: SecretStr | None = None
+    destination_owner_token: SecretStr | None = None
+    destination_client_secret: SecretStr | None = None
     source_admin_token: SecretStr | None = None
 
 
@@ -151,8 +167,42 @@ async def body(request, model):
         raise HTTPException(422, "invalid_request") from None
 
 
-def access_data(model, *, new_job=False, staged_only=False):
-    config = model.config.model_dump()
+def validate_source_account(config):
+    if ("@" not in config["source_email"] or "/" in config["source_email"]
+            or any(c.isspace() or ord(c) < 32 for c in config["source_email"])):
+        raise HTTPException(422, "invalid_source_email")
+    for key in ("source_org_id", "source_client_id"):
+        if any(ord(c) < 32 for c in config[key]):
+            raise HTTPException(422, "invalid_config")
+
+
+def secret_values(values):
+    credentials = {key: value.get_secret_value() for key, value in values.items() if value is not None}
+    if any(not value or len(value) > 8192 or any(ord(c) < 32 or ord(c) == 127 for c in value)
+           for value in credentials.values()):
+        raise HTTPException(422, "invalid_credentials")
+    return credentials
+
+
+def access_data(model, *, new_job=False, staged_only=False, batch_child=False):
+    config = model.config.model_dump(exclude_none=True)
+    auth = config.get("destination_auth")
+    shared = config["destination_type"] == "shared"
+    new_personal = (config["destination_type"] == "personal"
+                    and (auth or "destination_type" in model.config.model_fields_set)
+                    and (new_job or isinstance(model, CreateRequest)))
+    if shared and auth == "admin_token":
+        raise HTTPException(422, "invalid_shared_service_application")
+    if (new_personal and auth != "service_application"
+            or auth != "service_application" and "destination_oauth_url" in config):
+        raise HTTPException(422, "invalid_personal_destination")
+    if auth == "service_application":
+        try:
+            config["destination_oauth_url"] = bound_oauth_url(model.config.model_dump(exclude_unset=True))
+        except MigrationError as exc:
+            raise HTTPException(422, exc.code) from None
+    if not auth and (not config["identity_confirmed"] or "destination_client_id" in config):
+        raise HTTPException(422, "invalid_request")
     if (new_job or staged_only) and config["strategy"] != "staged":
         raise HTTPException(422, "onprem_staged_required")
     source_shared = config["source_type"] == "shared"
@@ -162,22 +212,29 @@ def access_data(model, *, new_job=False, staged_only=False):
         for key in ("source_type", "source_vd_hash", "source_folder"):
             config.pop(key)
     if config["source_public"]:
-        if config["destination_type"] != "shared":
+        if not shared and not auth:
             raise HTTPException(422, "invalid_source_public")
     else:
         config.pop("source_public")
-    if ("@" not in config["source_email"] or "/" in config["source_email"]
-            or any(c.isspace() for c in config["source_email"])):
-        raise HTTPException(422, "invalid_source_email")
-    for key in ("source_org_id", "source_client_id", "destination_identity"):
-        if any(ord(c) < 32 for c in config[key]):
-            raise HTTPException(422, "invalid_config")
+    validate_source_account(config)
+    if any(ord(c) < 32 for c in config["destination_identity"]):
+        raise HTTPException(422, "invalid_config")
     try:
         config["source_path"] = disk_path(config["source_path"])
         config["destination_url"] = normalize_destination_url(config["destination_url"])
     except (MigrationError, ValueError):
         raise HTTPException(422, "invalid_paths_or_destination") from None
-    if config["destination_type"] == "shared":
+    if auth and not shared:
+        if config["destination_vd_hash"] or config["destination_base"] not in ("/", "disk:/"):
+            raise HTTPException(422, "invalid_personal_destination")
+        config.pop("destination_base")
+        config.pop("destination_vd_hash")
+        try:
+            config["destination_root"] = disk_path(config["destination_root"] or "/")
+            config = canonical_config(config, batch_child=batch_child)
+        except (ValueError, MigrationError):
+            raise HTTPException(422, "invalid_personal_destination") from None
+    elif shared:
         try:
             config["destination_base"] = disk_path(config["destination_base"])
             folder = config.get("source_folder") or config["source_email"]
@@ -195,7 +252,11 @@ def access_data(model, *, new_job=False, staged_only=False):
                 )
                 if source_shared or "strategy" not in model.config.model_fields_set:
                     config["strategy"] = "staged"
-        except (MigrationError, ValueError):
+        except ValueError as exc:
+            if str(exc) == "invalid_shared_service_application":
+                raise HTTPException(422, "invalid_shared_service_application") from None
+            raise HTTPException(422, "invalid_destination_shared_disk") from None
+        except MigrationError:
             raise HTTPException(422, "invalid_destination_shared_disk") from None
     else:
         if config["destination_vd_hash"]:
@@ -208,10 +269,8 @@ def access_data(model, *, new_job=False, staged_only=False):
             )
         except ValueError:
             raise HTTPException(422, "invalid_paths_or_destination") from None
-    credentials = {k: v.get_secret_value()
-                   for k, v in model.credentials.__dict__.items() if v is not None}
-    if any(not value or len(value) > 8192 or any(ord(c) < 32 for c in value)
-           for value in credentials.values()):
+    credentials = secret_values(model.credentials.__dict__)
+    if set(credentials) - {"source_admin_token"} != credential_fields(config):
         raise HTTPException(422, "invalid_credentials")
     return config, credentials
 
@@ -221,6 +280,36 @@ def service(request):
     if not value:
         raise HTTPException(503, "onprem_unavailable")
     return value
+
+
+def personal_available(value, auth="admin_token"):
+    return value is not None and getattr(
+        value.runner.destination_factory, f"supports_personal_{auth}", False,
+    ) is True
+
+
+def shared_service_available(value):
+    return value is not None and getattr(
+        value.runner.destination_factory, "supports_shared_service_application", False,
+    ) is True
+
+
+def require_destination_available(value, config):
+    auth = config.get("destination_auth")
+    if auth == "service_application" and "destination_oauth_url" in config:
+        bound_oauth_url(config)
+    if config.get("destination_type") == "shared" and auth == "service_application":
+        if not shared_service_available(value):
+            raise HTTPException(409, "onprem_shared_grant_unavailable")
+    elif auth and not personal_available(value, auth):
+        detail = ("onprem_personal_grant_unavailable" if auth == "service_application"
+                  else "onprem_personal_token_unavailable")
+        raise HTTPException(409, detail)
+
+
+def require_started_for_retry(job):
+    if job["config"].get("destination_auth") and not job["selection_frozen"]:
+        raise HTTPException(409, "transfer_not_started")
 
 
 def job_of(value, job_id):
@@ -235,16 +324,17 @@ def require_live_job(job):
         raise HTTPException(409, "job_stopped")
 
 
-def require_batch_active(request, job_id, *, starting=False):
+def require_batch_active(request, job_id, *, starting=False, recovering_point=False):
     batches = getattr(request.app.state, "source_batches", None)
     if batches is None:
         return
     try:
-        managed = batches.require_child_active(job_id)
+        managed = batches.require_child_active(job_id, recovering_point=recovering_point)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from None
     if starting and managed:
         raise HTTPException(409, "managed_batch_start_required")
+    return managed
 
 
 @contextmanager
@@ -263,10 +353,35 @@ def guarded(value, job_id=None):
         lock.release()
 
 
+@router.post("/source/browse")
+async def browse_source(request: Request):
+    model = await body(request, SourceBrowseRequest)
+    config = model.model_dump(include=set(SourceAccount.model_fields))
+    validate_source_account(config)
+    credentials = secret_values({"source_client_secret": model.source_client_secret,
+                                 "source_admin_token": model.source_admin_token})
+    try:
+        path = disk_path(model.path)
+    except ValueError:
+        raise HTTPException(422, "invalid_disk_path") from None
+    factory = service(request).runner.source_factory
+
+    def list_page():
+        source = factory(config, credentials)
+        try:
+            return source.browse(path, model.offset)
+        finally:
+            source.close()
+
+    page = await asyncio.to_thread(list_page)
+    return JSONResponse(content=page, headers={"Cache-Control": "no-store"})
+
+
 @router.post("/preflight")
 async def preflight(request: Request):
     config, credentials = access_data(await body(request, AccessRequest), new_job=True)
     value = service(request)
+    require_destination_available(value, config)
     with guarded(value):
         return await asyncio.to_thread(value.runner.preflight, config, credentials)
 
@@ -278,6 +393,7 @@ async def create_job(request: Request):
         raise HTTPException(422, "reserved_idempotency_key")
     config, credentials = access_data(model, new_job=True)
     value = service(request)
+    require_destination_available(value, config)
     with guarded(value):
         job = value.store.create(config, model.idempotency_key)
         if (job["state"] == "queued" and job["revision"] == 0
@@ -290,8 +406,13 @@ async def create_job(request: Request):
 @router.post("/jobs/{job_id}/restart")
 async def restart(job_id: str, request: Request):
     model = await body(request, CreateRequest)
-    config, credentials = access_data(model, staged_only=True)
     value = service(request)
+    if job_id in value.excluded_job_ids:
+        original = job_of(value, job_id)["config"]
+        if original.get("destination_type") == "personal" or original.get("destination_auth"):
+            raise HTTPException(409, "managed_batch_start_required")
+    config, credentials = access_data(model, staged_only=True)
+    require_destination_available(value, config)
     with guarded(value, job_id):
         value.runner.require_staged_job(job_of(value, job_id))
         job = value.store.restart(job_id, config, model.idempotency_key)
@@ -365,6 +486,7 @@ def start(job_id: str, request: Request):
     with guarded(value, job_id):
         job = job_of(value, job_id)
         require_live_job(job)
+        require_destination_available(value, job["config"])
         value.runner.require_staged_job(job)
         if not job["plan_complete"] or job["state"] not in {"ready", "needs_attention"}:
             raise HTTPException(409, "plan_not_ready")
@@ -425,9 +547,9 @@ def pause(job_id: str, request: Request):
 
 @router.put("/jobs/{job_id}/credentials")
 async def credentials(job_id: str, request: Request):
-    require_batch_active(request, job_id)
+    managed = require_batch_active(request, job_id, recovering_point=True)
     model = await body(request, CredentialsRequest)
-    config, secret = access_data(model, staged_only=True)
+    config, secret = access_data(model, staged_only=True, batch_child=managed)
     value = service(request)
     with guarded(value, job_id):
         job = job_of(value, job_id)
@@ -435,6 +557,7 @@ async def credentials(job_id: str, request: Request):
         value.runner.require_staged_job(job)
         if config_identity(job["config"]) != config_identity(config):
             raise HTTPException(409, "credential_binding_mismatch")
+        require_destination_available(value, config)
         if job["state"] not in {
             "awaiting_credentials", "ready", "paused", "needs_attention",
             "completed_with_issues",
@@ -461,16 +584,21 @@ async def credentials(job_id: str, request: Request):
             return entry
 
         retry_entry = check_retry_entry()
+        if config.get("destination_auth"):
+            # Reattaching credentials must discard the client bound to the old session.
+            value.runner.release_clients(job_id)
+        proof = ({"expected_uid": value.runner.plan_uid(job)}
+                 if config.get("destination_auth") == "service_application" else {})
         try:
             if retry_entry:
                 attempt = (value.store.attempt(retry_entry["attempt_id"])
                            if retry_entry["attempt_id"] else None)
                 await asyncio.to_thread(
                     value.runner._logged, job, retry_entry, "check_destination_access",
-                    value.runner.preflight_destination, config, secret, attempt=attempt,
+                    value.runner.preflight_destination, config, secret, attempt=attempt, **proof,
                 )
             else:
-                await asyncio.to_thread(value.runner.preflight, config, secret)
+                await asyncio.to_thread(value.runner.preflight, config, secret, **proof)
         except Exception:
             require_live_job(job_of(value, job_id))
             raise
@@ -482,7 +610,7 @@ async def credentials(job_id: str, request: Request):
 
 @router.post("/jobs/{job_id}/resume")
 def resume(job_id: str, request: Request):
-    require_batch_active(request, job_id)
+    require_batch_active(request, job_id, recovering_point=True)
     value = service(request)
     value.runner.require_staged_job(job_of(value, job_id))
     batches = getattr(request.app.state, "source_batches", None)
@@ -491,6 +619,7 @@ def resume(job_id: str, request: Request):
     with guarded(value, job_id):
         job = job_of(value, job_id)
         require_live_job(job)
+        require_destination_available(value, job["config"])
         if not value.registry.get(job_id):
             raise HTTPException(409, "credentials_required")
         if job["state"] not in {"paused", "awaiting_credentials", "needs_attention"}:
@@ -507,6 +636,9 @@ def resume(job_id: str, request: Request):
         prestart = value.store.is_prestart_plan(job_id)
         if prestart:
             target = target or job["state"]
+        elif job["config"].get("destination_auth") and not job["selection_frozen"]:
+            # A partially scanned Disk must return to Dry Run before Start.
+            target = "queued"
         elif job["point_retry_active"]:
             target = "running"
         elif target in {"queued", "planning"}:
@@ -517,6 +649,9 @@ def resume(job_id: str, request: Request):
             target = "queued"
         else:
             target = "running"
+        value.runner.plan_uid(job)
+        if target == "running":
+            value.runner.ensure_personal_recipient(job)
         value.store.update_job(job_id, state=target, resume_state=None,
                                pause_requested=False,
                                error=job["error"] if prestart else None)
@@ -531,6 +666,10 @@ def resume(job_id: str, request: Request):
 async def retry(job_id: str, request: Request):
     require_batch_active(request, job_id)
     model = await body(request, RetryRequest)
+    return await asyncio.to_thread(retry_job, job_id, request, model)
+
+
+def retry_job(job_id, request, model):
     if model.strategy != "staged":
         raise HTTPException(422, "onprem_staged_required")
     value = service(request)
@@ -539,9 +678,14 @@ async def retry(job_id: str, request: Request):
     if batches is not None:
         batches.prepare_child_retry(job_id)
     with guarded(value, job_id):
-        require_live_job(job_of(value, job_id))
+        job = job_of(value, job_id)
+        require_live_job(job)
+        require_destination_available(value, job["config"])
+        require_started_for_retry(job)
         if not value.registry.get(job_id):
             raise HTTPException(409, "credentials_required")
+        value.runner.ensure_personal_recipient(job)
+        require_live_job(job_of(value, job_id))
         value.runner.retry(job_id, model.strategy)
     batches = getattr(request.app.state, "source_batches", None)
     if batches is not None:
@@ -554,13 +698,20 @@ async def retry(job_id: str, request: Request):
 async def point_retry(job_id: str, entry_id: str, request: Request):
     require_batch_active(request, job_id)
     model = await body(request, PointRetryRequest)
+    return await asyncio.to_thread(retry_entry, job_id, entry_id, request, model)
+
+
+def retry_entry(job_id, entry_id, request, model):
     value = service(request)
     value.runner.require_staged_job(job_of(value, job_id))
     batches = getattr(request.app.state, "source_batches", None)
     if batches is not None:
         batches.prepare_child_retry(job_id)
     with guarded(value, job_id):
-        require_live_job(job_of(value, job_id))
+        job = job_of(value, job_id)
+        require_live_job(job)
+        require_destination_available(value, job["config"])
+        require_started_for_retry(job)
         if not value.registry.get(job_id):
             raise HTTPException(409, "credentials_required")
         try:
@@ -572,6 +723,8 @@ async def point_retry(job_id: str, entry_id: str, request: Request):
                 value.store.attempt(model.attempt_id)
             except KeyError:
                 raise HTTPException(404, "attempt_not_found") from None
+        value.runner.ensure_personal_recipient(job)
+        require_live_job(job_of(value, job_id))
         value.store.queue_point_retry(
             job_id, entry_id, model.attempt_id, model.revision,
         )
@@ -660,6 +813,7 @@ def journal(job_id: str, request: Request):
             "max_point_retry_attempts", "retry_enabled",
             "error_side", "api_error", "api_reason", "transport_error",
             "request_host", "request_id", "diagnostic_message",
+            "publication_attempts", "max_publication_attempts",
         ])
         yield "\ufeff" + output.getvalue()
         cursor = 0
@@ -690,7 +844,8 @@ def journal(job_id: str, request: Request):
                     payload.get("error_side"), payload.get("api_error"),
                     payload.get("api_reason"), payload.get("transport_error"),
                     payload.get("request_host"), payload.get("request_id"),
-                    event["diagnostic_message"],
+                    event["diagnostic_message"], payload.get("publication_attempts"),
+                    payload.get("max_publication_attempts"),
                 )])
             cursor = batch[-1]["sequence"]
             yield output.getvalue()

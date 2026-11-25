@@ -156,6 +156,27 @@ test("mode cleanup needs no selected job or form credentials and leaves other mo
   assert.equal(get(ui, "run-journal-cleanup-result").textContent, "");
 });
 
+test("cancelling history deletion in each mode keeps its selection and sends no request", async () => {
+  const ui = await loadUi(undefined, {initialJobs: [job("single"), job("cross", "cross"), job("local", "local")]});
+  let prompt;
+  ui.window.confirm = (message) => {prompt = message; return false;};
+  for (const [mode, name] of [["single", "Одна организация"], ["cross", "Между организациями"], ["local", "Сохранить локально"]]) {
+    await ui.journal.selectMode(mode);
+    const reads = ui.reads.length;
+    prompt = "";
+    await get(ui, "run-journal-cleanup").fire("click");
+    assert.ok(prompt.includes(`«${name}»`));
+    assert.match(prompt, /безвозвратно/i);
+    assert.match(prompt, /журналы/i);
+    assert.match(prompt, /файлы/i);
+    if (mode === "local") assert.match(prompt, /планы.*CSV.*сохранятся/i);
+    assert.deepEqual(ui.requests, []);
+    assert.equal(ui.reads.length, reads);
+    assert.equal(get(ui, "run-history").value, mode);
+  }
+  assert.equal(ui.jobs.length, 3);
+});
+
 test("cleanup response and retries stay bound to their original mode", async () => {
   let release;
   const ui = await loadUi(undefined, {initialJobs: [job("single"), job("cross", "cross")], journalOverride: async ({url}) => {

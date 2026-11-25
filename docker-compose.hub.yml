@@ -1,0 +1,29 @@
+name: yandex-disk-copy
+
+services:
+  disk-copy:
+    image: cromovsky/yandex-disk-copy-v2:3.4.0
+    container_name: yandex-disk-copy
+    dns:
+      - 1.1.1.1
+      - 77.88.8.8
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      LOCAL_SAVE_DIR: /downloads
+      LOCAL_SAVE_HOST_DIR: ./downloads
+      ONPREM_ENABLED: "1"
+      ONPREM_ALLOW_INSECURE_HTTP: "1"
+      ONPREM_DATA_DIR: /var/lib/disk-copy
+      ONPREM_ADMIN_TOKEN: ${ONPREM_ADMIN_TOKEN:-}
+      ONPREM_STAGING_MAX_BYTES: ${ONPREM_STAGING_MAX_BYTES:-21474836480}
+      ONPREM_STAGING_RESERVE_BYTES: ${ONPREM_STAGING_RESERVE_BYTES:-1073741824}
+      ONPREM_API_READ_RPS: ${ONPREM_API_READ_RPS:-10}
+      ONPREM_API_WRITE_RPS: ${ONPREM_API_WRITE_RPS:-2}
+    volumes:
+      - ./downloads:/downloads
+      - migration-data:/var/lib/disk-copy
+    restart: unless-stopped
+
+volumes:
+  migration-data:

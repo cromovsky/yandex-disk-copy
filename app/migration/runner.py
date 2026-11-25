@@ -16,11 +16,12 @@ from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
-from .destination import OnPremDiskDestination, destination_path
+from .destination import (OnPremDiskDestination, account_uid, account_upn,
+                          destination_path, verified_service_uid)
 from .diagnostics import diagnostic_fields
 from .errors import MigrationError
 from .source import SaasDiskSource
-from app.file_cooldown import FileCooldown
+from .store import MAX_PUBLICATION_ATTEMPTS
 from app.retry_policy import RetryPolicy
 
 
@@ -63,6 +64,10 @@ DOWNLOAD_ERRORS = {
 }
 
 
+def requires_owner_proof(config):
+    return config.get("destination_type") == "personal" or config.get("destination_auth") == "service_application"
+
+
 def destination_interrupted(exc):
     return bool(isinstance(exc, MigrationError) and (
         exc.code.startswith("destination_")
@@ -84,6 +89,10 @@ def file_access_denied(exc, stage):
 
 class _StopRequested(Exception):
     pass
+
+
+class _PublicationDeferred(_StopRequested):
+    """Yield this worker step after a durable refusal or retry cancellation."""
 
 
 def disk_path(value: str) -> str:
@@ -146,8 +155,6 @@ class MigrationRunner:
         self._cache_reservations = {}
         self._outage_lock = threading.Lock()
         self._destination_outages = {}
-        self._file_cooldown = FileCooldown()
-        self._file_pause_logged = set()
         self.shutdown_event = None
         self.default_strategy = None
 
@@ -235,7 +242,7 @@ class MigrationRunner:
             destination.close()
         self._clients.clear()
 
-    def _logged(self, job, entry, stage, action, *args, attempt=None, **kwargs):
+    def _logged(self, job, entry, stage, action, *args, attempt=None, stage_fields=None, **kwargs):
         if self.store.get(job["id"]).get("full_stop_requested"):
             raise _StopRequested()
         payload = {"stage": stage, "status": "started"}
@@ -275,6 +282,7 @@ class MigrationRunner:
             if isinstance(exc, MigrationError):
                 exc._migration_stage = getattr(exc, "_migration_stage", stage)
                 if (attempt and stage in {"upload_file", "submit_url_upload"}
+                        and exc._migration_stage == stage
                         and not exc.uncertain and not exc.auth):
                     # This submission is known to have failed. Read failures
                     # while checking an older unknown write keep its phase.
@@ -297,9 +305,17 @@ class MigrationRunner:
                     )["download_attempts"],
                     max_download_attempts=self._download_limit(job["id"]),
                 )
-            self.store.event(job["id"], "transfer_stage", payload)
+            if (stage == "publish_source" and stage_fields and isinstance(exc, MigrationError)
+                    and exc.code == "source_publication_denied" and exc.http_status in {403, 423}
+                    and not exc.auth and not exc.uncertain):
+                payload.update(stage_fields)
+                exc._publication_retry = self.store.record_publication_denial(job["id"], payload)
+            else:
+                self.store.event(job["id"], "transfer_stage", payload)
             raise
         payload["status"] = "succeeded"
+        if stage_fields and result == "published":
+            payload.update(stage_fields)
         if stage in {"poll_transfer", "poll_move"}:
             if result in {"in-progress", "success", "failed"}:
                 payload["remote_status"] = result
@@ -351,8 +367,6 @@ class MigrationRunner:
     def stop_job(self, job_id):
         self.store.update_job(job_id, state="stopped", resume_state=None,
                               pause_requested=False)
-        self._file_cooldown.clear(job_id)
-        self._file_pause_logged.discard(job_id)
         if self.store.get(job_id).get("full_stop_requested"):
             self.store.cancel_local_entries(job_id)
             self.release_clients(job_id)
@@ -381,12 +395,22 @@ class MigrationRunner:
             if str(exc) != "job_stopped":
                 raise
 
-    def destination_client(self, job):
+    @staticmethod
+    def plan_uid(job):
+        if job["config"].get("destination_auth") == "service_application":
+            uid = job["destination_verified_uid"]
+            if (not job["config"].get("destination_oauth_url")
+                    or (job["plan_complete"] or job["selection_frozen"]) and not uid):
+                raise MigrationError("destination_plan_required")
+            return uid
+
+    def destination_client(self, job, *, refresh=False):
+        expected_uid = self.plan_uid(job)
         credentials = self.registry.get(job["id"])
         if not credentials:
             raise MigrationError("credentials_required", auth=True)
         current = self._clients.get(job["id"])
-        if current and current[0] != credentials:
+        if current and (refresh or current[0] != credentials):
             if current[1]:
                 current[1].close()
             current[2].close()
@@ -394,6 +418,14 @@ class MigrationRunner:
             current = None
         if not current:
             destination = self.destination_factory(job["config"], credentials)
+            if expected_uid is not None:
+                destination.expected_uid = expected_uid
+            if job["state"] == "running" and requires_owner_proof(job["config"]):
+                try:
+                    self._identity(job["config"], None, destination)
+                except Exception:
+                    destination.close()
+                    raise
             destination.retry_policy = self.retry_policy(job["id"])
             current = (credentials, None, destination)
             self._clients[job["id"]] = current
@@ -409,23 +441,47 @@ class MigrationRunner:
             self._clients[job["id"]] = current
         return current[1:]
 
-    def preflight(self, config, credentials):
+    def ensure_personal_recipient(self, job):
+        if requires_owner_proof(job["config"]):
+            try:
+                destination = self.destination_client(
+                    job, refresh=job["config"].get("destination_auth") == "service_application",
+                )
+                self._identity(job["config"], None, destination)
+            except Exception:
+                self.release_clients(job["id"])
+                raise
+
+    def preflight(self, config, credentials, *, expected_uid=None):
         source = self.source_factory(config, credentials)
         try:
             destination = self.destination_factory(config, credentials)
             try:
-                source_meta = source.stat(config["source_path"])
+                if expected_uid is not None:
+                    destination.expected_uid = expected_uid
+                personal = config.get("destination_type") == "personal"
+                proof = requires_owner_proof(config)
+                if not proof:
+                    source_meta = source.stat(config["source_path"])
                 info = destination.info()
-                self._identity(config, info)
-                target = destination.stat(config["destination_root"])
-                if target and target.get("type") != "dir":
-                    raise MigrationError("destination_conflict")
+                uid = self._identity(config, info, destination)
+                if proof:
+                    root = destination.stat("disk:/")
+                    if not root:
+                        raise MigrationError("destination_not_found")
+                    if root.get("type") != "dir":
+                        raise MigrationError("destination_conflict")
+                    source_meta = source.stat(config["source_path"])
+                if not personal:
+                    target = destination.stat(config["destination_root"])
+                    if target and target.get("type") != "dir":
+                        raise MigrationError("destination_conflict")
                 quota = self._quota(info)
                 return {
                     "source": {"path": source_meta.get("path"),
                                "type": source_meta.get("type")},
-                    "destination": self._destination_details(config, info),
-                    "warnings": ["manual_identity_binding", "stand_not_verified"]
+                    "destination": self._destination_details(config, info, uid),
+                    "warnings": ([] if proof else ["manual_identity_binding", "stand_not_verified"])
                     + (["quota_unavailable"] if quota is None else []),
                 }
             finally:
@@ -433,20 +489,27 @@ class MigrationRunner:
         finally:
             source.close()
 
-    def preflight_destination(self, config, credentials):
+    def preflight_destination(self, config, credentials, *, expected_uid=None):
         destination = self.destination_factory(config, credentials)
         try:
+            if expected_uid is not None:
+                destination.expected_uid = expected_uid
             info = destination.info()
-            self._identity(config, info)
+            uid = self._identity(config, info, destination)
             self.clear_destination_outage(config)
-            return self._destination_details(config, info)
+            return self._destination_details(config, info, uid)
         finally:
             destination.close()
 
     @staticmethod
     def _destination_key(config):
-        return (config["destination_url"], config.get("destination_vd_hash", ""),
-                config.get("destination_type", "personal"))
+        kind = config.get("destination_type")
+        disk = config.get("destination_vd_hash", "")
+        if kind == "personal":
+            disk = config["destination_identity"]
+            if config.get("destination_auth") == "admin_token":
+                disk = account_uid(disk) or disk
+        return config["destination_url"], disk, kind or "personal"
 
     def clear_destination_outage(self, config):
         with self._outage_lock:
@@ -461,7 +524,7 @@ class MigrationRunner:
                 )
 
     @staticmethod
-    def _destination_details(config, info):
+    def _destination_details(config, info, uid):
         result = {"identity": config["destination_identity"],
                   "free_bytes": MigrationRunner._quota(info)}
         if config.get("destination_type") == "shared":
@@ -470,10 +533,38 @@ class MigrationRunner:
             for key in ("name", "permissions"):
                 if key in info:
                     result[key] = info[key]
+        elif config.get("destination_type") == "personal":
+            result.update(type="personal", path=config["destination_root"])
+        if uid is not None:
+            result["verified_uid"] = uid
         return result
 
     @staticmethod
-    def _identity(config, info):
+    def _identity(config, info, destination=None):
+        if requires_owner_proof(config):
+            expected = config["destination_identity"]
+            if config.get("destination_auth") == "admin_token":
+                # The personal REST namespace is bound to the token used for this GET.
+                owner = (info if info is not None else destination.info()).get("user")
+                if not isinstance(owner, dict):
+                    raise MigrationError("destination_identity_unverified", auth=True)
+                if "@" in expected:
+                    actual = account_upn(owner.get("login"))
+                else:
+                    expected = account_uid(expected)
+                    actual = account_uid(owner.get("uid"))
+            else:
+                actual = verified_service_uid(expected, info if info is not None else destination.info())
+                pinned = getattr(destination, "expected_uid", None)
+                if pinned is not None and actual != pinned:
+                    raise MigrationError("destination_identity_mismatch", auth=True)
+                destination.expected_uid = actual
+                return actual
+            if not isinstance(actual, str) or not actual.strip():
+                raise MigrationError("destination_identity_unverified", auth=True)
+            if actual != expected:
+                raise MigrationError("destination_identity_mismatch", auth=True)
+            return
         if not config.get("identity_confirmed"):
             raise MigrationError("identity_confirmation_required")
         user = info.get("user") or {}
@@ -490,13 +581,13 @@ class MigrationRunner:
         return None
 
     def plan(self, job, source, destination, *, full_compare=False, checkpoint=None):
-        if full_compare:
+        if full_compare or requires_owner_proof(job["config"]):
             return self._full_plan(job, source, destination, checkpoint=checkpoint)
         self._checkpoint(job["id"])
         self.store.update_job(job["id"], state="planning", error=None)
         config = job["config"]
         info = destination.info()
-        self._identity(config, info)
+        self._identity(config, info, destination)
         root = config["source_path"]
         root_meta = source.stat(root)
         if root_meta.get("type") not in {"dir", "file"}:
@@ -565,20 +656,39 @@ class MigrationRunner:
         self.store.reset_incomplete_plan(job["id"])
         config = job["config"]
         info = destination.info()
-        self._identity(config, info)
-        # Shared info checks permissions; this read confirms the actual resource root.
-        if config.get("destination_type") == "shared":
-            target_root = destination.stat("disk:/")
-            if not target_root or target_root.get("type") != "dir":
+        verified_uid = self._identity(config, info, destination)
+        personal = config.get("destination_type") == "personal"
+        if personal or config.get("destination_type") == "shared":
+            disk_root = destination.stat("disk:/")
+            if not disk_root:
                 raise MigrationError("destination_not_found")
-        existing_root = destination.stat(config["destination_root"])
-        if existing_root and existing_root.get("type") != "dir":
-            raise MigrationError("destination_conflict")
+            if disk_root.get("type") != "dir":
+                raise MigrationError("destination_conflict" if personal else "destination_not_found")
+        if not personal:
+            existing_root = destination.stat(config["destination_root"])
+            if existing_root and existing_root.get("type") != "dir":
+                raise MigrationError("destination_conflict")
         root = config["source_path"]
         root_meta = source.stat(root)
         if root_meta.get("type") not in {"dir", "file"}:
             raise MigrationError("unsupported_resource")
         base = root.rsplit("/", 1)[0] if root != "disk:/" else "disk:"
+        if personal:
+            base = "disk:"
+            # The mirrored source and any CSV prefix can both have unscanned ancestors.
+            target = join_path(config["destination_root"], root[6:])
+            ancestors = target[6:].split("/")
+            if root != "disk:/":
+                ancestors = ancestors[:-1]
+            parent = base
+            for component in filter(None, ancestors):
+                check()
+                parent += "/" + component
+                metadata = destination.stat(parent)
+                if metadata is None:
+                    break
+                if metadata.get("type") != "dir":
+                    raise MigrationError("destination_conflict", source_path=parent)
         # Track normalized destination paths in SQLite, so a million-file inventory
         # does not retain a second complete tree in Python memory.
         with self.store._connection(write=True) as connection:
@@ -635,7 +745,8 @@ class MigrationRunner:
             quota = self._quota(info)
             if quota is None:
                 self.store.event(job["id"], "warning", {"error": "quota_unavailable"})
-            self.store.add_entries(job["id"], [], append=True, mark_ready=True)
+            self.store.add_entries(job["id"], [], append=True, mark_ready=True,
+                                   destination_verified_uid=verified_uid)
             if unavailable:
                 self.store.update_job(job["id"], state="needs_attention",
                                       error="plan_conflicts")
@@ -663,10 +774,12 @@ class MigrationRunner:
                  if e["selected"] and e["kind"] == "file" and e["state"] not in SUCCESS]
         required = sum(e["size"] for e in files)
         largest = max((e["size"] for e in files), default=0)
-        if required:
-            destination = self.destination_client(job)
+        if required or requires_owner_proof(job["config"]):
+            destination = self.destination_client(
+                job, refresh=job["config"].get("destination_auth") == "service_application",
+            )
             info = destination.info()
-            self._identity(job["config"], info)
+            self._identity(job["config"], info, destination)
             quota = self._quota(info)
             extra = largest if job["remote_root"] else 0
             if quota is not None and required + extra > quota:
@@ -681,6 +794,15 @@ class MigrationRunner:
         job = self.store.get(job_id)
         if (job["state"] not in {"queued", "running"}
                 or job.get("stop_requested")):
+            return
+        try:
+            self.plan_uid(job)
+        except MigrationError as exc:
+            self._job_error(job_id, state="needs_attention", error=exc.code)
+            return
+        if (job["state"] == "running" and requires_owner_proof(job["config"])
+                and not (job["plan_complete"] and job["selection_frozen"])):
+            self._job_error(job_id, state="needs_attention", error="plan_not_ready")
             return
         entries = [e for e in self.store.entries(job_id, limit=1000000)
                    if e["selected"]]
@@ -745,21 +867,6 @@ class MigrationRunner:
             return
         if waiting and (waiting.get("retry_at_ms") or 0) > int(time.time() * 1000):
             return
-        candidate = waiting or next((e for e in entries if e["state"] == "planned"), None)
-        if (candidate and self._file_cooldown.remaining(job_id)
-                and (candidate["kind"] == "file" or self._file_cooldown.after_error(job_id))):
-            phase = (self.store.attempt(candidate["attempt_id"])["phase"]
-                     if candidate.get("attempt_id") else None)
-            # Accepted remote work must still be polled and verified during a pause.
-            if point_start or phase in {None, "prepared", "downloading", "staged",
-                                        "download_retry_wait", "failed"}:
-                if job_id not in self._file_pause_logged:
-                    self.store.event(job_id, "transfer_stage", {
-                        "stage": "file_pause", "status": "waiting", "entry_id": candidate["id"],
-                        "retry_delay_ms": round(self._file_cooldown.remaining(job_id) * 1000),
-                    })
-                    self._file_pause_logged.add(job_id)
-                return
         entry = point or waiting
         try:
             if point and point_start:
@@ -786,8 +893,7 @@ class MigrationRunner:
                                       error="technical_namespace_outcome_unknown")
                 return
             if job["config"].get("source_public") and not waiting:
-                if self._prepare_publications(job, source) is False:
-                    return
+                self._prepare_publications(job, source)
             if job["remote_root"] and namespace == "unclaimed":
                 self._checkpoint(job_id)
                 self.store.update_job(job_id, namespace_state="intent")
@@ -829,9 +935,26 @@ class MigrationRunner:
                 self.store.update_entry(entry["id"], state="done")
                 return
             self._file(job, entry, source, destination)
+        except _PublicationDeferred:
+            if point and self.store.entry(point["id"])["state"] == "failed":
+                self._finish_point_retry(job_id, point, exhausted=True)
+            return
         except _StopRequested:
             return
         except MigrationError as exc:
+            if (entry and job["config"].get("destination_auth") == "service_application"
+                    and destination_interrupted(exc)):
+                # A lost grant cannot revoke or disprove an already accepted upload.
+                current_id = self.store.entry(entry["id"])["attempt_id"]
+                attempt = self.store.attempt(current_id) if current_id else None
+                pending = (attempt and attempt["phase"] in {"waiting_transfer", "waiting_move"}
+                           and attempt.get("operation_id"))
+                if pending or getattr(exc, "_migration_stage", "") == "check_destination_access":
+                    if exc.auth:
+                        self.release_clients(job_id)
+                    state = "awaiting_credentials" if exc.auth else "needs_attention"
+                    self._job_error(job_id, state=state, resume_state="running", error=exc.code)
+                    return
             if exc.auth and not (entry and not self.retry_policy(job_id).enabled
                                  and file_access_denied(exc, getattr(exc, "_migration_stage", ""))):
                 if entry and destination_interrupted(exc):
@@ -839,7 +962,10 @@ class MigrationRunner:
                         self._point_failure(job_id, entry, exc)
                     else:
                         self._failure(job_id, entry, exc)
-                self.registry.discard(job_id)
+                if requires_owner_proof(job["config"]):
+                    self.release_clients(job_id)
+                else:
+                    self.registry.discard(job_id)
                 self._job_error(job_id, state="awaiting_credentials",
                                 resume_state="needs_attention" if destination_interrupted(exc)
                                 else job["state"], error=exc.code)
@@ -902,6 +1028,14 @@ class MigrationRunner:
             if final and (final.get("type") != "file"
                           or not self._point_overwrite(job, entry)):
                 raise MigrationError("destination_conflict")
+            if (job["config"].get("destination_auth") == "service_application"
+                    and attempt and attempt["phase"] != "failed"):
+                # An upload can still be running while the final path returns 404.
+                operation = attempt["operation_id"]
+                if not operation or self._logged(
+                    job, entry, "poll_transfer", destination.poll, operation, attempt=attempt,
+                ) != "failed":
+                    raise MigrationError("transfer_outcome_unknown", uncertain=True)
             reuse = bool(attempt and attempt.get("local_name") and self._local_matches(
                 self._local(attempt["local_name"]), entry,
             ))
@@ -913,7 +1047,7 @@ class MigrationRunner:
             self.store.new_attempt(entry["id"], strategy, point_retry=True, reuse_local=reuse)
         self._file(job, self.store.entry(entry["id"]), source, destination)
 
-    def _destination_available(self, job, destination):
+    def _destination_available(self, job, destination, *, polling=False):
         info = destination.info()
         self._checkpoint(job["id"])
         root = destination.stat("disk:/")
@@ -921,12 +1055,15 @@ class MigrationRunner:
             raise MigrationError("destination_not_found", http_status=404)
         if root.get("type") != "dir":
             raise MigrationError("destination_invalid_response", http_status=200)
-        self._identity(job["config"], info)
+        # A pending operation uses the same token-bound client as its upload.
+        if not polling or job["config"].get("destination_type") != "personal":
+            self._identity(job["config"], info, destination)
         self.clear_destination_outage(job["config"])
         return info
 
     def _point_overwrite(self, job, entry):
-        if job["remote_root"] or not entry.get("point_retry_requested"):
+        if (job["remote_root"] or requires_owner_proof(job["config"])
+                or not entry.get("point_retry_requested")):
             return False
         origin = self.store.point_retry_origin(entry["id"])
         return any(
@@ -1027,25 +1164,55 @@ class MigrationRunner:
                 path is None or source.has_publication(root["source_path"])
             ):
                 continue
+            if root["denial_status"] == "skipped":
+                if path is not None:
+                    raise MigrationError("source_publication_denied")
+                continue
             self._publication_checkpoint(job["id"])
 
             def before_publish():
+                if job["config"].get("destination_auth") == "service_application":
+                    try:
+                        self._identity(job["config"], None, self.destination_client(job))
+                    except MigrationError as exc:
+                        exc._migration_stage = "check_destination_access"
+                        raise
                 self._publication_checkpoint(job["id"])
-                self.store.update_publication(
+                intent = self.store.update_publication(
                     job["id"], root["entry_id"], state="intent",
                 )
+                if intent is None:
+                    raise _PublicationDeferred()
                 self._checkpoint(job["id"])
 
+            attempt_fields = {}
+            if root["state"] in {"planned", "failed"}:
+                attempt_fields = {
+                    "publication_attempts": root["publication_attempts"] + 1,
+                    "max_publication_attempts": (
+                        MAX_PUBLICATION_ATTEMPTS if self.retry_policy(job["id"]).enabled else 1
+                    ),
+                }
             try:
                 self._logged(
                     job, dict(root, id=root["entry_id"]), "publish_source",
                     source.ensure_publication, root, checkpoint=before_publish,
+                    stage_fields=attempt_fields,
                 )
             except MigrationError as exc:
+                if hasattr(exc, "_publication_retry"):
+                    if path is not None and not exc._publication_retry:
+                        raise _PublicationDeferred() from None
+                    self._publication_checkpoint(job["id"])
+                    if exc._publication_retry:
+                        raise _PublicationDeferred() from None
+                    continue
                 if not exc.uncertain and root["state"] not in {"intent", "published"}:
                     self.store.update_publication(
                         job["id"], root["entry_id"], state="failed", error=exc.code,
                     )
+                if getattr(exc, "_migration_stage", "") == "check_destination_access":
+                    raise
                 if not self.retry_policy(job["id"]).enabled and (
                     not exc.auth or file_access_denied(exc, "publish_source")
                 ):
@@ -1056,8 +1223,6 @@ class MigrationRunner:
                     failure._migration_stage = "publish_source"
                     self._failure(job["id"], self.store.entry(root["entry_id"]), failure)
                     if path is None:
-                        if self._file_cooldown.remaining(job["id"]):
-                            return False
                         continue
                 raise
             if root["state"] != "published":
@@ -1067,8 +1232,6 @@ class MigrationRunner:
             self._publication_checkpoint(job["id"])
 
     def _skip_event(self, job_id, entry, exc, *, stage=None):
-        self._file_cooldown.mark(job_id, after_error=True)
-        self._file_pause_logged.discard(job_id)
         details = dict(exc.diagnostics)
         if "error_side" not in details:
             if exc.code.startswith(("staging_", "invalid_staging_", "cache_")):
@@ -1202,9 +1365,6 @@ class MigrationRunner:
             attempt = self.store.new_attempt(entry["id"], strategy)
             self.store.update_entry(entry["id"], state="transferring", error=None)
         phase = attempt["phase"]
-        transferred = phase in {
-            "waiting_transfer", "waiting_move", "verifying", "verifying_final", "succeeded",
-        }
         if phase == "download_retry_wait":
             self.store.update_entry(entry["id"], retry_at_ms=None)
             self.store.update_attempt(attempt["id"], phase="prepared")
@@ -1267,7 +1427,6 @@ class MigrationRunner:
             phase = "waiting_transfer" if operation else "verifying"
             self.store.update_attempt(attempt["id"], phase=phase,
                                       operation_id=operation)
-            transferred = True
             self.store.update_entry(entry["id"], state="waiting_operation"
                                     if operation else "verifying")
             attempt = self.store.attempt(attempt["id"])
@@ -1275,15 +1434,22 @@ class MigrationRunner:
         if phase in {"waiting_transfer", "waiting_move"}:
             self._checkpoint(job["id"])
             self._logged(job, entry, "check_destination_access", self._destination_available,
-                         job, destination, attempt=attempt)
+                         job, destination, attempt=attempt, polling=True)
             try:
                 status = self._logged(
                     job, entry, "poll_move" if phase == "waiting_move"
                     else "poll_transfer", destination.poll,
                     attempt["operation_id"], attempt=attempt,
                 )
-            except MigrationError:
-                raise
+            except MigrationError as exc:
+                if (not direct or job["config"].get("destination_auth") != "service_application"
+                        or exc.code != "destination_not_found" or exc.http_status != 404):
+                    raise
+                final = self._logged(job, entry, "check_destination", destination.stat,
+                                     entry["destination_path"], attempt=attempt)
+                if not matching(entry, final):
+                    raise
+                status = "success"
             except Exception:
                 raise MigrationError("destination_invalid_response",
                                      diagnostics={"error_side": "onprem"}) from None
@@ -1366,9 +1532,6 @@ class MigrationRunner:
             self.store.update_attempt(attempt["id"], phase="succeeded", error=None)
             self.store.update_entry(entry["id"], state="done", verification="md5",
                                     error=None, retry_at_ms=None)
-            if transferred:
-                self._file_cooldown.mark(job["id"])
-                self._file_pause_logged.discard(job["id"])
             self._logged(job, entry, "cleanup", self.cleanup, job["id"],
                          successes_only=True, attempt=attempt)
 
@@ -1513,13 +1676,25 @@ class MigrationRunner:
         return remaining
 
     def _download_stage(self, entry, attempt, source, name, path):
+        job = self.store.get(entry["job_id"])
+        if job["config"].get("source_public"):
+            if attempt.get("local_name"):
+                # _stage has already verified that these bytes are missing or unusable.
+                self.store.update_attempt(attempt["id"], phase="prepared", local_name=None)
+            try:
+                self._prepare_publications(job, source, path=entry["source_path"])
+            except MigrationError:
+                # Metadata/read failures still consume their normal download attempt.
+                self._begin_download(entry)
+                raise
+            current = self.store.entry(entry["id"])
+            if current["state"] == "failed" and current["error"] == "source_publication_denied":
+                raise _PublicationDeferred()
         self._begin_download(entry)
         self.store.update_attempt(attempt["id"], phase="downloading", local_name=name)
         self.store.update_entry(entry["id"], state="downloading")
         digest, size = hashlib.md5(), 0
-        job = self.store.get(entry["job_id"])
         if job["config"].get("source_public"):
-            self._prepare_publications(job, source, path=entry["source_path"])
             url = self._logged(
                 job, entry, "public_download_link",
                 source.public_download_url, entry["source_path"], attempt=attempt,
@@ -1601,6 +1776,7 @@ class MigrationRunner:
                             self.store.update_attempt(old["id"], local_name=None)
                 self.store.update_entry(entry["id"], state="planned", error=None,
                                         download_attempts=0, retry_at_ms=None)
+        self.store.reset_publication_retries(job_id)
         self.store.update_job(
             job_id, state="running", resume_state=None,
             pause_requested=False, error=None,

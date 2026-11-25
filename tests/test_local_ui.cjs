@@ -249,7 +249,7 @@ for (const cross of [false, true]) {
     assertSharedLogLock(ui, false);
   });
 
-  test(`${mode}: batch transfer submits pairs, leaves the local tab accessible and locks its run button until done`, async () => {
+  test(`${mode}: batch CSV survives opening one disk and the transfer submits the original pairs`, async () => {
     const ui = await loadUi();
     fillTransfer(ui, cross);
     if (cross) {
@@ -262,6 +262,9 @@ for (const cross of [false, true]) {
     const textarea = ui.byId.get(cross ? "x_batch_pairs" : "batch_pairs");
     textarea.value = "SOURCE;DESTINATION\nsource@example.test;dest@example.test";
     await textarea.fire("input");
+    await subtabs.querySelector('[data-subtab-target="one"]').fire("click");
+    await subtabs.querySelector('[data-subtab-target="many"]').fire("click");
+    assert.equal(textarea.value, "SOURCE;DESTINATION\nsource@example.test;dest@example.test");
     await ui.byId.get(cross ? "run-cross" : "run").fire("click");
     assert.equal(ui.requests.length, 1);
     assert.equal(ui.requests[0].url, cross ? "/api/run-batch-cross" : "/api/run-batch");

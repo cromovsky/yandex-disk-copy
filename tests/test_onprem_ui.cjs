@@ -27,6 +27,10 @@ class Element {
       contains: (value) => this.className.split(/\s+/).includes(value),
       add: (value) => {if (!this.classList.contains(value)) this.className += " " + value;},
       remove: (value) => {this.className = this.className.split(/\s+/).filter((part) => part !== value).join(" ");},
+      toggle: (value, enabled = !this.classList.contains(value)) => {
+        if (enabled) this.classList.add(value); else this.classList.remove(value);
+        return enabled;
+      },
     };
   }
   addEventListener(name, handler) {(this.listeners[name] ||= []).push(handler);}
@@ -90,6 +94,19 @@ const config = {
   destination_type: "shared", destination_vd_hash: "shared-target-hash", destination_base: "/",
   destination_root: "disk:/source@example.test", strategy: "staged", identity_confirmed: true,
 };
+const sharedAppConfig = {...config, destination_url: "https://cloud-api.example.test",
+  destination_client_id: "office-app", destination_oauth_url: "https://oauth.example.test/token",
+  destination_auth: "service_application", identity_confirmed: false};
+
+async function fillSharedApp(ui) {
+  const get = suffix => ui.byId.get("onprem-" + suffix);
+  get("destination-url").value = sharedAppConfig.destination_url;
+  get("destination-client-id").value = sharedAppConfig.destination_client_id;
+  get("destination-client-secret").value = "office-secret";
+  get("destination-owner-token").value = "office-owner";
+  await fire(get("destination-owner-token"), "input");
+}
+
 const job = {id: "job-1", created_at: "2026-10-11T12:34:56.123456+00:00", state: "queued", revision: 1, config, counts: {planned: 1}, directory_counts: {},
   total_files: 1, total_directories: 0, total_bytes: 18, verified_bytes: 0, remote_root: "disk:/.transfer/job-1"};
 const first = {id: "entry-1", kind: "file", source_path: "/<unsafe>.txt", destination_path: "disk:/copy/<unsafe>.txt",
@@ -101,7 +118,7 @@ const entrySets = new Map();
 let apiError = null;
 let apiOverride = null;
 let preflightDestination = {type: "shared", vd_hash: "shared-target-hash", name: "Архив сотрудников",
-  permissions: ["read", "write"], free_bytes: 10240, identity: config.destination_identity,
+  permissions: ["read", "write"], free_bytes: 10240, verified_uid: "1000123", identity: config.destination_identity,
   path: "vd:shared-target-hash:disk:/source@example.test"};
 const restartedJobs = new Map();
 const requests = [];
@@ -161,7 +178,7 @@ const storageWrites = [];
 const storage = {setItem(key, value) {storageWrites.push({key, value});}, getItem() {return null;}, removeItem() {}, clear() {}};
 const confirmations = [];
 let confirmStop = true;
-const window = {localStorage: storage, sessionStorage: storage, diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true}), addEventListener() {},
+const window = {localStorage: storage, sessionStorage: storage, diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true, onprem_shared_service_application_available: true}), addEventListener() {},
   confirm(message) {confirmations.push(message); return confirmStop;}};
 vm.runInNewContext(source, {document, window, fetch, URL, Blob, crypto, Uint8Array, console,
   localStorage: storage, sessionStorage: storage,
@@ -174,6 +191,97 @@ async function fire(nodeOrId, event) {
   await flush();
 }
 const field = (key) => nodes.find((node) => node.dataset.onpremConfig === key);
+
+function assertPrimaryAction(elements, expected) {
+  const actions = ["plan", "start", "pause", "resume", "stop", "restart"].map(name => elements.get("onprem-" + name));
+  assert.ok(actions.every(button => button && !button.hidden), "all six actions remain visible");
+  const primary = actions.filter(button => button.classList.contains("is-primary"));
+  assert.deepEqual(primary.map(button => button.id), expected ? ["onprem-" + expected] : []);
+  assert.ok(primary.every(button => !button.disabled), "an unavailable action cannot be highlighted");
+}
+
+async function verifySourceBrowser() {
+  const ui = createDocument(), calls = [];
+  const get = suffix => ui.byId.get("onprem-" + suffix);
+  const reply = data => ({ok: true, status: 200, json: async () => data});
+  const dialog = get("browser"), pathField = get("source-path");
+  let pending = null, fail = false, focused = "";
+  const row = (name, type, path) => ({name, type, path: "disk:" + path});
+  for (const node of ui.nodes) node.focus = () => { focused = node.id; };
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  pathField.dispatchEvent = event => (pathField.listeners[event.type] || []).forEach(fn => fn(event));
+  vm.runInNewContext(source, {document: ui.document,
+    window: {addEventListener() {}, diskCopyConfigPromise: Promise.resolve({onprem_enabled: true,
+      onprem_auth_required: true, onprem_personal_service_application_available: true})},
+    fetch: async (address, options) => {
+      assert.equal(address, "/api/onprem/source/browse");
+      const body = JSON.parse(options.body);
+      calls.push({body, key: options.headers["X-Onprem-Key"], method: options.method});
+      if (pending) return new Promise(resolve => { pending.resolve = resolve; });
+      if (fail) return {ok: false, status: 409, json: async () => ({detail: "source_auth_failed"})};
+      if (body.path === "/") return reply({path: "disk:/", next_offset: body.offset === 0 ? 1 : null,
+        items: body.offset === 0 ? [row("Проекты", "dir", "/Проекты")] : [row("<report>", "file", "/<report>")]});
+      return reply({path: "disk:" + body.path, items: [], next_offset: null});
+    }, Event, URL, Blob, crypto, Uint8Array, console, setTimeout() {return 1;}, clearTimeout() {}});
+  await flush();
+  ui.document.querySelector('.mode-tab[data-mode="onprem"]').classList.add("active");
+  get("access-key").value = "pilot";
+  await fire(get("access-key"), "input");
+  const open = () => fire(get("browse-source"), "click");
+  await open();
+  assert.equal(focused, "onprem-source-email");
+  assert.equal(calls.length, 0);
+  for (const [key, value] of Object.entries({email: "source@example.test", org: "42",
+    client: "app", secret: "private", "admin-token": "directory"})) get("source-" + key).value = value;
+  pathField.value = "/вручную";
+  await open();
+  assert.equal(dialog.open, true);
+  assert.deepEqual(calls[0], {method: "POST", key: "pilot", body: {source_org_id: "42",
+    source_client_id: "app", source_client_secret: "private", source_admin_token: "directory",
+    source_email: "source@example.test", path: "/", offset: 0}});
+  assert.equal(get("browser-path").textContent, "Весь Диск сотрудника");
+  assert.equal(get("browser-select").disabled, false);
+  await fire(get("browser-list").children[0].children[0], "click");
+  assert.equal(calls.at(-1).body.path, "/Проекты");
+  assert.equal(get("browser-status").textContent, "Папка пуста.");
+  await fire(get("browser-up"), "click");
+  await fire(get("browser-close"), "click");
+  assert.equal(pathField.value, "/вручную");
+  await open();
+  await fire(get("browser-list").children[0].children[0], "click");
+  await fire(get("browser-select"), "click");
+  assert.equal(pathField.value, "/Проекты");
+  assert.equal(dialog.open, false);
+  await open();
+  await fire(get("browser-more"), "click");
+  assert.equal(calls.at(-1).body.offset, 1);
+  await fire(get("browser-list").children[1].children[0], "click");
+  assert.equal(pathField.value, "/<report>");
+  await open();
+  await fire(get("browser-select"), "click");
+  assert.equal(pathField.value, "/");
+  fail = true;
+  await open();
+  assert.equal(get("browser-select").disabled, true);
+  assert.equal(get("browser-more").textContent, "Повторить");
+  fail = false;
+  await fire(get("browser-more"), "click");
+  assert.equal(get("browser-select").disabled, false);
+  await fire(get("browser-close"), "click");
+  pending = {};
+  await open();
+  get("source-email").value = "other@example.test";
+  await fire(get("source-email"), "input");
+  assert.equal(dialog.open, false);
+  pending.resolve(reply({path: "disk:/", items: [row("чужой", "file", "/чужой")], next_offset: null}));
+  await flush();
+  assert.equal(get("browser-list").children.length, 0);
+  assert.equal(pathField.value, "/");
+  get("source-input").value = "list";
+  await fire(get("source-input"), "change");
+  assert.equal(get("browse-source").hidden, true);
+}
 
 async function verifyReleaseGate() {
   function loadGate(configPromise, {missingConfig = false} = {}) {
@@ -226,6 +334,476 @@ async function verifyReleaseGate() {
   assert.equal(pilot.requests.length, 0, "enabling a tab does not launch background work");
 }
 
+async function verifyPersonalDraft() {
+  const saved = new Map(), writes = [];
+  const sessionStorage = {
+    getItem: key => saved.get(key) ?? null,
+    setItem(key, value) { saved.set(key, value); writes.push(value); },
+    removeItem: key => saved.delete(key),
+  };
+  let finishHistory, delayHistory = false;
+  async function load() {
+    const ui = createDocument(), events = {}, timers = [];
+    const get = id => ui.byId.get("onprem-" + id);
+    ui.document.querySelector('.mode-tab[data-mode="onprem"]').classList.add("active");
+    vm.runInNewContext(source, {document: ui.document, window: {sessionStorage,
+      addEventListener(name, cb) { events[name] = cb; },
+      diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_personal_service_application_available: true})},
+      fetch: async address => {
+        if (delayHistory && address.endsWith("/jobs/" + job.id)) {
+          delayHistory = false;
+          await new Promise(resolve => {finishHistory = resolve;});
+        }
+        return {ok: true, json: async () => address.includes("jobs?") ? {jobs: [job]} : job};
+      },
+      URL, crypto, Uint8Array, setTimeout(cb) {timers.push(cb); return timers.length;}, clearTimeout() {}});
+    await flush();
+    return {get, events, timers};
+  }
+  const ui = await load();
+  const draft = {"source-org": "123", "source-client": "saas-client", "source-path": "/Отчёты",
+    "source-email": "source@example.test", recipient: "9007199254740993123",
+    "destination-url": "https://disk.example.test/v1/disk", "destination-client-id": "office-client"};
+  const secrets = ["source-secret", "source-admin-token", "destination-client-secret", "destination-owner-token", "access-key"];
+  for (const [id, value] of Object.entries(draft)) { ui.get(id).value = value; await fire(ui.get(id), "input"); }
+  for (const id of secrets) { ui.get(id).value = "private-" + id; await fire(ui.get(id), "input"); }
+  await fire(ui.get("source-client"), "change");
+  await fire(ui.get("destination-url"), "change");
+  assert.equal(ui.get("source-secret").value, "private-source-secret", "a repeated change with the same Client ID preserves credentials");
+  assert.equal(ui.get("destination-owner-token").value, "private-destination-owner-token");
+  await fire(ui.get("refresh"), "click");
+  for (let count = 0; count < 72; count++) await ui.timers.at(-1)();
+  for (const [id, value] of Object.entries(draft)) assert.equal(ui.get(id).value, value);
+  ui.events.pagehide({persisted: true});
+  const beforeReturn = ui.timers.length;
+  ui.events.pageshow({persisted: true});
+  assert.ok(ui.timers.length > beforeReturn);
+  for (const id of secrets) assert.equal(ui.get(id).value, "private-" + id, "back/forward navigation retains the live form");
+  ui.get("history").value = job.id;
+  delayHistory = true;
+  await fire(ui.get("history"), "change");
+  assert.equal(typeof finishHistory, "function");
+  ui.get("recipient").value = "updated@example.test"; await fire(ui.get("recipient"), "input");
+  finishHistory(); await flush();
+  assert.equal(ui.get("recipient").value, "updated@example.test", "a late history response cannot replace newer input");
+  assert.equal(ui.get("history").value, "");
+  ui.get("source-input").value = "list"; await fire(ui.get("source-input"), "change");
+  assert.equal(ui.get("list-publication-note").hidden, false, "CSV mode keeps its explanation of personal source publication");
+  assert.equal(ui.get("source-secret").value, "private-source-secret", "the same SaaS access works in CSV mode");
+  assert.equal(ui.get("destination-owner-token").value, "private-destination-owner-token");
+  ui.get("destination-url").value = "https://cloud-api.list.example";
+  await fire(ui.get("destination-url"), "input");
+  ui.get("destination-owner-token").value = "private-list-owner";
+  ui.get("source-input").value = "single"; await fire(ui.get("source-input"), "change");
+  assert.equal(ui.get("list-publication-note").hidden, true, "single mode only displays its action panel warning");
+  assert.equal(ui.get("destination-url").value, draft["destination-url"]);
+  assert.equal(ui.get("destination-owner-token").value, "", "another installation's access stays out of the single form");
+  ui.get("source-input").value = "list"; await fire(ui.get("source-input"), "change");
+  assert.equal(ui.get("destination-url").value, "https://cloud-api.list.example");
+  ui.events.pagehide({persisted: false});
+  for (const id of secrets) assert.equal(ui.get(id).value, "");
+  const reload = await load();
+  for (const [id, value] of Object.entries({...draft, recipient: "updated@example.test"})) assert.equal(reload.get(id).value, value);
+  for (const id of secrets) assert.equal(reload.get(id).value, "");
+  assert.equal(reload.get("start").disabled, true);
+  reload.get("destination-url").value = "https://other.example.test";
+  reload.events["onprem-batch-config-loaded"]?.();
+  reload.get("destination-owner-token").value = "private-other-installation";
+  reload.get("destination-url").value = draft["destination-url"];
+  await fire(reload.get("destination-url"), "input");
+  assert.equal(reload.get("destination-owner-token").value, "", "switching back from a restored list clears the other installation's access");
+  reload.get("destination-url").value = "https://disk.example.test/v1/disk?token=private-query";
+  await fire(reload.get("destination-url"), "input");
+  assert.ok(writes.length > 0);
+  assert.ok(writes.every(value => !value.includes("private-")));
+  assert.equal((await load()).get("destination-url").value, "");
+  reload.get("history").value = job.id;
+  delayHistory = true;
+  await fire(reload.get("history"), "change");
+  await fire(reload.get("source-client"), "change");
+  finishHistory(); await flush();
+  assert.equal(reload.get("history").value, job.id, "a repeated change cannot cancel an explicit history selection");
+}
+
+async function verifySharedServiceDestination() {
+  const ui = createDocument(), calls = [], uid = "1000123";
+  const get = suffix => ui.byId.get("onprem-" + suffix);
+  const operator = "operator@office.test", disk = "archive";
+  let currentJob, provedUid = uid, failNextHistory = false;
+  const fetch = async (url, options) => {
+    const path = url.split("?")[0], method = options.method || "GET";
+    const body = options.body && JSON.parse(options.body);
+    calls.push({path, method, body});
+    let result = currentJob;
+    if (path.endsWith("/preflight")) result = {destination: {type: "shared", identity: operator, verified_uid: provedUid,
+      vd_hash: disk, permissions: ["read", "write"]}};
+    else if (path.endsWith("/jobs") && method === "POST") {
+      currentJob = {...clone(job), config: {...body.config, destination_oauth_url: "https://oauth.office.test/token"},
+        destination_verified_uid: uid, plan_complete: true, selection_frozen: false, state: "ready"};
+      result = currentJob;
+    } else if (path.endsWith("/stop")) {
+      Object.assign(currentJob, {state: "stopped", full_stop_requested: true});
+      result = {...currentJob};
+      delete result.managed_by_batch;
+      failNextHistory = true;
+    } else if (path.endsWith("/jobs") && failNextHistory) {
+      failNextHistory = false;
+      throw new Error("history unavailable after accepted stop");
+    } else if (path.endsWith("/jobs")) result = {jobs: currentJob ? [currentJob] : []};
+    else if (path.endsWith("/events")) result = {events: []};
+    else if (path.endsWith("/entries")) result = {entries: [first]};
+    return {ok: true, json: async () => clone(result)};
+  };
+  vm.runInNewContext(source, {document: ui.document, window: {addEventListener() {}, confirm: () => true,
+    sessionStorage: {getItem: () => JSON.stringify({sharedAuth: "token", vdHash: "previous-disk", operator: "former@office.test"})},
+    diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_shared_service_application_available: true})},
+    fetch, URL, crypto, Uint8Array, setTimeout() {return 1;}, clearTimeout() {}});
+  await flush();
+  assert.equal(get("destination-vd-hash").value, "previous-disk", "older drafts retain Disk and operator without restoring employee-token access");
+  assert.equal(get("destination-identity").value, "former@office.test");
+  assert.equal(get("shared-auth-choice"), undefined);
+  assert.equal(get("shared-auth"), undefined);
+  assert.equal(get("service-access").hidden, false);
+  assert.equal(get("shared-confirm").hidden, true);
+  assert.equal(get("destination-token").disabled, true);
+  assert.equal(get("destination-identity").type, "email");
+  for (const [id, value] of Object.entries({"source-org":"123", "source-client":"saas", "source-secret":"saas-secret",
+    "source-email":"one@saas.test", "destination-identity":operator, "destination-url":"https://cloud-api.office.test/v1/disk",
+    "destination-client-id":"app", "destination-client-secret":"app-secret", "destination-owner-token":"owner",
+    "destination-token":"unused", "destination-vd-hash":"https://disk.office.test/client/vd/archive/disk"})) get(id).value = value;
+  await fire(get("destination-vd-hash"), "change");
+  assert.equal(get("destination-vd-hash").value, disk);
+  provedUid = null;
+  await fire(get("form"), "submit");
+  assert.equal(calls.filter(call => call.path.endsWith("/jobs") && call.method === "POST").length, 0);
+  provedUid = uid;
+  await fire(get("form"), "submit");
+  const made = calls.find(call => call.path.endsWith("/jobs") && call.method === "POST").body;
+  assert.equal(made.config.destination_auth, "service_application");
+  assert.equal(made.config.destination_identity, operator);
+  assert.equal(made.config.destination_client_id, "app");
+  assert.equal(made.config.identity_confirmed, false);
+  assert.equal(made.config.destination_vd_hash, disk);
+  assert.deepEqual(made.credentials, {source_client_secret:"saas-secret", destination_client_secret:"app-secret", destination_owner_token:"owner"});
+  assert.match(get("destination-preview").textContent, /operator@office.test.*1000123/);
+  assert.equal(get("start").disabled, false);
+  await fire(get("start"), "click");
+  const attached = calls.find(call => call.path.endsWith("/credentials")).body;
+  assert.deepEqual(attached.credentials, made.credentials);
+  assert.equal(attached.config.identity_confirmed, false);
+  assert.ok(calls.some(call => call.path.endsWith("/start")));
+
+  Object.assign(currentJob, {managed_by_batch: true, can_start_transfer: false, selection: {editable: false, selected: 1}});
+  for (const [state, action] of [["ready", "start"], ["completed", "restart"]]) {
+    currentJob.state = state;
+    await fire(get("refresh"), "click");
+    assert.equal(get(action).disabled, true, `a CSV-managed ${state} job cannot ${action} from standalone history`);
+    assertPrimaryAction(ui.byId, null);
+    const beforeClick = calls.length;
+    await fire(get(action), "click");
+    assert.equal(calls.length, beforeClick, "forced disabled clicks cannot submit credentials or mutate a CSV child");
+  }
+
+  currentJob.state = "paused";
+  await fire(get("refresh"), "click");
+  await fire(get("stop"), "click");
+  assert.equal(get("job-state").textContent, "Остановлено полностью");
+  assert.equal(get("restart").disabled, true, "a partial Stop response and failed refresh must preserve CSV ownership");
+  assertPrimaryAction(ui.byId, null);
+  const afterStop = calls.length;
+  await fire(get("restart"), "click");
+  assert.equal(calls.length, afterStop);
+
+  Object.assign(currentJob.config, {source_type: "shared", source_vd_hash: "saas-archive", source_folder: "Archive", source_public: false});
+  get("history").value = currentJob.id;
+  await fire(get("history"), "change");
+  assert.equal(get("publish-warning").hidden, true);
+  get("source-email").value = "new-personal@saas.test";
+  await fire(get("source-email"), "input");
+  assert.equal(get("publish-warning").hidden, false, "a new plan for the edited personal source will publish");
+  get("source-email").value = currentJob.config.source_email;
+  await fire(get("source-email"), "input");
+  assert.equal(get("publish-warning").hidden, true, "returning to the saved shared source restores its warning state");
+
+  currentJob = {...clone(job), id: "saved-employee-job", state: "ready",
+    config: {...clone(config), source_type: "shared", source_vd_hash: "archive-source", source_folder: "Archive"}};
+  get("history").value = currentJob.id;
+  await fire(get("history"), "change");
+  assert.equal(get("publish-warning").hidden, true, "a historical shared SaaS source is read without publication");
+  assert.equal(get("service-access").hidden, true);
+  assert.equal(get("destination-owner-token").value, "");
+  assert.equal(get("shared-confirm").hidden, false);
+  assert.equal(get("destination-token").disabled, false);
+  assert.equal(get("start").disabled, true);
+  const before = calls.length;
+  await fire(get("plan"), "click");
+  assert.equal(calls.slice(before).some(call => call.method === "POST"), false);
+  assert.equal(get("service-access").hidden, false);
+  assert.equal(get("shared-confirm").hidden, true);
+  assert.equal(get("destination-token").disabled, true);
+  assert.equal(get("source-email").value, "", "a shared SaaS source cannot silently become the operator's personal Disk");
+  assert.equal(get("publish-warning").hidden, false, "returning to a personal-source draft restores its publication warning");
+  assert.match(get("notice").textContent, /Список дисков из CSV/);
+}
+
+async function verifyPersonalDestination() {
+  for (const [available, recipient] of [[false, "apetrov@office.example"], [true, "apetrov@office.example"], [true, "9007199254740993123"]]) {
+    const ui = createDocument();
+    const get = name => ui.byId.get("onprem-" + name);
+    const calls = [];
+    const uid = "9007199254740993123";
+    let identity = null, checkedUid = uid, currentJob;
+    const respond = value => ({ok: true, json: async () => clone(value)});
+    const fetch = async (url, options) => {
+      const path = url.split("?")[0], method = options.method || "GET", body = options.body && JSON.parse(options.body);
+      calls.push({path, method, body});
+      if (path.endsWith("/preflight")) return respond({destination: {type: "personal", identity, verified_uid: checkedUid}});
+      if (path.endsWith("/jobs") && method === "POST") {
+        currentJob = {...clone(job), state: "queued", plan_complete: false, selection_frozen: false,
+          destination_verified_uid: null, config: {...body.config, destination_root: "disk:/",
+            destination_oauth_url: "https://oauth.example.test/token"}};
+        return respond(currentJob);
+      }
+      if (path.endsWith("/resume")) Object.assign(currentJob, {state: currentJob.resume_state === "queued" ? "queued" : "running", resume_state: null});
+      if (path.endsWith("/jobs")) return respond({jobs: [currentJob]});
+      if (path.endsWith("/entries")) return respond({entries: [{...first, state: currentJob.counts.failed ? "failed" : "planned",
+        source_path: currentJob.config.source_path, destination_path: "disk:/готовый-путь"}]});
+      if (path.endsWith("/events")) return respond({events: []});
+      return respond(currentJob);
+    };
+    vm.runInNewContext(source, {document: ui.document, window: {addEventListener() {},
+      diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_personal_available: true, onprem_personal_service_application_available: available})},
+      fetch, URL, crypto, Uint8Array, setTimeout() {return 1;}, clearTimeout() {}});
+    await flush();
+    assert.equal(get("recipient").value, "", "a new transfer starts without a recipient");
+    const recipientPattern = new RegExp("^(?:" + get("recipient").attributes.pattern + ")$", "u");
+    assert.ok(recipientPattern.test(recipient));
+    assert.equal(recipientPattern.test("apetrov"), false);
+    for (const [id, value] of Object.entries({"source-org": "123", "source-client": "saas", "source-secret": "source-test-only",
+      "source-email": "aivanov@cloud.example", "recipient": recipient,
+      "destination-url": "https://cloud-api.example.test", "destination-admin-token": "admin-test-only", "destination-token": "shared-only"})) get(id).value = value;
+    get("destination-personal").checked = true;
+    get("destination-shared").checked = false;
+    await fire(get("destination-personal"), "change");
+    get("source-secret").value = "source-test-only";
+    get("destination-client-id").value = "target-app";
+    await fire(get("destination-client-id"), "input");
+    assert.equal(get("destination-oauth-url"), undefined, "the form needs only the Disk API address");
+    assert.equal(get("source-secret").value, "source-test-only", "setting up On-premises preserves SaaS access");
+    get("destination-client-secret").value = "target-secret";
+    get("destination-owner-token").value = "org-owner";
+    await fire(get("source-client"), "input");
+    assert.equal(get("source-secret").value, "");
+    assert.equal(get("destination-client-secret").value, "target-secret");
+    assert.equal(get("destination-owner-token").value, "org-owner");
+    get("source-secret").value = "source-test-only";
+    assert.equal(get("personal-preview").hidden, false);
+    assert.equal(get("preview-source").textContent, "aivanov@cloud.example");
+    assert.equal(get("preview-recipient").textContent, recipient);
+    const sourcePath = recipient.includes("@") ? "/Проекты/Q1" : "/Проекты/Q1/Смета.xlsx";
+    assert.equal(Boolean(get("source-path").readOnly), false);
+    assert.equal(get("source-path").value, "/");
+    get("source-path").value = sourcePath;
+    await fire(get("source-path"), "input");
+    assert.equal(get("preview-source-path").textContent, sourcePath);
+    assert.equal(get("preview-destination-path").textContent, sourcePath);
+    assert.equal(get("destination-token").disabled, true);
+    assert.equal(get("identity-confirmed").disabled, true);
+    assert.equal(get("plan").disabled, !available);
+    if (!available) {
+      assert.equal(get("personal-unavailable").hidden, false);
+      assert.equal(get("destination-admin-token").disabled, true);
+      await fire(get("form"), "submit");
+      assert.equal(calls.length, 0);
+    } else {
+      for (identity of [null, "other", "Apetrov"]) {
+        await fire(get("form"), "submit");
+        assert.ok(calls.every(call => call.path.endsWith("/preflight")));
+        assert.match(get("notice").textContent, /получател|учётная запись|владельца/i);
+        assert.equal(get("start").disabled, true);
+      }
+      identity = recipient;
+      for (checkedUid of [null, 123, ""]) {
+        await fire(get("form"), "submit");
+        assert.ok(calls.every(call => call.path.endsWith("/preflight")));
+        assert.match(get("notice").textContent, /GET \/v1\/disk\//);
+        assert.doesNotMatch(get("notice").textContent, /введите.*UID/i);
+      }
+      checkedUid = recipient.includes("@") ? "999" : uid;
+      await fire(get("form"), "submit");
+      assert.equal(get("legacy-note").hidden, true, "a new Dry Run can be queued without a plan UID");
+      assert.equal(get("start").disabled, true);
+      Object.assign(currentJob, {state: "awaiting_credentials", resume_state: "queued", counts: {}});
+      get("history").value = currentJob.id;
+      await fire(get("history"), "change");
+      get("source-secret").value = "source-test-only";
+      get("destination-client-secret").value = "target-secret";
+      get("destination-owner-token").value = "org-owner";
+      await fire(get("destination-owner-token"), "input");
+      assert.equal(get("resume").disabled, false, "restore access to finish the interrupted Dry Run");
+      await fire(get("resume"), "click");
+      assert.equal(currentJob.state, "queued");
+      assert.match(get("notice").textContent, /Dry Run/);
+      assert.equal(get("start").disabled, true);
+      assert.ok(calls.every(call => !call.path.endsWith("/start")));
+      Object.assign(currentJob, {state: "ready", plan_complete: true, destination_verified_uid: uid});
+      await fire(get("refresh"), "click");
+      const create = calls.find(call => call.path.endsWith("/jobs") && call.method === "POST").body;
+      assert.ok(calls.filter(call => call.path.endsWith("/preflight")).every(call => call.body.config.source_path === sourcePath));
+      assert.equal(create.config.source_path, sourcePath);
+      assert.equal(create.config.destination_auth, "service_application");
+      assert.equal(create.config.destination_type, "personal");
+      assert.equal(create.config.destination_identity, recipient);
+      assert.equal(create.config.destination_client_id, "target-app");
+      assert.equal(create.config.destination_url, "https://cloud-api.example.test");
+      assert.ok(!("destination_oauth_url" in create.config));
+      assert.ok(!("destination_verified_uid" in create.config));
+      assert.equal(create.config.source_public, true);
+      assert.equal(Boolean(create.config.identity_confirmed), false);
+      assert.ok(!("destination_vd_hash" in create.config));
+      assert.deepEqual(create.credentials, {source_client_secret: "source-test-only", destination_client_secret: "target-secret", destination_owner_token: "org-owner"});
+      assert.equal(calls.some(call => JSON.stringify(call.body || {}).includes("shared-only")), false);
+      assert.ok(get("destination-check").textContent.includes(recipient));
+      assert.ok(get("destination-check").textContent.includes("UID " + uid), "the plan supplies the saved UID independently of preflight");
+      assert.equal(get("preview-destination-path").textContent, "/готовый-путь");
+      assert.equal(get("start").disabled, false);
+      await fire(get("start"), "click");
+      const attach = calls.find(call => call.path.endsWith("/credentials"));
+      assert.equal(attach.body.config.destination_auth, "service_application");
+      assert.ok(!("destination_oauth_url" in attach.body.config));
+      assert.deepEqual(attach.body.credentials, create.credentials);
+      assert.ok(calls.some(call => call.path.endsWith("/start")));
+      get("source-path").value = "/Архив";
+      await fire(get("source-path"), "input");
+      assert.equal(get("destination-check").hidden, true);
+      assert.equal(get("start").disabled, true);
+      get("source-path").value = sourcePath;
+      await fire(get("source-path"), "input");
+      assert.equal(get("start").disabled, true, "restoring the old path requires a fresh plan");
+      await fire(get("form"), "submit");
+      Object.assign(currentJob, {state: "ready", plan_complete: true, destination_verified_uid: uid});
+      await fire(get("refresh"), "click");
+      assert.equal(get("start").disabled, false);
+      get("recipient").value = "other";
+      await fire(get("recipient"), "input");
+      assert.equal(get("destination-check").hidden, true);
+      assert.equal(get("start").disabled, true);
+      get("recipient").value = recipient;
+      await fire(get("recipient"), "input");
+      assert.equal(get("start").disabled, true, "restoring the old login does not restore an invalidated plan");
+      get("destination-url").value = "https://disk.other.example";
+      await fire(get("destination-url"), "input");
+      assert.equal(get("destination-admin-token").value, "", "changing the installation requires its own admin token");
+    }
+    get("source-input").value = "list";
+    await fire(get("source-input"), "change");
+    assert.equal(get("destination-token").disabled, true);
+    assert.equal(get("identity-confirmed").disabled, true);
+    assert.equal(get("service-access").hidden, !available);
+    assert.equal(get("recipient").required, false);
+    assert.equal(get("personal-fields").hidden, true);
+    assert.equal(get("destination-admin-token").disabled, true);
+    assert.equal(get("destination-token").value, "");
+    if (available) {
+      get("source-input").value = "single";
+      get("destination-shared").checked = true;
+      get("destination-personal").checked = false;
+      await fire(get("destination-shared"), "change");
+      assert.equal(get("source-path").value, sourcePath);
+      get("source-secret").value = "source-test-only";
+      get("destination-token").value = "shared-only";
+      get("identity-confirmed").checked = true;
+      await fire(get("identity-confirmed"), "change");
+      const callsBefore = calls.length;
+      await fire(get("form"), "submit");
+      assert.equal(get("plan").disabled, true);
+      assert.equal(get("shared-unavailable").hidden, false);
+      assert.equal(get("destination-token").disabled, true);
+      assert.equal(calls.length, callsBefore, "no fallback to employee credentials when shared service access is unavailable");
+      get("history").value = currentJob.id;
+      await fire(get("history"), "change");
+      assert.equal(get("preview-destination-path").textContent, "/готовый-путь");
+      assert.ok(get("destination-check").textContent.includes("UID " + uid));
+      get("destination-url").value = "https://cloud-api.other.example.test";
+      get("destination-client-secret").value = "secret";
+      get("destination-owner-token").value = "owner";
+      await fire(get("destination-url"), "input");
+      assert.equal(get("destination-client-secret").value, "");
+      assert.equal(get("destination-owner-token").value, "");
+      assert.equal(get("destination-check").hidden, true);
+      delete currentJob.destination_verified_uid;
+      currentJob.config.destination_auth = "service_application";
+      currentJob.config.destination_client_id = "old-service-app";
+      currentJob.config.source_path = "disk:" + sourcePath;
+      get("history").value = currentJob.id;
+      await fire(get("history"), "change");
+      assert.equal(get("destination-personal").checked, true);
+      assert.equal(get("recipient").value, recipient);
+      assert.equal(get("source-path").value, sourcePath);
+      assert.equal(get("preview-destination-path").textContent, sourcePath);
+      assert.equal(get("legacy-note").hidden, false);
+      assert.equal(get("destination-admin-token").value, "");
+      assert.equal(get("start").disabled, true);
+      assert.equal(get("resume").disabled, true);
+      Object.assign(currentJob, {state: "awaiting_credentials", resume_state: "queued", plan_complete: false, selection_frozen: true});
+      await fire(get("refresh"), "click");
+      assert.equal(get("legacy-note").hidden, false, "a frozen job always needs its saved UID");
+      assert.equal(get("resume").disabled, true);
+      Object.assign(currentJob, {state: "ready", resume_state: null, plan_complete: true, selection_frozen: false});
+      currentJob.config.destination_auth = "admin_token";
+      delete currentJob.config.destination_client_id;
+      delete currentJob.config.destination_oauth_url;
+      currentJob.error = "destination_identity_unverified";
+      get("history").value = currentJob.id;
+      await fire(get("history"), "change");
+      assert.equal(get("destination-admin-token").disabled, false);
+      assert.equal(get("destination-owner-token").disabled, true);
+      assert.match(get("job-error").textContent, /владельца личного Диска/);
+      get("source-secret").value = "old-source";
+      get("destination-admin-token").value = "old-admin";
+      await fire(get("destination-admin-token"), "input");
+      assert.equal(get("start").disabled, false);
+      await fire(get("start"), "click");
+      const oldAttach = calls.filter(call => call.path.endsWith("/credentials")).at(-1);
+      assert.equal(oldAttach.body.config.destination_auth, "admin_token");
+      assert.deepEqual(oldAttach.body.credentials, {source_client_secret: "old-source", destination_token: "old-admin"});
+      for (const [state, counts, suffix] of [["paused", {planned: 1}, "/resume"], ["completed_with_issues", {failed: 1}, "/retry"]]) {
+        Object.assign(currentJob, {state, counts, selection_frozen: true});
+        await fire(get("refresh"), "click");
+        const beforeResume = calls.length;
+        await fire(get("resume"), "click");
+        const changed = calls.slice(beforeResume);
+        assert.deepEqual(changed.find(call => call.path.endsWith("/credentials")).body.credentials, oldAttach.body.credentials);
+        assert.ok(changed.some(call => call.path.endsWith(suffix)));
+      }
+      await fire(get("plan"), "click");
+      assert.equal(get("destination-owner-token").disabled, false);
+      assert.equal(get("destination-admin-token").value, "");
+      currentJob.state = "stopped";
+      get("history").value = currentJob.id;
+      await fire(get("history"), "change");
+      assert.equal(get("restart").disabled, false, "an old admin token is not needed to prepare a new service-application job");
+      get("destination-admin-token").value = "old-admin";
+      await fire(get("destination-admin-token"), "input");
+      const beforeRestart = calls.length;
+      formValid = false;
+      try { await fire(get("restart"), "click"); } finally { formValid = true; }
+      assert.equal(calls.length, beforeRestart, "the old job does not create a child or send its admin token");
+      assert.equal(get("destination-admin-token").disabled, true);
+      assert.equal(get("destination-admin-token").value, "");
+      assert.equal(get("destination-owner-token").disabled, false);
+      assert.equal(get("recipient").value, recipient);
+      assert.equal(get("source-path").value, sourcePath);
+      assert.equal(get("destination-url").value, currentJob.config.destination_url);
+      assert.equal(get("history").value, "");
+      get("history").value = "";
+      await fire(get("history"), "change");
+      assert.equal(get("recipient").value, "", "a new job must not inherit the recipient from history");
+      assert.equal(get("preview-recipient").textContent, "укажите email");
+    }
+  }
+}
+
 async function verifyGlobalCacheCleanup() {
   const ui = createDocument();
   const calls = [];
@@ -239,10 +817,12 @@ async function verifyGlobalCacheCleanup() {
   let cleanupError = null;
   let networkFailure = false;
   let pendingCleanup = null;
+  let confirmCleanup = false;
+  const prompts = [];
   const respond = (value) => ({ok: true, status: 200, json: async () => clone(value)});
   vm.runInNewContext(source, {
     document: ui.document,
-    window: {addEventListener() {}, confirm() {throw new Error("Global cache cleanup needs no confirmation");},
+    window: {addEventListener() {}, confirm(message) {prompts.push(message); return confirmCleanup;},
       diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true})},
     fetch: async (address, options = {}) => {
       const url = new URL(address, "http://localhost");
@@ -265,11 +845,20 @@ async function verifyGlobalCacheCleanup() {
   assert.equal(get("onprem-cleanup").disabled, true, "global cleanup still needs the application access key");
   await fire(get("onprem-cleanup"), "click");
   assert.equal(calls.length, 0, "manually dispatched unauthenticated cleanup does not send a request");
+  assert.equal(prompts.length, 0);
   get("onprem-access-key").value = "global-test-key";
   await fire(get("onprem-access-key"), "input");
   assert.equal(get("onprem-cleanup").disabled, false, "credentials, identity and a prepared job are not needed");
   const validationBefore = formValidationCalls;
   formValid = false;
+  await fire(get("onprem-cleanup"), "click");
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /всех заданий.*On-premises/i);
+  assert.match(prompts[0], /заново/i);
+  assert.match(prompts[0], /история.*файлы на Дисках сохранятся/i);
+  assert.equal(calls.length, 0, "cancel sends no request");
+  assert.equal(get("onprem-cleanup-result").textContent, "");
+  confirmCleanup = true;
   await fire(get("onprem-cleanup"), "click");
   formValid = true;
   assert.equal(formValidationCalls, validationBefore, "cleanup never validates the transfer form");
@@ -281,14 +870,14 @@ async function verifyGlobalCacheCleanup() {
   assert.match(firstResult, /Удалено файлов: 4.*Объём: 4 Кб/);
   assert.equal(get("onprem-cleanup-result").attributes["aria-live"], "polite");
   assert.equal(get("onprem-remote-attempts"), undefined, "cleanup no longer displays job-specific remote attempts");
-  assert.match(html, /<button id="onprem-cleanup"[^>]*>Очистить локальный кеш<\/button>/);
+  assert.match(html, /<button id="onprem-cleanup"[^>]*>Очистить временные файлы всех заданий…<\/button>/);
   assert.match(html, /#onprem-cleanup-panel\s*\{[^}]*text-align:\s*center/);
   assert.match(html, /#onprem-cleanup-panel \.onprem-actions\s*\{[^}]*justify-content:\s*center/);
   assert.match(html, /<section id="onprem-cleanup-panel"[\s\S]*?<\/section>\s*<\/div>\s*<section data-legacy-output>/,
     "the independent cache section is the last section in SaaS-Onprem");
   assert.ok(html.indexOf('<section id="onprem-cleanup-panel"') > html.indexOf('<section id="onprem-log-panel"'),
     "the cache button is below the job journal");
-  assert.match(html, /Удаляет весь временный кеш всех заданий.*нужные файлы скачаются заново/);
+  assert.match(html, /Во время переноса кеш занят.*Пауза.*Приостановлено/);
 
   for (const selectedJob of globalJobs) {
     get("onprem-history").value = selectedJob.id;
@@ -366,7 +955,7 @@ async function verifyStagedOnly() {
     if (url.pathname === "/api/onprem/preflight") return errorCode
       ? response({detail: errorCode}, 409) : response({destination: preflightDestination});
     if (url.pathname === "/api/onprem/jobs") {
-      if (method === "POST") current = {...clone(job), state: "ready", config: {...body.config, destination_root: config.destination_root}};
+      if (method === "POST") current = {...clone(job), state: "ready", destination_verified_uid: "1000123", config: {...body.config, destination_oauth_url: sharedAppConfig.destination_oauth_url, destination_root: config.destination_root}};
       return response(method === "POST" ? current : {jobs: current ? [current] : []});
     }
     if (url.pathname.endsWith("/entries")) return response({entries: [{...clone(first), state: "planned"}]});
@@ -374,7 +963,7 @@ async function verifyStagedOnly() {
     return response(current);
   };
   vm.runInNewContext(source, {document: ui.document, window: {addEventListener() {}, confirm() {return true;},
-    diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true})},
+    diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true, onprem_shared_service_application_available: true})},
     fetch: fakeFetch, URL, Blob, crypto, Uint8Array, console, setTimeout() {return 1;}, clearTimeout() {}});
   await flush();
   const get = (id) => ui.byId.get(id);
@@ -389,9 +978,7 @@ async function verifyStagedOnly() {
   await fire(tab, "click");
   for (const node of ui.nodes.filter((node) => node.dataset.onpremConfig)) node.value = config[node.dataset.onpremConfig] || "";
   get("onprem-source-secret").value = "test-source-secret";
-  get("onprem-destination-token").value = "test-destination-token";
-  get("onprem-identity-confirmed").checked = true;
-  await fire(get("onprem-identity-confirmed"), "change");
+  await fillSharedApp(ui);
   strategy.value = "url";
   await fire(strategy, "change");
   await fire(get("onprem-form"), "submit");
@@ -406,11 +993,10 @@ async function verifyStagedOnly() {
   assert.match(get("onprem-log").textContent, /Прежний способ переноса/);
   assert.doesNotMatch(get("onprem-log").textContent, /Напрямую по ссылке/);
   get("onprem-source-secret").value = "test-source-secret";
-  get("onprem-destination-token").value = "test-destination-token";
-  get("onprem-identity-confirmed").checked = true;
-  await fire(get("onprem-identity-confirmed"), "change");
+  await fillSharedApp(ui);
   assert.equal(get("onprem-start").disabled, true, "old URL plans require a fresh Dry Run");
   assert.equal(get("onprem-stop").disabled, false, "historical URL plans remain stoppable");
+  assertPrimaryAction(ui.byId, null);
   assert.equal(get("onprem-report").disabled, false, "historical URL plans remain exportable");
   current.state = "paused";
   await fire(get("onprem-refresh"), "click");
@@ -440,7 +1026,7 @@ async function verifyPublicSourceConfiguration() {
       : response({destination: preflightDestination});
     if (url.pathname === "/api/onprem/jobs") {
       if (method === "POST" && rejectCreates) throw new Error("simulated create response interruption");
-      if (method === "POST") current = {...clone(job), state: "ready", config: {...body.config, destination_root: config.destination_root}};
+      if (method === "POST") current = {...clone(job), state: "ready", destination_verified_uid: "1000123", config: {...body.config, destination_oauth_url: sharedAppConfig.destination_oauth_url, destination_root: config.destination_root}};
       return response(method === "POST" ? current : {jobs: current ? [current] : []});
     }
     if (url.pathname.endsWith("/entries")) return response({entries: [{...clone(first), state: "planned"}]});
@@ -448,11 +1034,11 @@ async function verifyPublicSourceConfiguration() {
     return response(current);
   };
   vm.runInNewContext(source, {document: ui.document, window: {addEventListener() {}, confirm() {return true;},
-    diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true})},
+    diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true, onprem_shared_service_application_available: true})},
     fetch: fakeFetch, URL, Blob, crypto, Uint8Array, console, setTimeout() {return 1;}, clearTimeout() {}});
   await flush();
   const get = (id) => ui.byId.get(id);
-  assert.match(html, /<button id="onprem-plan"[^>]*>Dry Run<\/button>/);
+  assertPrimaryAction(ui.byId, null);
   assert.equal(get("onprem-start").disabled, true, "Start needs a successfully prepared plan");
   assert.equal(get("onprem-source-public"), undefined, "publication is no longer an editable or hidden input");
   assert.equal(get("onprem-source-admin-token").tagName, "INPUT");
@@ -461,7 +1047,11 @@ async function verifyPublicSourceConfiguration() {
   assert.equal(get("onprem-job-source-mode"), undefined, "the job summary omits the source-access row");
   assert.equal(get("onprem-destination-base"), undefined, "new transfers have no base-folder input");
   assert.doesNotMatch(html, /data-onprem-config="destination_base"|Папка внутри общего диска/);
-  assert.match(html, /Ссылки остаются публичными после завершения и остановки/);
+  const warning = html.match(/<p id="onprem-publish-warning"[^>]*>([\s\S]*?)<\/p>/);
+  assert.ok(warning && warning.index < html.indexOf('id="onprem-run-actions"'), "publication warning precedes the actions");
+  assert.match(warning[1], /публичными[^<.]*после завершения[^<.]*остановки/);
+  assert.equal(get("onprem-list-publication-note").hidden, true);
+  assert.equal(get("onprem-publish-warning").hidden, false);
   const strategy = get("onprem-strategy");
   assert.equal(strategy.value, "staged", "a fresh form defaults to the local cache route");
   assert.match(html, /С временным сохранением в кэш/);
@@ -471,11 +1061,11 @@ async function verifyPublicSourceConfiguration() {
   await fire(tab, "click");
   for (const node of ui.nodes.filter((node) => node.dataset.onpremConfig)) node.value = config[node.dataset.onpremConfig] || "";
   get("onprem-source-secret").value = "fake-secret";
-  get("onprem-destination-token").value = "fake-token";
-  get("onprem-identity-confirmed").checked = true;
-  await fire(get("onprem-identity-confirmed"), "change");
+  await fillSharedApp(ui);
   strategy.value = "staged";
   await fire(strategy, "change");
+  assertPrimaryAction(ui.byId, "plan");
+  assert.equal(get("onprem-plan").textContent, "Проверить план");
   assert.equal(calls.filter((call) => call.method !== "GET").length, 0, "selecting a strategy never publishes or starts a job");
   rejectPreflight = true;
   await fire(get("onprem-form"), "submit");
@@ -530,6 +1120,9 @@ async function verifyPublicSourceConfiguration() {
   assert.equal(publicCreate.body.config.source_public, true, "new public staged plans retain the explicit flag");
   assert.equal(publicCreate.body.credentials.source_admin_token, undefined, "empty optional admin field is omitted");
   assert.equal(get("onprem-start").disabled, false);
+  assertPrimaryAction(ui.byId, "start");
+  assert.equal(get("onprem-plan").textContent, "Составить новый план");
+  assert.equal(get("onprem-publish-warning").hidden, false);
   assert.equal(publicCreate.body.config.destination_base, "/");
   const expectedDate = new Date(current.created_at).toLocaleString("ru-RU", {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
@@ -571,6 +1164,8 @@ async function verifyPublicSourceConfiguration() {
     if (originalStrategy === "staged") current.config.source_public = false;
     get("onprem-history").value = current.id;
     await fire(get("onprem-history"), "change");
+    assert.equal(get("onprem-publish-warning").hidden, true,
+      "a saved personal plan with private downloading does not promise to publish");
     assert.equal(strategy.value, "staged", "history cannot restore the retired transfer route into the new form");
     assert.match(get("onprem-job-destination").textContent, /Old archive/,
       "the selected job shows its actual historical destination separately from a new plan preview");
@@ -599,6 +1194,11 @@ async function verifyPublicSourceConfiguration() {
     await fire(get("onprem-resume"), "click");
     if (!legacyUrl) assert.deepEqual(calls.filter((call) => call.path.endsWith("/credentials")).at(-1).body.config, retainedConfig);
     await fire(get("onprem-form"), "submit");
+    assert.equal(get("onprem-destination-token").value, "");
+    const beforeNew = calls.filter(call => call.path === "/api/onprem/jobs" && call.method === "POST").length;
+    await fillSharedApp(ui);
+    await fire(get("onprem-form"), "submit");
+    assert.equal(calls.filter(call => call.path === "/api/onprem/jobs" && call.method === "POST").length, beforeNew + 1);
     const fresh = calls.filter((call) => call.path === "/api/onprem/jobs" && call.method === "POST").at(-1);
     assert.equal(fresh.body.config.source_public, true, "a new Dry Run never inherits private downloading");
     assert.equal(fresh.body.config.destination_base, "/", "a new Dry Run never inherits the archived base folder");
@@ -869,10 +1469,10 @@ async function verifyAutomaticJobActions() {
   assert.ok(controls, "the remaining transfer controls have their own lower row");
   const labels = (markup) => Array.from(markup.matchAll(/<button id="([^"]+)"[^>]*>([^<]+)<\/button>/g),
     (match) => [match[1], match[2]]);
-  assert.deepEqual(labels(startControls), [["onprem-plan", "Dry Run"], ["onprem-start", "Начать перенос"]]);
+  assert.deepEqual(labels(startControls), [["onprem-plan", "Проверить план"], ["onprem-start", "Начать перенос"]]);
   assert.deepEqual(labels(controls), [
     ["onprem-pause", "Пауза"],
-    ["onprem-resume", "Продолжить"], ["onprem-stop", "Остановить полностью"],
+    ["onprem-resume", "Продолжить"], ["onprem-stop", "Остановить полностью…"],
     ["onprem-restart", "Начать заново"],
   ], "lower controls expose the remaining four requested actions");
   assert.match(html, /id="onprem-run-actions"[\s\S]*?<\/div>\s*<div id="onprem-transfer-actions"/,
@@ -920,7 +1520,7 @@ async function verifyAutomaticJobActions() {
     };
     vm.runInNewContext(source, {
       document: ui.document, window: {addEventListener() {}, confirm() {return true;},
-        diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true})},
+        diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: true, onprem_shared_service_application_available: true})},
       fetch: fakeFetch, URL, Blob, crypto, Uint8Array, console,
       setTimeout(callback) {scheduled.push(callback); return scheduled.length;}, clearTimeout() {},
     });
@@ -945,6 +1545,8 @@ async function verifyAutomaticJobActions() {
   for (const state of ["completed_with_issues", "awaiting_credentials"]) {
     const ui = await load({state, resumeState: state === "awaiting_credentials" ? "paused" : undefined});
     assert.equal(ui.byId.get("onprem-resume").disabled, false);
+    if (state === "completed_with_issues") assert.equal(ui.byId.get("onprem-restart").disabled, false);
+    assertPrimaryAction(ui.byId, "resume");
     await fire(ui.byId.get("onprem-resume"), "click");
     assert.deepEqual(ui.writes().map((call) => [call.method, call.path.split("/").at(-1)]),
       [["PUT", "credentials"], ["POST", "retry"]], "Continue attaches access then retries failures once");
@@ -954,6 +1556,24 @@ async function verifyAutomaticJobActions() {
   await fire(rejected.byId.get("onprem-resume"), "click");
   assert.deepEqual(rejected.writes().map((call) => call.path.split("/").at(-1)), ["credentials"],
     "rejected access prevents both retry and resume");
+
+  const child = await load({state: "needs_attention", entryState: "planned"});
+  const childResume = child.byId.get("onprem-resume");
+  Object.assign(child.selected, {managed_by_batch: true, can_start_transfer: false, selection_frozen: false});
+  for (const [state, resume_state] of [["needs_attention", null], ["awaiting_credentials", "ready"]]) {
+    Object.assign(child.selected, {state, resume_state});
+    await fire(child.byId.get("onprem-refresh"), "click");
+    assert.equal(childResume.disabled, true, "a CSV child must wait for the list's first Start");
+    assertPrimaryAction(child.byId, null);
+    await fire(childResume, "click");
+    assert.deepEqual(child.writes(), [], "forced Continue cannot start a CSV child independently");
+  }
+  Object.assign(child.selected, {state: "paused", resume_state: null, selection_frozen: true});
+  await fire(child.byId.get("onprem-refresh"), "click");
+  assertPrimaryAction(child.byId, "resume");
+  await fire(childResume, "click");
+  assert.deepEqual(child.writes().map(call => call.path.split("/").at(-1)), ["credentials", "resume"]);
+  assert.equal(child.selected.state, "running");
 
   for (const state of ["paused", "awaiting_credentials"]) {
     for (const extraEntryStates of [[], ["outcome_unknown"], ["failed"]]) {
@@ -1003,11 +1623,30 @@ async function verifyAutomaticJobActions() {
 
   const ready = await load({state: "awaiting_credentials", resumeState: "ready", entryState: "planned"});
   assert.equal(ready.byId.get("onprem-start").disabled, false);
+  assert.equal(ready.byId.get("onprem-resume").disabled, false);
+  assertPrimaryAction(ready.byId, "start");
   await fire(ready.byId.get("onprem-start"), "click");
   assert.deepEqual(ready.writes().map((call) => call.path.split("/").at(-1)), ["credentials", "resume", "start"],
     "Start restores a ready plan before starting transfer");
 
+  const attention = await load({state: "needs_attention", entryState: "planned"});
+  Object.assign(attention.selected, {plan_complete: true, can_start_transfer: true, selection: {selected: 1}});
+  await fire(attention.byId.get("onprem-refresh"), "click");
+  assert.equal(attention.byId.get("onprem-resume").disabled, false);
+  assertPrimaryAction(attention.byId, "start");
+  attention.selected.selection.selected = 0;
+  await fire(attention.byId.get("onprem-refresh"), "click");
+  assert.equal(attention.byId.get("onprem-start").disabled, true);
+  assertPrimaryAction(attention.byId, null);
+
+  const completed = await load({state: "completed", entryState: "done"});
+  assertPrimaryAction(completed.byId, "restart");
+
   const transfer = await load({state: "running", entryState: "downloading"});
+  transfer.selected.pause_requested = true;
+  await fire(transfer.byId.get("onprem-refresh"), "click");
+  assertPrimaryAction(transfer.byId, null);
+  transfer.selected.pause_requested = false;
   const downloadRate = transfer.byId.get("onprem-download-rate");
   const uploadRate = transfer.byId.get("onprem-upload-rate");
   assert.ok(downloadRate && uploadRate, "the summary has distinct cache and shared-disk rates");
@@ -1059,6 +1698,7 @@ async function verifyAutomaticJobActions() {
   for (const id of ["onprem-source-secret", "onprem-identity-confirmed"]) {
     const delayed = await load({state: "awaiting_credentials", resumeState: "ready", entryState: "planned", delayResume: true});
     await fire(delayed.byId.get("onprem-start"), "click");
+    assertPrimaryAction(delayed.byId, null);
     assert.deepEqual(delayed.writes().map((call) => call.path.split("/").at(-1)), ["credentials", "resume"]);
     if (id === "onprem-source-secret") delayed.byId.get(id).value = "changed-fake-secret";
     else delayed.byId.get(id).checked = false;
@@ -1071,10 +1711,10 @@ async function verifyAutomaticJobActions() {
 }
 
 async function verifyRetryPolicy() {
-  async function load({state = "ready", retryEnabled = false, strategy = "staged", failPolicy = false} = {}) {
+  async function load({state = "ready", retryEnabled = false, strategy = "staged", failPolicy = false, delegated = false} = {}) {
     const ui = createDocument(), calls = [];
-    let current = {...clone(job), state, config: {...clone(config), strategy, retry_enabled: retryEnabled}};
-    const policyWindow = {diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: false}), addEventListener() {}};
+    let current = {...clone(job), state, destination_verified_uid: delegated ? "1000123" : null, config: {...clone(delegated ? sharedAppConfig : config), strategy, retry_enabled: retryEnabled}};
+    const policyWindow = {diskCopyConfigPromise: Promise.resolve({onprem_enabled: true, onprem_auth_required: false, onprem_shared_service_application_available: true}), addEventListener() {}};
     const api = async (address, options = {}) => {
       const url = new URL(address, "http://localhost"), method = options.method || "GET", body = options.body ? JSON.parse(options.body) : null;
       calls.push({path: url.pathname, method, body});
@@ -1117,15 +1757,10 @@ async function verifyRetryPolicy() {
   assert.equal(rejected.byId.get("retry-onprem").checked, true);
   assert.equal(rejected.byId.get("retry-onprem").disabled, false);
   assert.doesNotMatch(rejected.byId.get("retry-onprem-notice").textContent, /secret-value/);
-  const recovered = await load({state: "stopped", retryEnabled: true});
+  const recovered = await load({state: "stopped", retryEnabled: true, delegated: true});
   recovered.byId.get("retry-onprem").checked = false; await fire(recovered.byId.get("retry-onprem"), "change");
-  for (const [key, value] of Object.entries(config)) {
-    const field = recovered.nodes.find((node) => node.dataset.onpremConfig === key); if (field) field.value = value;
-  }
   recovered.byId.get("onprem-source-secret").value = "source-secret";
-  recovered.byId.get("onprem-destination-token").value = "destination-secret";
-  recovered.byId.get("onprem-identity-confirmed").checked = true;
-  await fire(recovered.byId.get("onprem-identity-confirmed"), "change");
+  await fillSharedApp(recovered);
   before = recovered.calls.length;
   await fire(recovered.byId.get("onprem-form"), "submit");
   const writes = recovered.calls.slice(before).filter((call) => call.method !== "GET");
@@ -1136,9 +1771,13 @@ async function verifyRetryPolicy() {
 }
 
 (async () => {
+  await verifySourceBrowser();
+  await verifyPersonalDraft();
   await verifyRetryPolicy();
   await verifyStagedOnly();
   await verifyReleaseGate();
+  await verifyPersonalDestination();
+  await verifySharedServiceDestination();
   await verifyGlobalCacheCleanup();
   await verifyPublicSourceConfiguration();
   await verifyAutomaticJobActions();
@@ -1151,9 +1790,9 @@ async function verifyRetryPolicy() {
   assert.ok(field("destination_vd_hash"), "new transfers require an existing shared disk mark");
   assert.equal(field("destination_base"), undefined, "new transfers always use the shared-disk root");
   assert.equal(field("destination_root"), undefined, "the per-email destination is derived, not entered manually");
-  assert.equal(field("destination_type"), undefined, "the new form has no personal/shared destination picker");
+  assert.ok(byId.get("onprem-destination-personal") && byId.get("onprem-destination-shared"), "single-disk transfers expose both destinations");
   assert.equal(byId.get("onprem-access").hidden, false);
-  assert.equal(byId.get("onprem-plan").disabled, true, "missing access key and identity confirmation block creation");
+  assert.equal(byId.get("onprem-plan").disabled, true, "missing access key and application credentials block creation");
   assert.equal(byId.get("onprem-journal").disabled, true, "journal export needs an authorized selected job");
   const tab = document.querySelector('.mode-tab[data-mode="onprem"]');
   await fire("onprem-journal", "click");
@@ -1163,11 +1802,11 @@ async function verifyRetryPolicy() {
   assert.equal(byId.get("log").hidden, true);
   assert.equal(requests.length, 0, "no unauthenticated polling requests");
   byId.get("onprem-access-key").value = "test-key";
-  for (const [key, value] of Object.entries(config)) if (field(key)) field(key).value = value;
+  job.config = sharedAppConfig;
+  job.destination_verified_uid = preflightDestination.verified_uid;
+  for (const [key, value] of Object.entries(sharedAppConfig)) if (field(key)) field(key).value = value;
   byId.get("onprem-source-secret").value = "fake-source-secret";
-  byId.get("onprem-destination-token").value = "fake-destination-token";
-  byId.get("onprem-identity-confirmed").checked = true;
-  await fire("onprem-identity-confirmed", "change");
+  await fillSharedApp({byId});
   await fire(field("source_email"), "input");
   assert.match(byId.get("onprem-destination-preview").textContent, /shared-target-hash.*\/source@example\.test/);
   assert.doesNotMatch(byId.get("onprem-destination-preview").textContent, /\/\//);
@@ -1183,13 +1822,17 @@ async function verifyRetryPolicy() {
   assert.match(byId.get("onprem-destination-check").textContent, /shared-target-hash/);
   assert.match(byId.get("onprem-destination-check").textContent, /10 Кб/);
   assert.match(byId.get("onprem-destination-check").textContent, /Чтение и запись/);
-  byId.get("onprem-destination-token").value = "refreshed-fake-token";
-  await fire("onprem-destination-token", "input");
+  byId.get("onprem-destination-client-secret").value = "refreshed-office-secret";
+  await fire("onprem-destination-client-secret", "input");
   assert.equal(byId.get("onprem-destination-check").hidden, true, "changing credentials invalidates the verified disk card");
-  byId.get("onprem-destination-token").value = "fake-destination-token";
+  byId.get("onprem-destination-client-secret").value = "office-secret";
   await fire("onprem-form", "submit");
   const create = requests.find((request) => request.method === "POST" && request.path === "/api/onprem/jobs");
-  assert.equal(create.body.config.identity_confirmed, true);
+  assert.equal(create.body.config.identity_confirmed, false);
+  assert.equal(create.body.config.destination_auth, "service_application");
+  assert.equal(create.body.credentials.destination_client_secret, "office-secret");
+  assert.equal(create.body.credentials.destination_owner_token, "office-owner");
+  assert.equal(Object.hasOwn(create.body.credentials, "destination_token"), false);
   assert.equal(create.body.config.destination_type, "shared");
   assert.equal(create.body.config.destination_vd_hash, "shared-target-hash");
   assert.equal(create.body.config.destination_base, "/");
@@ -1209,6 +1852,14 @@ async function verifyRetryPolicy() {
     "the route runs from the SaaS source to the On-premises shared disk and its saved destination folder");
   assert.equal((byId.get("onprem-job-destination").textContent.match(/→/g) || []).length, 1,
     "a folder within the destination is not rendered as a second transfer direction");
+  job.config = config;
+  delete job.destination_verified_uid;
+  byId.get("onprem-history").value = job.id;
+  await fire("onprem-history", "change");
+  byId.get("onprem-source-secret").value = "fake-source-secret";
+  byId.get("onprem-destination-token").value = "fake-destination-token";
+  byId.get("onprem-identity-confirmed").checked = true;
+  await fire("onprem-identity-confirmed", "change");
   job.state = "ready";
   job.total_files = 205;
   job.counts = {planned: 205};
@@ -1234,8 +1885,14 @@ async function verifyRetryPolicy() {
   field("destination_url").value = "https://disk.example.test:8443";
   await fire(field("destination_url"), "input");
   assert.equal(byId.get("onprem-start").disabled, true, "a different non-default port changes the bound destination");
-  field("destination_url").value = config.destination_url;
-  await fire(field("destination_url"), "input");
+  assert.equal(byId.get("onprem-destination-token").value, "", "a different installation requires its own token");
+  assert.equal(byId.get("onprem-history").value, "", "changing the installation exits the saved employee-token context");
+  byId.get("onprem-history").value = job.id;
+  await fire("onprem-history", "change");
+  byId.get("onprem-source-secret").value = "fake-source-secret";
+  byId.get("onprem-destination-token").value = "fake-destination-token";
+  byId.get("onprem-identity-confirmed").checked = true;
+  await fire("onprem-identity-confirmed", "change");
   assert.equal(byId.get("onprem-start").disabled, false);
   byId.get("onprem-source-admin-token").value = "fake-source-admin";
   await fire("onprem-source-admin-token", "input");
@@ -1249,9 +1906,12 @@ async function verifyRetryPolicy() {
   ], "Start validates filled access before the transfer without a separate button");
   assert.equal(requests.slice(beforeAutoStart).find((request) => request.path.endsWith("/credentials")).body.credentials.source_admin_token, "fake-source-admin");
   assert.equal(byId.get("onprem-pause").disabled, false);
+  assertPrimaryAction(byId, "pause");
   await fire("onprem-pause", "click");
   assert.equal(byId.get("onprem-resume").disabled, false);
+  assertPrimaryAction(byId, "resume");
   await fire("onprem-resume", "click");
+  assertPrimaryAction(byId, "pause");
   job.state = "running";
   first.state = "downloading";
   first.download_attempts = 2;
@@ -1360,9 +2020,17 @@ async function verifyRetryPolicy() {
       payload: {stage: "poll_transfer", status: "failed", error: "destination_url_import_failed",
         http_status: 200, remote_status: "failed"},
       diagnostic_message: "On-premises. HTTP 200: Статус получен; удалённая операция завершилась ошибкой. Код API: DiskDownloadLimitExceededError. Превышен лимит скачивания."},
+    {sequence: 30, created_at: "2026-10-11T12:00:23Z", type: "transfer_stage",
+      payload: {stage: "publish_source", status: "skipped", error: "source_publication_denied", http_status: 423,
+        publication_attempts: 3, max_publication_attempts: 3}},
+    {sequence: 31, created_at: "2026-10-11T12:00:24Z", type: "transfer_stage",
+      payload: {stage: "publish_source", status: "skipped", error: "source_publication_denied", http_status: 403,
+        publication_attempts: 2, max_publication_attempts: 2}},
   ];
   await fire("onprem-refresh", "click");
   const operationLog = byId.get("onprem-log").textContent;
+  assert.match(operationLog, /Публикация исходного ресурса.*Пропущен.*HTTP 423.*Попытка публикации 3 из 3/);
+  assert.match(operationLog, /Публикация исходного ресурса.*Пропущен.*HTTP 403.*Попытка публикации 2 из 2/);
   assert.match(operationLog, /path-operation_1/);
   assert.match(operationLog, /\?id=query-operation_2/, "query-form operation references remain inspectable");
   assert.match(operationLog, /entry:legacy/);
@@ -1406,7 +2074,7 @@ async function verifyRetryPolicy() {
   assert.doesNotMatch(hostileRetryEvent, /Скачивание:|Пауза перед повтором:|Следующая попытка:|unsafe/, "out-of-bounds and hostile retry fields are suppressed");
   await fire("onprem-refresh", "click");
   const incrementalEvents = requests.filter((request) => request.path.endsWith("/events")).at(-1);
-  assert.equal(incrementalEvents.params.get("after"), "29", "polling follows the latest received cursor");
+  assert.equal(incrementalEvents.params.get("after"), "31", "polling follows the latest received cursor");
   assert.equal(incrementalEvents.params.has("tail"), false, "later polling only requests new events");
   assert.doesNotMatch(operationLog, /fake-source-secret|fake-private-token|fake-destination-token|event-secret-token|event-private-token|url-private|path-secret|private-secret|private-stage|private-status|https?:\/\/|file:\/\//);
   assert.equal(byId.get("onprem-resume").disabled, true);
@@ -1447,7 +2115,10 @@ async function verifyRetryPolicy() {
   assert.equal(requests.filter((request) => request.path.endsWith("/journal")).at(-1).path, `/api/onprem/jobs/${job.id}/journal`);
   assert.equal(requests.every((request) => request.headers["X-Onprem-Key"] === "test-key"), true);
   assert.doesNotMatch(byId.get("onprem-log").textContent, /fake-source-secret|fake-destination-token|fake-private-token/);
-  assert.deepEqual(storageWrites, [], "no on-prem secrets or access key are stored in browser storage");
+  const assertStorageHasNoSecrets = () => assert.doesNotMatch(JSON.stringify(storageWrites),
+    /test-key|fake-source-secret|office-secret|office-owner|fake-destination-token|fake-source-admin|fresh-source-secret|fresh-office-secret|changed-during-preflight/,
+    "neither application credentials, employee tokens nor the access key enter the browser draft");
+  assertStorageHasNoSecrets();
   const anchorsBeforeStaleExport = document.body.children.length;
   let finishStaleExport;
   apiOverride = ({url}) => url.pathname.endsWith("/journal")
@@ -1815,10 +2486,10 @@ async function verifyRetryPolicy() {
   assert.equal(holder.counts.outcome_unknown, 1);
   assert.ok(byId.get("onprem-stop"), "jobs expose a permanent local stop action");
   assert.ok(byId.get("onprem-restart"), "a stopped transfer can create a separate reviewed plan");
-  const historicalParentConfig = {...clone(config), destination_base: "/Old archive",
+  const historicalParentConfig = {...clone(sharedAppConfig), destination_base: "/Old archive",
     destination_root: "vd:shared-target-hash:disk:/Old archive/source@example.test", source_public: false};
   const stoppedParent = {...clone(holder), state: "needs_attention", stop_requested: false, stop_blocked: false,
-    pause_requested: false, counts: {outcome_unknown: 1}, config: historicalParentConfig};
+    pause_requested: false, counts: {outcome_unknown: 1}, config: historicalParentConfig, destination_verified_uid: preflightDestination.verified_uid};
   allJobs = [stoppedParent, waiting];
   const parentEntries = [{...first, state: "outcome_unknown", attempt_id: "preserved-attempt"}];
   entrySets.set(stoppedParent.id, parentEntries);
@@ -1873,7 +2544,8 @@ async function verifyRetryPolicy() {
   await fire("onprem-refresh", "click");
   assert.equal(byId.get("onprem-job-state").textContent, "Остановлено полностью");
   assert.equal(byId.get("onprem-stop").disabled, true);
-  assert.equal(byId.get("onprem-restart").disabled, true, "restart needs newly validated credentials and owner confirmation");
+  assert.equal(byId.get("onprem-restart").disabled, true, "restart needs newly supplied application credentials");
+  assertPrimaryAction(byId, null);
   const beforeStoppedPoll = requests.filter((request) => request.method !== "GET").length;
   await runPoll();
   assert.equal(requests.filter((request) => request.method !== "GET").length, beforeStoppedPoll,
@@ -1881,11 +2553,12 @@ async function verifyRetryPolicy() {
   assert.deepEqual(parentEntries, [{...first, state: "outcome_unknown", attempt_id: "preserved-attempt"}],
     "stop preserves original object and attempt history");
   byId.get("onprem-source-secret").value = "fresh-source-secret";
-  byId.get("onprem-destination-token").value = "fresh-destination-token";
-  byId.get("onprem-identity-confirmed").checked = true;
+  byId.get("onprem-destination-owner-token").value = "office-owner";
+  byId.get("onprem-destination-client-secret").value = "fresh-office-secret";
   formValid = true;
-  await fire("onprem-identity-confirmed", "change");
+  await fire("onprem-destination-client-secret", "input");
   assert.equal(byId.get("onprem-restart").disabled, false);
+  assertPrimaryAction(byId, "restart");
   field("source_email").value = "changed-original@example.test";
   await fire(field("source_email"), "input");
   assert.equal(byId.get("onprem-restart").disabled, true, "restart cannot change the immutable source identity");
@@ -1902,7 +2575,7 @@ async function verifyRetryPolicy() {
     const key = stoppedParent.id + ":" + body.idempotency_key;
     const child = {...clone(stoppedParent), id: "a0000000000000000000000000000001", state: "queued",
       stop_requested: false, full_stop_requested: false, stop_blocked: false, restart_of: stoppedParent.id, counts: {}, total_files: 0,
-      total_bytes: 0, verified_bytes: 0, revision: 1, remote_root: null, error: null, config: {...clone(body.config), destination_base: "/", source_public: true, destination_root: "vd:shared-target-hash:disk:/source@example.test"}};
+      total_bytes: 0, verified_bytes: 0, revision: 1, remote_root: null, error: null, config: {...clone(body.config), destination_oauth_url: sharedAppConfig.destination_oauth_url, destination_base: "/", source_public: true, destination_root: "vd:shared-target-hash:disk:/source@example.test"}};
     restartedJobs.set(key, child); allJobs.unshift(child); entrySets.set(child.id, []);
     throw new Error("Lost reply after server accepted restart");
   };
@@ -1911,18 +2584,20 @@ async function verifyRetryPolicy() {
   assert.equal(byId.get("onprem-history").value, stoppedParent.id);
   assert.match(byId.get("onprem-notice").textContent, /Соединение прервалось/);
   const uncertainRestart = requests.filter((request) => request.path.endsWith("/restart")).at(-1);
-  assert.deepEqual(uncertainRestart.body.config, {...stoppedParent.config, retry_enabled: true},
-    "restart preserves all historical parameters while sending the independently editable retry policy");
-  assert.equal(uncertainRestart.body.credentials.destination_token, "fresh-destination-token");
+  const expectedConfig = {...stoppedParent.config, retry_enabled: true};
+  delete expectedConfig.destination_oauth_url;
+  assert.deepEqual(uncertainRestart.body.config, expectedConfig,
+    "restart lets the server derive the OAuth endpoint from the reviewed Disk API address");
+  assert.equal(uncertainRestart.body.credentials.destination_client_secret, "fresh-office-secret");
   assert.match(uncertainRestart.body.idempotency_key, /^[0-9a-f-]{36}$/i);
   const otherParent = {...clone(stoppedParent), id: "c".repeat(32), state: "completed", stop_requested: false, full_stop_requested: false};
   allJobs.push(otherParent);
   byId.get("onprem-history").value = otherParent.id;
   await fire("onprem-history", "change");
   byId.get("onprem-source-secret").value = "other-fresh-source-secret";
-  byId.get("onprem-destination-token").value = "other-fresh-destination-token";
-  byId.get("onprem-identity-confirmed").checked = true;
-  await fire("onprem-identity-confirmed", "change");
+  byId.get("onprem-destination-client-secret").value = "other-fresh-office-secret";
+  byId.get("onprem-destination-owner-token").value = "office-owner";
+  await fire("onprem-destination-owner-token", "input");
   apiOverride = ({url, method, body}) => {
     if (url.pathname !== `/api/onprem/jobs/${otherParent.id}/restart` || method !== "POST") return null;
     const key = otherParent.id + ":" + body.idempotency_key;
@@ -1936,9 +2611,9 @@ async function verifyRetryPolicy() {
   byId.get("onprem-history").value = stoppedParent.id;
   await fire("onprem-history", "change");
   byId.get("onprem-source-secret").value = "fresh-source-secret";
-  byId.get("onprem-destination-token").value = "current-fresh-destination-token";
-  byId.get("onprem-identity-confirmed").checked = true;
-  await fire("onprem-identity-confirmed", "change");
+  byId.get("onprem-destination-client-secret").value = "current-fresh-office-secret";
+  byId.get("onprem-destination-owner-token").value = "office-owner";
+  await fire("onprem-destination-owner-token", "input");
   let finishRestartHistory;
   apiOverride = ({url, method}) => url.pathname === "/api/onprem/jobs" && method === "GET"
     ? new Promise((resolve) => {finishRestartHistory = resolve;}) : null;
@@ -1946,7 +2621,7 @@ async function verifyRetryPolicy() {
   const retriedRestart = requests.filter((request) => request.path.endsWith("/restart")).at(-1);
   assert.equal(retriedRestart.body.idempotency_key, uncertainRestart.body.idempotency_key,
     "uncertain restart retries keep their key after another parent is restarted and secrets refreshed");
-  assert.equal(retriedRestart.body.credentials.destination_token, "current-fresh-destination-token");
+  assert.equal(retriedRestart.body.credentials.destination_client_secret, "current-fresh-office-secret");
   assert.equal(restartedJobs.size, 2, "each parent's lost response followed by retry keeps exactly one child");
   const newJob = [...restartedJobs.values()][0];
   assert.equal(byId.get("onprem-history").value, newJob.id);
@@ -1955,8 +2630,8 @@ async function verifyRetryPolicy() {
   await fire("onprem-restart", "click");
   assert.equal(requests.length, beforeDuplicateRestart, "duplicate clicks while refreshing cannot create another job");
   assert.equal(field("source_email").value, config.source_email);
-  assert.equal(byId.get("onprem-identity-confirmed").checked, true,
-    "selecting the new job retains confirmed form access for manual Start");
+  assert.equal(byId.get("onprem-destination-client-secret").value, "current-fresh-office-secret",
+    "selecting the new job retains the supplied application access for manual Start");
   finishRestartHistory({ok: true, status: 200, json: async () => ({jobs: clone(allJobs)})});
   await flush(); apiOverride = null;
   assert.ok(byId.get("onprem-history").children.some((option) => option.value === stoppedParent.id));
@@ -2061,8 +2736,13 @@ async function verifyRetryPolicy() {
   await fire("onprem-resume", "click");
   assert.equal(requests.length, beforeChangedBinding, "automatic access cannot alter the destination disk binding");
   assert.equal(byId.get("onprem-resume").disabled, true);
+  assert.equal(byId.get("onprem-history").value, "", "changing the shared disk exits the saved employee-token context");
   field("destination_vd_hash").value = config.destination_vd_hash;
   await fire(field("destination_vd_hash"), "input");
+  job.config = sharedAppConfig;
+  job.destination_verified_uid = preflightDestination.verified_uid;
+  byId.get("onprem-source-secret").value = "fake-source-secret";
+  await fillSharedApp({byId});
   preflightDestination = {...preflightDestination, free_bytes: null};
   await fire("onprem-form", "submit");
   assert.match(byId.get("onprem-destination-check").textContent, /Свободное место неизвестно/);
@@ -2072,10 +2752,12 @@ async function verifyRetryPolicy() {
     "documented boolean permissions are accepted after preflight");
   assert.match(byId.get("onprem-destination-check").textContent, /Чтение и запись разрешены/);
   delete preflightDestination.permissions;
+  const beforeMissingRights = requests.filter((request) => request.path === "/api/onprem/jobs" && request.method === "POST").length;
   await fire("onprem-form", "submit");
-  assert.equal(byId.get("onprem-destination-check").hidden, false,
-    "successful backend preflight may omit optional rights metadata");
-  assert.match(byId.get("onprem-destination-check").textContent, /API не указал права/);
+  assert.equal(byId.get("onprem-destination-check").hidden, true, "service application preflight requires explicit disk permissions");
+  assert.equal(requests.filter((request) => request.path === "/api/onprem/jobs" && request.method === "POST").length,
+    beforeMissingRights, "missing rights prevent creating a new application transfer");
+  assert.match(byId.get("onprem-notice").textContent, /Нет доступа к выбранному общему диску/);
   assert.doesNotMatch(byId.get("onprem-destination-check").textContent, /Чтение и запись разрешены/,
     "absent metadata never becomes a verified rights claim");
   for (const permissions of [["read"], {read: true, write: false}]) {
@@ -2084,7 +2766,7 @@ async function verifyRetryPolicy() {
     await fire("onprem-form", "submit");
     assert.equal(requests.filter((request) => request.path === "/api/onprem/jobs" && request.method === "POST").length,
       createCount, "explicit read-only access prevents creating a transfer");
-    assert.match(byId.get("onprem-notice").textContent, /ресурс заблокирован или доступ ограничен/);
+    assert.match(byId.get("onprem-notice").textContent, /Нет доступа к выбранному общему диску/);
     assert.equal(field("strategy").value, "staged", "read-only access keeps the fixed transfer route");
   }
   preflightDestination = {...preflightDestination, permissions: ["read", "write"]};
@@ -2097,8 +2779,8 @@ async function verifyRetryPolicy() {
   const pendingPreflight = fire("onprem-form", "submit");
   await flush();
   assert.equal(typeof resolvePendingPreflight, "function");
-  byId.get("onprem-destination-token").value = "changed-during-preflight";
-  await fire("onprem-destination-token", "input");
+  byId.get("onprem-destination-owner-token").value = "changed-during-preflight";
+  await fire("onprem-destination-owner-token", "input");
   resolvePendingPreflight({ok: true, status: 200, json: async () => ({destination: clone(preflightDestination)})});
   await pendingPreflight;
   await flush();
@@ -2121,6 +2803,6 @@ async function verifyRetryPolicy() {
     assert.doesNotMatch(byId.get("onprem-notice").textContent, /Операция не выполнена/);
   }
   apiError = null;
-  assert.deepEqual(storageWrites, []);
+  assertStorageHasNoSecrets();
   console.log("PASS: staged-only forms and payloads, historical URL read/stop/export, disabled release gate, explicit Onprem opt-in, configuration failure fallback, asynchronous plan/history, pagination, credential recovery, file-row retry, permanent local stop, idempotent new-job restart, historical blocker full stop, manual Start, stale-read protection and secret-safe rendering/storage");
 })().catch((error) => {console.error(error); process.exitCode = 1;});

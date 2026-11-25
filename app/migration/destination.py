@@ -4,6 +4,8 @@ import os
 import random
 import re
 import threading
+import time
+from http.cookiejar import DefaultCookiePolicy
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -21,6 +23,85 @@ from .operations import OPERATION_ID, operation_endpoint
 _LIMITERS = {}
 _LIMITER_LOCK = threading.Lock()
 _VD_HASH = re.compile(r"[A-Za-z0-9_-]{1,256}")
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def account_uid(value):
+    """Return canonical decimal uint64 text for a Disk user.uid."""
+    if isinstance(value, str):
+        if not value.isascii() or not value.isdecimal():
+            return None
+        digits = value.lstrip("0") or "0"
+        if len(digits) > 20:
+            return None
+        value = int(digits)
+    if type(value) is int and 0 <= value < 2**64:
+        return str(value)
+    return None
+
+
+def account_upn(value):
+    if not isinstance(value, str) or re.search(r"[\s/:\\\x00-\x1f\x7f]", value):
+        return None
+    name, _, domain = value.partition("@")
+    if name and domain and "@" not in domain:
+        return value
+    return None
+
+
+def verified_service_uid(identity, info):
+    user = info.get("user") if isinstance(info, dict) else None
+    uid = account_uid(user.get("uid")) if isinstance(user, dict) else None
+    if uid is None:
+        raise MigrationError("destination_identity_unverified", auth=True)
+    expected = account_uid(identity)
+    actual = uid
+    if expected is None:
+        expected = account_upn(identity)
+        email = user.get("email")
+        # OAuth binds the token to the requested email. Disk may return only its owner's UID.
+        if expected is not None and email in (None, ""):
+            return uid
+        actual = account_upn(email)
+        if expected is None or actual is None:
+            raise MigrationError("destination_identity_unverified", auth=True)
+    if actual != expected:
+        raise MigrationError("destination_identity_mismatch", auth=True)
+    return uid
+
+
+def normalize_oauth_url(value):
+    https_url(value, "invalid_destination_oauth_url")
+    parsed = urlsplit(value)
+    if parsed.path != "/token" or "?" in value or "#" in value:
+        raise MigrationError("invalid_destination_oauth_url")
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = "[" + host + "]"
+    if parsed.port is not None and parsed.port != 443:
+        host += ":" + str(parsed.port)
+    return urlunsplit(("https", host, "/token", "", ""))
+
+
+def personal_oauth_url(disk_url):
+    error = "invalid_personal_disk_api_url"
+    parsed = urlsplit(https_url(disk_url, error))
+    service, _, domain = parsed.hostname.partition(".")
+    if (service != "cloud-api" or parsed.port not in (None, 443)
+            or not parsed.netloc.isascii() or len(parsed.hostname) > 253
+            or not all(_DNS_LABEL.fullmatch(part) for part in domain.split("."))
+            or parsed.path not in ("", "/", "/v1/disk", "/v1/disk/")
+            or "?" in disk_url or "#" in disk_url):
+        raise MigrationError(error)
+    return f"https://oauth.{domain}/token"
+
+
+def bound_oauth_url(config):
+    endpoint = personal_oauth_url(config.get("destination_url"))
+    if ("destination_oauth_url" in config
+            and normalize_oauth_url(config["destination_oauth_url"]) != endpoint):
+        raise MigrationError("invalid_destination_oauth_url")
+    return endpoint
 
 
 def normalize_destination_url(value):
@@ -78,7 +159,14 @@ class _UploadProgress:
 
 
 class OnPremDiskDestination:
+    supports_personal_admin_token = True
+    supports_personal_service_application = True
+    supports_shared_service_application = True
+
     def __init__(self, config, credentials):
+        self.service_application = config.get("destination_auth") == "service_application"
+        if self.service_application and not config.get("destination_oauth_url"):
+            raise MigrationError("onprem_personal_grant_unavailable")
         self.api_url = normalize_destination_url(config["destination_url"])
         self.destination_type = config.get("destination_type", "personal")
         self.vd_hash = config.get("destination_vd_hash", "")
@@ -88,10 +176,36 @@ class OnPremDiskDestination:
             else "/resources"
         )
         self.token = credentials.get("destination_token")
-        if not isinstance(self.token, str) or not self.token:
+        self.expected_uid = None
+        if self.service_application:
+            self.token = None
+            self.token_lock = threading.Lock()
+            self.token_deadline = 0
+            self.oauth_url = bound_oauth_url(config)
+            self.identity = config.get("destination_identity")
+            uid = account_uid(self.identity)
+            if not account_upn(self.identity) and (uid is None or self.destination_type == "shared"):
+                raise MigrationError("destination_identity_unverified", auth=True)
+            self.exchange_form = {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "client_id": config.get("destination_client_id"),
+                "client_secret": credentials.get("destination_client_secret"),
+                "access_token": credentials.get("destination_owner_token"),
+                "scope": "cloud_api:disk.read cloud_api:disk.write cloud_api:disk.info",
+                "subject_token": uid if uid is not None else self.identity,
+                "subject_token_type": "urn:yandex:params:oauth:token-type:" + (
+                    "uid" if uid is not None else "email"
+                ),
+            }
+            if not all(isinstance(v, str) and v.strip() for v in self.exchange_form.values()):
+                raise MigrationError("destination_auth_failed", auth=True)
+        elif not isinstance(self.token, str) or not self.token:
             raise MigrationError("destination_auth_failed", auth=True)
         self.session = requests.Session()
         self.session.trust_env = False
+        self.session.cookies = requests.cookies.RequestsCookieJar(
+            policy=DefaultCookiePolicy(allowed_domains=()),
+        )
         self.limiter = get_onprem_limiter(self.api_url)
         self.verify = os.environ.get("ONPREM_CA_BUNDLE") or True
         self.last_operation_diagnostics = {}
@@ -100,18 +214,95 @@ class OnPremDiskDestination:
     def close(self):
         self.session.close()
 
-    def _request(self, method, endpoint, *, capability=False, **kwargs):
+    def _verified_access(self):
+        with self.token_lock:
+            now = time.monotonic()
+            if self.token and now < self.token_deadline:
+                return self.token, self.owner_info, self.token_deadline
+            try:
+                return self._exchange_and_verify(now)
+            except MigrationError as exc:
+                exc._migration_stage = "check_destination_access"
+                raise
+
+    def _exchange_and_verify(self, now):
+        try:
+            response = self.session.request(
+                "POST", self.oauth_url, data=self.exchange_form,
+                verify=self.verify, allow_redirects=False, timeout=DEFAULT_TIMEOUT,
+            )
+        except (requests.RequestException, OSError):
+            raise MigrationError("destination_unavailable") from None
+        try:
+            if response.status_code != 200:
+                rejected = 400 <= response.status_code < 500 and response.status_code != 429
+                raise MigrationError(
+                    "destination_auth_failed" if rejected else "destination_unavailable",
+                    auth=rejected, http_status=response.status_code,
+                )
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            token = payload.get("access_token") if isinstance(payload, dict) else None
+            ttl = payload.get("expires_in", 3600) if isinstance(payload, dict) else None
+            if (not isinstance(token, str) or not token.isascii()
+                    or not token.isprintable() or " " in token
+                    or not token or type(ttl) is not int or ttl <= 0):
+                raise MigrationError("destination_auth_failed", auth=True)
+        finally:
+            response.close()
+        ttl = min(ttl, 3600)
+        deadline = now + ttl - min(300, ttl / 10)
+        proof = self._request("GET", "/", proof_access=(token, deadline))
+        try:
+            self._status(proof, (200,))
+            info = self._json(proof)
+        finally:
+            proof.close()
+        uid = verified_service_uid(self.identity, info)
+        if self.expected_uid is not None and self.expected_uid != uid:
+            raise MigrationError("destination_identity_mismatch", auth=True)
+        if time.monotonic() >= deadline:
+            raise MigrationError("destination_auth_failed", auth=True)
+        self.expected_uid = uid
+        self.owner_info = info
+        self.token = token
+        self.token_deadline = deadline
+        return token, info, deadline
+
+    def _acquire_slot(self, method):
+        if self.checkpoint is not None:
+            self.limiter.acquire(method, checkpoint=self.checkpoint)
+        else:
+            self.limiter.acquire(method)
+
+    def _request(self, method, endpoint, *, capability=False, proof_access=None, **kwargs):
         url = endpoint if capability else self.api_url + endpoint
         is_read = method == "GET"
         kwargs.setdefault("timeout", (5.0, 15.0) if is_read else DEFAULT_TIMEOUT)
         kwargs["allow_redirects"] = False
         kwargs["verify"] = self.verify
-        if not capability:
-            kwargs["headers"] = {"Authorization": "OAuth " + self.token}
-        if self.checkpoint is not None:
-            self.limiter.acquire(method, checkpoint=self.checkpoint)
+        if self.service_application and not capability and proof_access is None:
+            # Refresh and proof consume their own time and rate-limit slot.
+            for _ in range(2):
+                token, _, deadline = self._verified_access()
+                self._acquire_slot(method)
+                if time.monotonic() < deadline:
+                    break
+            else:
+                error = MigrationError("destination_auth_failed", auth=True)
+                error._migration_stage = "check_destination_access"
+                raise error
         else:
-            self.limiter.acquire(method)
+            self._acquire_slot(method)
+            token = self.token
+            if proof_access is not None:
+                token, deadline = proof_access
+                if time.monotonic() >= deadline:
+                    raise MigrationError("destination_auth_failed", auth=True)
+        if not capability:
+            kwargs["headers"] = {"Authorization": "OAuth " + token}
         try:
             response = self.session.request(method, url, **kwargs)
         except (requests.RequestException, OSError) as exc:
@@ -310,12 +501,15 @@ class OnPremDiskDestination:
             response.close()
 
     def info(self):
-        response = self._request("GET", "/")
-        try:
-            self._status(response, (200,))
-            owner = self._json(response)
-        finally:
-            response.close()
+        if self.service_application:
+            owner = self._verified_access()[1]
+        else:
+            response = self._request("GET", "/")
+            try:
+                self._status(response, (200,))
+                owner = self._json(response)
+            finally:
+                response.close()
         if self.destination_type == "personal":
             return owner
         response = self._request("GET", "/virtual-disks", params={

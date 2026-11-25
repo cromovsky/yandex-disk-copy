@@ -1,33 +1,27 @@
-"""A disabled retry skips one object, then paces the next without pausing the job."""
+"""With retries disabled, errors are logged and the queue advances immediately."""
 
 import pytest
 
-from app.file_cooldown import FileCooldown
 from app.migration.errors import MigrationError
-from tests.fake_clock import FakeClock
+from tests import test_migration_file_pause as queue_fixtures
 from tests import test_migration_runner as fixtures
 from tests import test_migration_public_runner as public_fixtures
 from tests.test_migration_point_retry import queue, unknown
-from tests.test_migration_runner import CONFIG, DIR, META, stage_events
+from tests.test_migration_runner import CONFIG, META, stage_events
 
 
 unplanned_migration = fixtures.unplanned_migration
+two_files = queue_fixtures.two_files
+frozen_clock = queue_fixtures.frozen_clock
 direct_migration = fixtures.direct_migration
 public_migration = public_fixtures.public_migration
 
 
 @pytest.fixture
-def paced_errors(unplanned_migration):
-    store, _, runner, job_id, source, _ = unplanned_migration
-    source.walk = lambda path: [dict(DIR), dict(META), dict(
-        META, path="disk:/Docs/b.txt", name="b.txt",
-    )]
-    clock = FakeClock()
-    runner._file_cooldown = FileCooldown(seconds=20, monotonic=clock.monotonic)
-    runner.step(job_id)
+def two_files_no_retries(two_files):
+    _, _, runner, job_id, _, _ = two_files
     runner.set_retry_enabled(job_id, False)
-    store.update_job(job_id, state="running")
-    return unplanned_migration, clock
+    return two_files
 
 
 def fail_first(migration, failure):
@@ -65,35 +59,24 @@ def fail_first(migration, failure):
 
 
 @pytest.mark.parametrize("failure", ["source", "destination", "verification"])
-def test_skipped_error_waits_twenty_seconds_then_continues(paced_errors, failure):
-    migration, clock = paced_errors
-    store, _, runner, job_id, _, destination = migration
-    first = fail_first(migration, failure)
-    assert runner._file_cooldown.remaining(job_id) == 20
+def test_skipped_error_immediately_advances_to_next_file(two_files_no_retries, frozen_clock, failure):
+    store, _, runner, job_id, _, destination = two_files_no_retries
+    first = fail_first(two_files_no_retries, failure)
     before = destination.uploads
-    for _ in range(5):
-        runner.step(job_id)
-    clock.advance(19.999)
-    runner.step(job_id)
-    assert destination.uploads == before
-    assert store.get(job_id)["state"] == "running"
-    assert len(stage_events(store, job_id, "file_pause")) == 1
-    assert stage_events(store, job_id, "file_pause")[0]["payload"]["retry_delay_ms"] == 20000
     assert any(e["payload"].get("entry_id") == first["id"]
                and e["payload"]["status"] == "skipped"
                for e in stage_events(store, job_id))
-    clock.advance(0.001)
     runner.step(job_id)
     assert destination.uploads == before + 1
     runner.step(job_id)
     assert store.get(job_id)["state"] == "completed_with_issues"
-    assert clock.sleeps == []
+    assert frozen_clock.monotonic() == 0
+    assert not stage_events(store, job_id, "file_pause")
 
 
-def test_directory_after_error_waits_but_last_error_finishes_without_wait(paced_errors):
-    migration, clock = paced_errors
-    store, _, runner, job_id, _, destination = migration
-    first = fail_first(migration, "source")
+def test_directory_after_error_starts_immediately(two_files_no_retries):
+    store, _, runner, job_id, _, destination = two_files_no_retries
+    first = fail_first(two_files_no_retries, "source")
     other = next(e for e in store.entries(job_id) if e["source_path"].endswith("b.txt"))
     store.update_entry(other["id"], state="skipped_by_user")
     directory = store.add_entries(job_id, [{
@@ -101,54 +84,37 @@ def test_directory_after_error_waits_but_last_error_finishes_without_wait(paced_
         "destination_path": "disk:/owner/Docs/later", "size": 0,
     }], append=True)[0]
     runner.step(job_id)
-    assert store.entry(directory)["state"] == "planned"
-    assert "disk:/owner/Docs/later" not in destination.nodes
-    clock.advance(20)
-    runner.step(job_id)
     assert store.entry(directory)["state"] == "done"
     runner.step(job_id)
     assert store.get(job_id)["state"] == "completed_with_issues"
     assert store.entry(first["id"])["error"] == "source_timeout"
-    assert clock.sleeps == []
 
 
-def test_final_error_finishes_immediately(paced_errors):
-    migration, clock = paced_errors
-    store, _, runner, job_id, _, _ = migration
+def test_final_error_finishes_immediately(two_files_no_retries):
+    store, _, runner, job_id, _, _ = two_files_no_retries
     other = next(e for e in store.entries(job_id) if e["source_path"].endswith("b.txt"))
     store.update_entry(other["id"], state="skipped_by_user")
-    fail_first(migration, "source")
+    fail_first(two_files_no_retries, "source")
     runner.step(job_id)
     assert store.get(job_id)["state"] == "completed_with_issues"
-    assert runner._file_cooldown.remaining(job_id) == 20
     assert not stage_events(store, job_id, "file_pause")
-    assert clock.sleeps == []
 
 
-def test_pause_can_resume_and_stop_interrupts_error_wait(paced_errors):
-    migration, clock = paced_errors
-    store, _, runner, job_id, _, destination = migration
-    fail_first(migration, "source")
+def test_pause_before_next_file_after_error(two_files_no_retries):
+    store, _, runner, job_id, _, destination = two_files_no_retries
+    fail_first(two_files_no_retries, "source")
     store.update_job(job_id, pause_requested=True)
     runner.step(job_id)
     assert store.get(job_id)["state"] == "paused"
     store.update_job(job_id, state="running", pause_requested=False)
     runner.step(job_id)
-    assert destination.uploads == 0
-    assert store.get(job_id)["state"] == "running"
-    store.request_stop(job_id)
-    runner.stop_job(job_id)
-    runner.step(job_id)
-    assert store.get(job_id)["state"] == "stopped"
-    assert runner._file_cooldown.remaining(job_id) == 0
-    assert clock.sleeps == []
+    assert destination.uploads == 1
 
 
-def test_error_cooldown_does_not_delay_another_source(paced_errors):
-    migration, _ = paced_errors
-    store, registry, runner, job_id, source, destination = migration
-    fail_first(migration, "source")
-    source.walk = lambda path: [dict(DIR), dict(META, path="disk:/Docs/b.txt", name="b.txt")]
+def test_skipped_error_does_not_delay_another_source(two_files_no_retries):
+    store, registry, runner, job_id, source, destination = two_files_no_retries
+    fail_first(two_files_no_retries, "source")
+    source.walk = lambda path: [dict(fixtures.DIR), dict(META, path="disk:/Docs/b.txt", name="b.txt")]
     config = dict(CONFIG, source_email="other@example.org", destination_root="disk:/other")
     other = store.create(config, "other-source-after-error")["id"]
     registry.put(other, config, {"source_client_secret": "s", "destination_token": "d"})
@@ -159,13 +125,10 @@ def test_error_cooldown_does_not_delay_another_source(paced_errors):
         if destination.uploads:
             break
     assert destination.uploads == 1
-    assert runner._file_cooldown.remaining(job_id) == 20
-    assert runner._file_cooldown.remaining(other) == 20
 
 
-def test_enabled_retries_keep_the_download_retry_schedule(paced_errors):
-    migration, _ = paced_errors
-    store, _, runner, job_id, source, _ = migration
+def test_enabled_retries_keep_the_download_retry_schedule(two_files_no_retries):
+    store, _, runner, job_id, source, _ = two_files_no_retries
     runner.set_retry_enabled(job_id, True)
 
     def chunks(path):
@@ -180,14 +143,11 @@ def test_enabled_retries_keep_the_download_retry_schedule(paced_errors):
     assert first["retry_at_ms"] is not None
     assert first["download_attempts"] == 1
     assert store.attempt(first["attempt_id"])["phase"] == "download_retry_wait"
-    assert runner._file_cooldown.remaining(job_id) == 0
     assert not stage_events(store, job_id, "file_pause")
 
 
-def test_point_retry_error_starts_cooldown_before_the_queue_continues(direct_migration):
+def test_queue_continues_immediately_after_failed_point_retry(direct_migration):
     store, _, runner, job_id, _, destination = direct_migration
-    clock = FakeClock()
-    runner._file_cooldown = FileCooldown(seconds=20, monotonic=clock.monotonic)
     runner.set_retry_enabled(job_id, False)
     entry, attempt = unknown(direct_migration, cache=True)
     destination.upload_error = MigrationError("destination_unavailable", http_status=503)
@@ -196,19 +156,15 @@ def test_point_retry_error_starts_cooldown_before_the_queue_continues(direct_mig
     assert store.entry(entry["id"])["state"] == "failed"
     assert not store.entry(entry["id"])["point_retry_requested"]
     assert store.get(job_id)["state"] == "running"
-    assert runner._file_cooldown.remaining(job_id) == 20
     directory = next(e for e in store.entries(job_id) if e["kind"] == "dir")
-    runner.step(job_id)
-    assert store.entry(directory["id"])["state"] == "planned"
-    clock.advance(20)
     runner.step(job_id)
     assert store.entry(directory["id"])["state"] == "done"
 
 
-def test_publication_failure_waits_before_the_next_root(public_migration):
+def test_publication_failure_allows_next_root_immediately(public_migration):
     store, registry, runner, old_id, source, destination = public_migration
     config = dict(store.get(old_id)["config"], source_path="disk:/", retry_enabled=False)
-    job_id = store.create(config, "paced-publication-error")["id"]
+    job_id = store.create(config, "skipped-publication")["id"]
     registry.put(job_id, config, registry.get(old_id))
     nodes = [dict(META, path="disk:/a.txt"), dict(META, path="disk:/b.txt")]
     source.walk = lambda path: nodes
@@ -224,18 +180,8 @@ def test_publication_failure_waits_before_the_next_root(public_migration):
             raise MigrationError("source_public_access_denied", http_status=403)
         return original(node, **kwargs)
     source.ensure_publication = publish
-    clock = FakeClock()
-    runner._file_cooldown = FileCooldown(seconds=20, monotonic=clock.monotonic)
     runner.step(job_id)
     store.update_job(job_id, state="running")
-    runner.step(job_id)
-    assert calls == ["disk:/a.txt"]
-    assert destination.uploads == 0
-    for _ in range(5):
-        runner.step(job_id)
-    assert calls == ["disk:/a.txt"]
-    assert len(stage_events(store, job_id, "file_pause")) == 1
-    clock.advance(20)
     runner.step(job_id)
     assert calls == ["disk:/a.txt", "disk:/b.txt"]
     assert destination.uploads == 1
@@ -243,33 +189,8 @@ def test_publication_failure_waits_before_the_next_root(public_migration):
     assert store.get(job_id)["state"] == "completed_with_issues"
 
 
-def test_each_skipped_error_logs_a_new_wait(paced_errors):
-    migration, clock = paced_errors
-    store, _, runner, job_id, source, _ = migration
-    fail_first(migration, "source")
-    runner.step(job_id)
-    assert len(stage_events(store, job_id, "file_pause")) == 1
-    clock.advance(20)
-
-    def chunks(path):
-        raise MigrationError("source_timeout", http_status=504)
-        yield
-    source.chunks = chunks
-    runner.step(job_id)
-    third = store.add_entries(job_id, [{
-        "kind": "dir", "source_path": "disk:/Docs/later",
-        "destination_path": "disk:/owner/Docs/later", "size": 0,
-    }], append=True)[0]
-    runner.step(job_id)
-    assert store.entry(third)["state"] == "planned"
-    waits = stage_events(store, job_id, "file_pause")
-    assert len(waits) == 2
-    assert [event["payload"]["retry_delay_ms"] for event in waits] == [20000, 20000]
-
-
-def test_failed_directory_and_subtree_wait_before_next_directory(paced_errors):
-    migration, clock = paced_errors
-    store, _, runner, job_id, _, destination = migration
+def test_failed_subtree_allows_next_directory_immediately(two_files_no_retries):
+    store, _, runner, job_id, _, destination = two_files_no_retries
     original = destination.ensure_dir
 
     def ensure_dir(path):
@@ -284,19 +205,14 @@ def test_failed_directory_and_subtree_wait_before_next_directory(paced_errors):
         "destination_path": "disk:/owner/Elsewhere", "size": 0,
     }], append=True)[0]
     runner.step(job_id)
-    assert store.entry(other)["state"] == "planned"
-    assert "disk:/owner/Elsewhere" not in destination.nodes
-    clock.advance(20)
-    runner.step(job_id)
     assert store.entry(other)["state"] == "done"
     runner.step(job_id)
     assert store.get(job_id)["state"] == "completed_with_issues"
 
 
-def test_accepted_operation_is_polled_during_error_cooldown(paced_errors):
-    migration, _ = paced_errors
-    store, _, runner, job_id, _, destination = migration
-    fail_first(migration, "source")
+def test_accepted_operation_is_polled_after_a_skipped_error(two_files_no_retries):
+    store, _, runner, job_id, _, destination = two_files_no_retries
+    fail_first(two_files_no_retries, "source")
     second = next(e for e in store.entries(job_id) if e["source_path"].endswith("b.txt"))
     attempt = store.new_attempt(second["id"], "staged")
     store.update_attempt(attempt["id"], phase="waiting_transfer", operation_id="op-1")

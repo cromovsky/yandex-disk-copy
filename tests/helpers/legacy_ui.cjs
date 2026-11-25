@@ -163,7 +163,7 @@ async function loadUi(config = { cross_org: true }, { delayConfig = false, failC
     },
   };
   const windowListeners = {};
-  const window = {localStorage: storage, addEventListener(name, handler) { (windowListeners[name] ||= []).push(handler); },
+  const window = {localStorage: storage, confirm() {return true;}, addEventListener(name, handler) { (windowListeners[name] ||= []).push(handler); },
     dispatchEvent(event) { for (const handler of windowListeners[event.type] || []) handler(event); }};
   const context = {
     document, window, navigator: {}, Event: class { constructor(type) { this.type = type; } },

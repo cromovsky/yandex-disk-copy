@@ -26,7 +26,7 @@ from .disk_copy import (
 )
 from .throttle import READ_RPS, WRITE_RPS, TOTAL_RPS
 from .run_journal import JournalError, Redactor, RunJournal, normalize_event, now
-from .migration.api import router as onprem_router
+from .migration.api import personal_available, router as onprem_router, shared_service_available
 from .migration.worker import MigrationService, enabled as onprem_enabled
 from .retry_policy import RetryPolicy
 from .source_slots import SOURCE_SLOTS
@@ -36,6 +36,7 @@ from .source_batches.service import BatchService
 STATIC_DIR = Path(__file__).parent / "static"
 INSTRUCTION_MD = Path(__file__).parent.parent / "docs" / "INSTRUCTION.md"
 ONPREM_INSTRUCTION_MD = INSTRUCTION_MD.with_name("ONPREM.md")
+ONPREM_ACCESS_MD = INSTRUCTION_MD.with_name("ONPREM_ACCESS.md")
 
 BATCH_MAX_PAIRS = 25
 BATCH_CONCURRENCY = 5
@@ -89,7 +90,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.include_router(onprem_router)
 app.include_router(source_batches_router)
 
-# Справка включает тот же runbook, который доступен отдельно в docs/ONPREM.md.
 _instruction_html: Optional[str] = None
 
 
@@ -100,19 +100,22 @@ def _render_instruction() -> str:
             _instruction_html = "<p>Инструкция недоступна.</p>"
         else:
             text = INSTRUCTION_MD.read_text(encoding="utf-8")
-            marker = "<!-- onprem-instruction -->"
-            if marker in text:
-                if ONPREM_INSTRUCTION_MD.exists():
-                    runbook = ONPREM_INSTRUCTION_MD.read_text(encoding="utf-8")
-                else:
-                    runbook = "Инструкция по переносу в on-premises недоступна."
-                text = text.replace(marker, runbook)
-                text = text.replace(
-                    "[onprem-guide]: ONPREM.md", "[onprem-guide]: #onprem-guide"
-                )
-            _instruction_html = markdown.markdown(
-                text, extensions=["tables", "fenced_code", "sane_lists"]
+            for marker, path, fallback in (
+                ("<!-- onprem-instruction -->", ONPREM_INSTRUCTION_MD,
+                 "Инструкция по переносу в on-premises недоступна."),
+                ("<!-- onprem-access -->", ONPREM_ACCESS_MD,
+                 '<p id="onprem-access">Инструкция по доступам On-premises недоступна.</p>'),
+            ):
+                if marker in text:
+                    text = text.replace(marker, path.read_text(encoding="utf-8") if path.is_file() else fallback)
+            rendered = markdown.markdown(
+                text, extensions=["tables", "fenced_code", "sane_lists", "md_in_html"]
             )
+            # Links between the Markdown files open chapters inside the same help dialog.
+            rendered = rendered.replace('href="ONPREM.md"', 'href="#onprem-guide"')
+            for path in (INSTRUCTION_MD, ONPREM_INSTRUCTION_MD, ONPREM_ACCESS_MD):
+                rendered = rendered.replace(f'href="{path.name}#', 'href="#')
+            _instruction_html = rendered
     return _instruction_html
 
 
@@ -475,6 +478,11 @@ def config() -> dict:
     return {
         "cross_org": val not in ("0", "false", "no", "off"),
         "onprem_enabled": onprem_enabled(),
+        "onprem_personal_service_application_available": personal_available(
+            getattr(app.state, "onprem", None), "service_application",
+        ),
+        "onprem_personal_available": personal_available(getattr(app.state, "onprem", None), "admin_token"),
+        "onprem_shared_service_application_available": shared_service_available(getattr(app.state, "onprem", None)),
         "onprem_auth_required": bool(os.environ.get("ONPREM_ADMIN_TOKEN")),
         "batch_max_pairs": BATCH_MAX_PAIRS,
         "batch_concurrency": BATCH_CONCURRENCY,

@@ -3,7 +3,6 @@
 import pytest
 
 from app.disk_copy import CopyError
-from app.file_cooldown import FileCooldown
 from app.migration.errors import MigrationError
 from tests import test_source_batches as batch_fixtures
 from tests.fake_clock import FakeClock
@@ -12,11 +11,6 @@ from tests.test_disk_copy import make_copier
 from tests.test_source_batches import BODY, MD5, FakeSource, create, finish_plan
 
 setup_service = batch_fixtures.setup_service
-
-
-@pytest.fixture(autouse=True)
-def file_pause_enabled(monkeypatch):
-    monkeypatch.setattr("app.file_cooldown.FILE_PAUSE_SECONDS", 20)
 
 
 class Log:
@@ -32,7 +26,7 @@ class Log:
 
 @pytest.mark.parametrize("destination", ["personal", "shared"])
 @pytest.mark.parametrize("retry_enabled", [False, True])
-def test_legacy_consecutive_errors_space_next_transfer_only_when_retries_disabled(
+def test_legacy_consecutive_errors_allow_next_transfer_immediately(
     destination, retry_enabled,
 ):
     clock, log = FakeClock(), Log()
@@ -67,20 +61,18 @@ def test_legacy_consecutive_errors_space_next_transfer_only_when_retries_disable
         copier._public_download_href = lambda *args: "https://example.invalid/file"
         copier._vd_upload_from_url = copy
         copier.save_to_shared()
-    assert [when for _, when in calls] == (
-        [1000, 1020, 1040] if not retry_enabled else [1000, 1000, 1000]
-    )
+    assert calls == [("one.txt", 1000), ("two.txt", 1000), ("last.txt", 1000)]
+    assert clock.sleeps == []
     assert len(copier.fails) == 2 and len(copier.links) == 1
     if not retry_enabled:
         errors = [e for e in log.events if e.get("retry_enabled") is False]
         assert len(errors) == 2
         assert all(e["attempt"] == 1 and e["http_status"] == 503
                    and e["error_side"] == "source" for e in errors)
-        assert clock.sleeps == [20, 20]
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_single_local_errors_wait_before_next_download(tmp_path, shared):
+def test_single_local_errors_allow_next_download_immediately(tmp_path, shared):
     clock = FakeClock()
     copier = make_copier(FakeSession({}), clock=clock)
     copier.cfg.local_save, copier.cfg.local_root = True, str(tmp_path)
@@ -101,9 +93,9 @@ def test_single_local_errors_wait_before_next_download(tmp_path, shared):
 
     copier._download_to_path = download
     copier.save_local()
-    assert calls == [1000, 1020, 1040]
+    assert calls == [1000, 1000, 1000]
     assert len(copier.fails) == 2 and len(copier.links) == 1
-    assert clock.sleeps == [20, 20]
+    assert clock.sleeps == []
 
 
 def local_errors(service, clock):
@@ -122,7 +114,6 @@ def local_errors(service, clock):
             yield BODY
 
     service.source_factory = Source
-    service._file_cooldown = FileCooldown(seconds=20, monotonic=clock.monotonic)
     detail = finish_plan(service, create(service))
     batch_id, source_id = detail["batch"]["id"], detail["sources"][0]["id"]
     service.set_retry_enabled(batch_id, False)
@@ -137,12 +128,12 @@ def local_errors(service, clock):
     return batch_id, source_id, Source.calls
 
 
-def test_local_csv_errors_pause_then_continue_and_preserve_diagnostics(setup_service):
+def test_local_csv_continues_after_skipped_errors_without_waiting(setup_service):
     service, _ = setup_service
     clock = FakeClock()
     batch_id, source_id, calls = local_errors(service, clock)
     service._transfer_one(source_id)
-    assert calls == [1000, 1020, 1040]
+    assert calls == [1000, 1000, 1000]
     entries = service.entries(source_id)["entries"]
     assert [e["state"] for e in entries] == ["failed", "failed", "done"]
     assert [e["attempts"] for e in entries] == [1, 1, 1]
@@ -151,27 +142,10 @@ def test_local_csv_errors_pause_then_continue_and_preserve_diagnostics(setup_ser
                if e["status"] == "skipped" and e.get("retry_enabled") is False]
     assert len(skipped) == 2
     assert all(e["http_status"] == 503 and e["error_side"] == "source" for e in skipped)
-    assert clock.sleeps == [20, 20]
+    assert clock.sleeps == []
 
 
-@pytest.mark.parametrize("action", ["pause", "stop"])
-def test_local_csv_error_pause_is_interruptible(setup_service, action):
-    service, _ = setup_service
-    clock = FakeClock()
-    batch_id, source_id, calls = local_errors(service, clock)
-
-    def interrupt(seconds, checkpoint):
-        getattr(service, action)(batch_id)
-        checkpoint()
-
-    service._delay = interrupt
-    service._transfer_one(source_id)
-    assert calls == [1000]
-    assert service.entries(source_id)["entries"][0]["state"] == "failed"
-    assert service.store.get(batch_id)["state"] == ("paused" if action == "pause" else "stopped")
-
-
-def test_single_local_error_waits_before_next_existing_object(tmp_path):
+def test_single_local_checks_existing_file_immediately_after_error(tmp_path):
     clock, log = FakeClock(), Log()
     copier = make_copier(FakeSession({}), clock=clock)
     copier.cfg.local_save, copier.cfg.local_root = True, str(tmp_path)
@@ -193,6 +167,6 @@ def test_single_local_error_waits_before_next_existing_object(tmp_path):
     copier.save_local()
     existing = [(event, when) for event, when in events
                 if event.get("stage") == "check_local" and event.get("status") == "skipped"]
-    assert existing and existing[0][1] == 1020
-    assert clock.sleeps == [20]
+    assert existing and existing[0][1] == 1000
+    assert clock.sleeps == []
     assert len(copier.fails) == 1 and len(copier.skipped) == 1

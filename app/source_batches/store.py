@@ -14,17 +14,75 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from app.migration.destination import account_uid, account_upn, bound_oauth_url, normalize_destination_url
+from app.migration.errors import MigrationError
 from app.migration.runner import disk_path
 from app.run_journal import normalize_event, now
 
+MAX_CSV_BYTES = 2 * 1024**2
 COMMON_KEYS = {"source_org_id", "source_client_id", "page_limit", "retry_enabled"}
 ONPREM_KEYS = {"destination_url", "destination_identity", "destination_vd_hash",
                "destination_type", "destination_base", "identity_confirmed", "strategy"}
+SERVICE_KEYS = {"destination_auth", "destination_oauth_url", "destination_client_id"}
+PERSONAL_KEYS = {"destination_url", "destination_type", "strategy"} | SERVICE_KEYS
 
 
-def parse_sources(content):
-    if not isinstance(content, str) or len(content.encode("utf-8")) > 2 * 1024**2:
+class SourcesCsvError(ValueError):
+    def __init__(self, code, csv_row=None):
+        super().__init__(code)
+        self.csv_row = csv_row
+
+
+def _personal_sources(content):
+    records = filter(None, csv.reader(io.StringIO(content.removeprefix("\ufeff"), newline=""), strict=True))
+    result = []
+    row_number = None
+    try:
+        header = next(records, [])
+        fields = set(header)
+        required = {"source_email", "destination_email"}
+        if (not required <= fields or fields - required - {"path", "destination_folder"}
+                or len(fields) != len(header)):
+            raise SourcesCsvError("invalid_sources_columns")
+        while True:
+            row_number = len(result) + 1
+            values = next(records, None)
+            if values is None:
+                break
+            if len(values) != len(header) or len(result) >= 1000:
+                raise SourcesCsvError("invalid_sources_row", row_number)
+            row = dict(zip(header, values))
+            for key in ("source_email", "destination_email"):
+                row[key] = row[key].strip()
+                if not account_upn(row[key]) or len(row[key].encode("utf-8")) > 254:
+                    raise SourcesCsvError("invalid_sources_row", row_number)
+            for key in ("path", "destination_folder"):
+                path = row.get(key) or "/"
+                if not path.startswith(("/", "disk:/")):
+                    raise SourcesCsvError("invalid_disk_path", row_number)
+                try:
+                    row[key] = disk_path(path)
+                except ValueError:
+                    raise SourcesCsvError("invalid_disk_path", row_number) from None
+                if len(row[key].encode("utf-8")) > 4096:
+                    raise SourcesCsvError("invalid_disk_path", row_number)
+            row.update(type="personal", email=row.pop("source_email"), vd_hash="", csv_row=row_number)
+            result.append(row)
+    except csv.Error:
+        raise SourcesCsvError("invalid_sources_columns" if row_number is None else "invalid_sources_row",
+                              row_number) from None
+    if not result:
+        raise SourcesCsvError("empty_source_list")
+    return result
+
+
+def parse_sources(content, *, personal=False):
+    if not isinstance(content, str) or len(content) > MAX_CSV_BYTES or len(content.encode("utf-8")) > MAX_CSV_BYTES:
+        if personal:
+            raise SourcesCsvError("invalid_sources_csv")
         raise ValueError("invalid_sources_csv")
+    if personal:
+        return _personal_sources(content)
     reader = csv.DictReader(io.StringIO(content.lstrip("\ufeff")))
     if reader.fieldnames != ["type", "email", "vd_hash", "path"]:
         raise ValueError("invalid_sources_columns")
@@ -57,8 +115,15 @@ def parse_sources(content):
 
 
 def clean_config(mode, config):
-    keys = COMMON_KEYS | (ONPREM_KEYS if mode == "onprem" else set())
-    if mode not in {"local", "onprem"} or not isinstance(config, dict) or set(config) - keys:
+    if mode not in {"local", "onprem"} or not isinstance(config, dict):
+        raise ValueError("invalid_batch_config")
+    personal = mode == "onprem" and config.get("destination_type") == "personal"
+    shared_service = (config.get("destination_type") == "shared"
+                      and config.get("destination_auth") == "service_application" and mode == "onprem")
+    keys = COMMON_KEYS | (PERSONAL_KEYS if personal else ONPREM_KEYS if mode == "onprem" else set())
+    if shared_service:
+        keys |= SERVICE_KEYS
+    if set(config) - keys:
         raise ValueError("invalid_batch_config")
     value = dict(config)
     if "retry_enabled" in value and type(value["retry_enabled"]) is not bool:
@@ -71,21 +136,33 @@ def clean_config(mode, config):
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
         raise ValueError("invalid_page_limit")
     if mode == "onprem":
-        if value.get("strategy", "staged") != "staged":
+        if value.setdefault("strategy", "staged") != "staged":
             raise ValueError("onprem_staged_required")
-        from app.migration.destination import normalize_destination_url
+        if personal or shared_service:
+            client_id = value.get("destination_client_id")
+            if (value.get("destination_auth") != "service_application"
+                    or not isinstance(client_id, str) or not 1 <= len(client_id) <= 256
+                    or re.search(r"[\s/:\\\x00-\x1f\x7f]", client_id)):
+                raise ValueError("invalid_personal_destination" if personal else "invalid_batch_destination")
+            try:
+                value["destination_oauth_url"] = bound_oauth_url(value)
+            except MigrationError as exc:
+                raise ValueError(exc.code) from None
         value["destination_url"] = normalize_destination_url(value.get("destination_url", ""))
+        if personal:
+            return value
         identity = value.get("destination_identity", "")
         vd = value.get("destination_vd_hash", "")
+        needs_manual_confirmation = not shared_service
         if (not isinstance(identity, str) or not identity or len(identity) > 256
                 or any(ord(c) < 32 for c in identity)
                 or not isinstance(vd, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", vd)
-                or value.get("identity_confirmed") is not True
+                or (shared_service and not account_upn(identity))
+                or value.setdefault("identity_confirmed", False) is not needs_manual_confirmation
                 or value.get("destination_type", "shared") != "shared"
                 or value.get("destination_base", "disk:/") not in {"/", "disk:/"}):
             raise ValueError("invalid_batch_destination")
         value.update(destination_type="shared", destination_base="disk:/")
-        value.setdefault("strategy", "staged")
     return value
 
 
@@ -109,12 +186,13 @@ class BatchStore:
                 mode TEXT NOT NULL, config TEXT NOT NULL, state TEXT NOT NULL,
                 phase TEXT NOT NULL DEFAULT 'access', resume_state TEXT,
                 error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                started INTEGER NOT NULL DEFAULT 0
+                started INTEGER NOT NULL DEFAULT 0, mapping_issues TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS sources (
                 id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(id),
                 position INTEGER NOT NULL, type TEXT NOT NULL, email TEXT NOT NULL,
                 vd_hash TEXT NOT NULL, path TEXT NOT NULL, folder TEXT,
+                destination_email TEXT, destination_folder TEXT, csv_row INTEGER,
                 selected INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'pending',
                 plan_complete INTEGER NOT NULL DEFAULT 0, child_job_id TEXT,
                 journal_id TEXT, error TEXT, summary TEXT NOT NULL DEFAULT '{}'
@@ -138,7 +216,36 @@ class BatchStore:
         if "selected" not in columns:
             self.db.execute("ALTER TABLE entries ADD COLUMN selected INTEGER "
                             "NOT NULL DEFAULT 1 CHECK(selected IN (0,1))")
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sources)")}
+        for name, sql_type in (("destination_email", "TEXT"), ("destination_folder", "TEXT"),
+                               ("csv_row", "INTEGER")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE sources ADD COLUMN {name} {sql_type}")
+        batch_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(batches)")}
+        if "mapping_issues" not in batch_columns:
+            self.db.execute("ALTER TABLE batches ADD COLUMN mapping_issues TEXT NOT NULL DEFAULT '{}'")
+        if "shared_operator_uid" not in batch_columns:
+            self.db.execute("ALTER TABLE batches ADD COLUMN shared_operator_uid TEXT")
         self.db.commit()
+        self._upgrade_personal_row_numbers()
+
+    def _upgrade_personal_row_numbers(self):
+        with self.db as db:
+            db.execute("BEGIN IMMEDIATE")
+            # Older personal lists counted the header and blank lines, so their first record was always >= 2.
+            batches = db.execute("SELECT batch_id FROM sources WHERE position=0 AND csv_row>1").fetchall()
+            for (batch_id,) in batches:
+                batch = db.execute("SELECT mapping_issues FROM batches WHERE id=?", (batch_id,)).fetchone()
+                issues = json.loads(batch["mapping_issues"])
+                if issues:
+                    record_numbers = dict(db.execute(
+                        "SELECT csv_row, position+1 FROM sources WHERE batch_id=?", (batch_id,)
+                    ))
+                    for issue in issues.values():
+                        if "conflict_rows" in issue:
+                            issue["conflict_rows"] = [record_numbers[n] for n in issue["conflict_rows"]]
+                    db.execute("UPDATE batches SET mapping_issues=? WHERE id=?", (json.dumps(issues), batch_id))
+                db.execute("UPDATE sources SET csv_row=position+1 WHERE batch_id=?", (batch_id,))
 
     @contextmanager
     def connection(self):
@@ -152,6 +259,9 @@ class BatchStore:
         result = dict(row)
         result.pop("idempotency_key", None)
         result["config"] = json.loads(result["config"])
+        if result["mode"] == "onprem":
+            result["config"].setdefault("destination_type", "shared")
+        result["mapping_issues"] = json.loads(result["mapping_issues"])
         result["started"] = bool(result["started"])
         return result
 
@@ -174,8 +284,11 @@ class BatchStore:
             if previous:
                 old = self._batch(previous)
                 previous_sources = self.sources(old["id"])
+                fields = ("type", "email", "vd_hash", "path")
+                if config.get("destination_type") == "personal":
+                    fields += ("destination_email", "destination_folder", "csv_row")
                 if old["mode"] != mode or {k: v for k, v in old["config"].items() if k != "retry_enabled"} != {k: v for k, v in config.items() if k != "retry_enabled"} or [
-                    {k: s[k] for k in ("type", "email", "vd_hash", "path")} for s in previous_sources
+                    {k: s[k] for k in fields} for s in previous_sources
                 ] != sources:
                     raise ValueError("idempotency_conflict")
                 return old
@@ -183,9 +296,10 @@ class BatchStore:
             db.execute("INSERT INTO batches(id,idempotency_key,mode,config,state,created_at,updated_at) "
                        "VALUES(?,?,?,?,'draft',?,?)",
                        (batch_id, key, mode, json.dumps(config), timestamp, timestamp))
-            db.executemany("INSERT INTO sources(id,batch_id,position,type,email,vd_hash,path) "
-                           "VALUES(?,?,?,?,?,?,?)", [
-                               (uuid.uuid4().hex, batch_id, i, s["type"], s["email"], s["vd_hash"], s["path"])
+            db.executemany("INSERT INTO sources(id,batch_id,position,type,email,vd_hash,path,"
+                           "destination_email,destination_folder,csv_row) VALUES(?,?,?,?,?,?,?,?,?,?)", [
+                               (uuid.uuid4().hex, batch_id, i, s["type"], s["email"], s["vd_hash"], s["path"],
+                                s.get("destination_email"), s.get("destination_folder"), s.get("csv_row"))
                                for i, s in enumerate(sources)
                            ])
             return self.get(batch_id)
@@ -223,6 +337,16 @@ class BatchStore:
             ).fetchone()
             return self._batch(row) if row is not None else None
 
+    def bind_shared_operator(self, batch_id, uid):
+        if not isinstance(uid, str) or account_uid(uid) != uid:
+            raise ValueError("destination_identity_unverified")
+        with self.connection() as db:
+            # Concurrent Dry Runs for the same shared Disk must agree on the operator.
+            if not db.execute("UPDATE batches SET shared_operator_uid=? WHERE id=? "
+                              "AND (shared_operator_uid IS NULL OR shared_operator_uid=?)",
+                              (uid, batch_id, uid)).rowcount:
+                raise ValueError("destination_identity_mismatch")
+
     def sources(self, batch_id):
         self.get(batch_id)
         with self.lock:
@@ -234,8 +358,10 @@ class BatchStore:
             return self._source(self.db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone())
 
     def update(self, batch_id, **fields):
-        if not fields or set(fields) - {"state", "phase", "resume_state", "error", "started"}:
+        if not fields or set(fields) - {"state", "phase", "resume_state", "error", "started", "mapping_issues"}:
             raise ValueError("invalid_batch_update")
+        if "mapping_issues" in fields:
+            fields["mapping_issues"] = json.dumps(fields["mapping_issues"])
         with self.connection() as db:
             db.execute("UPDATE batches SET " + ",".join(k + "=?" for k in fields) +
                        ",updated_at=? WHERE id=?", (*fields.values(), now(), batch_id))

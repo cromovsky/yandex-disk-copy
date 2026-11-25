@@ -84,7 +84,7 @@ class SaasDiskSource:
         return True
 
     def _request(self, method, url, *, max_attempts=MAX_ATTEMPTS,
-                 checkpoint=None, **kwargs):
+                 checkpoint=None, before_send=None, **kwargs):
         checkpoint = checkpoint or self.checkpoint
         generation = (self.retry_policy.cancellation_generation
                       if self.retry_policy is not None else None)
@@ -114,10 +114,12 @@ class SaasDiskSource:
             if previous_response is not None:
                 previous_response.close()
                 previous_response = None
+            if before_send is not None:
+                before_send()
             try:
                 response = self.session.request(method, url, **kwargs)
             except requests.RequestException as exc:
-                if checkpoint is not None:
+                if checkpoint is not None and before_send is None:
                     checkpoint()
                 code = ("source_timeout" if isinstance(exc, requests.Timeout) else
                         "source_connection_failed" if isinstance(
@@ -138,7 +140,7 @@ class SaasDiskSource:
                     delay = random.uniform(0, backoff_delay(attempt))
                 cooldown = self.limiter.penalize(delay)
             try:
-                if checkpoint is not None:
+                if checkpoint is not None and before_send is None:
                     checkpoint()
             except BaseException:
                 response.close()
@@ -398,6 +400,50 @@ class SaasDiskSource:
             raise MigrationError("source_invalid_response")
         return result
 
+    def _folder_page(self, folder, offset, limit, fields):
+        try:
+            payload = self._api_get(self._resource_endpoint(), {
+                "path": self._source_path(folder), "limit": limit, "offset": offset,
+                "sort": "path", "fields": "_embedded.total," + ",".join(
+                    "_embedded.items." + key for key in fields.split(",")
+                ),
+            })
+            embedded = payload.get("_embedded")
+            if not isinstance(embedded, dict):
+                raise MigrationError("source_invalid_response")
+            total, items = embedded.get("total"), embedded.get("items")
+            if (type(total) is not int or total < 0 or not isinstance(items, list)
+                    or len(items) > limit or (not items and offset < total)):
+                raise MigrationError("source_invalid_response")
+            entries = []
+            prefix = folder.rstrip("/") + "/"
+            for item in items:
+                if not isinstance(item, dict):
+                    raise MigrationError("source_invalid_response")
+                entry = self._metadata(item)
+                if not entry["path"].startswith(prefix):
+                    raise MigrationError("source_invalid_response", source_path=entry["path"])
+                relative = entry["path"][len(prefix):]
+                if not relative or "/" in relative:
+                    raise MigrationError("source_changed", source_path=entry["path"])
+                entries.append(entry)
+            return entries, total
+        except MigrationError as exc:
+            if not exc.source_path:
+                exc.source_path = folder
+            raise
+
+    def browse(self, path, offset):
+        folder = disk_path(path)
+        entries, total = self._folder_page(folder, offset, 100, "type,path")
+        end = offset + len(entries)
+        return {
+            "path": folder,
+            "items": [{"name": entry["path"].rsplit("/", 1)[-1],
+                       "path": entry["path"], "type": entry["type"]} for entry in entries],
+            "next_offset": end if end < total else None,
+        }
+
     def walk(self, path):
         root = self.stat(path)
         if root["path"] != "disk:/":
@@ -410,46 +456,10 @@ class SaasDiskSource:
             folder = pending.popleft()
             offset = 0
             while True:
-                try:
-                    payload = self._api_get(self._resource_endpoint(), {
-                        "path": self._source_path(folder), "limit": self.page_limit, "offset": offset,
-                        "sort": "path", "fields": (
-                            "_embedded.total," + ",".join(
-                                "_embedded.items." + key
-                                for key in RESOURCE_FIELDS.split(",")
-                            )
-                        ),
-                    })
-                except MigrationError as exc:
-                    exc.source_path = folder
-                    raise
-                embedded = payload.get("_embedded")
-                if not isinstance(embedded, dict):
-                    raise MigrationError("source_invalid_response", source_path=folder)
-                total, items = embedded.get("total"), embedded.get("items")
-                if (
-                    not isinstance(total, int) or isinstance(total, bool) or total < 0
-                    or not isinstance(items, list) or (not items and offset < total)
-                ):
-                    raise MigrationError("source_invalid_response", source_path=folder)
-                for item in items:
-                    if not isinstance(item, dict):
-                        raise MigrationError("source_invalid_response",
-                                             source_path=folder)
-                    try:
-                        entry = self._metadata(item)
-                    except MigrationError as exc:
-                        if not exc.source_path:
-                            exc.source_path = folder
-                        raise
-                    prefix = folder.rstrip("/") + "/"
-                    if not entry["path"].startswith(prefix):
-                        raise MigrationError("source_invalid_response",
-                                             source_path=entry["path"])
-                    relative = entry["path"][len(prefix):]
-                    if "/" in relative or not relative or entry["path"] in seen:
-                        raise MigrationError("source_changed",
-                                             source_path=entry["path"])
+                items, total = self._folder_page(folder, offset, self.page_limit, RESOURCE_FIELDS)
+                for entry in items:
+                    if entry["path"] in seen:
+                        raise MigrationError("source_changed", source_path=entry["path"])
                     seen.add(entry["path"])
                     yield entry
                     if entry["type"] == "dir":
@@ -533,9 +543,11 @@ class SaasDiskSource:
                 response = self._request(
                     "PUT", API + "/resources/publish", params={"path": path},
                     headers={"Authorization": "OAuth " + token},
-                    max_attempts=1, checkpoint=checkpoint,
+                    max_attempts=1, before_send=checkpoint,
                 )
             except MigrationError as exc:
+                if getattr(exc, "_migration_stage", "") == "check_destination_access":
+                    raise
                 self._unknown_publications.add(path)
                 raise MigrationError("source_publication_outcome_unknown",
                                      uncertain=True, diagnostics=exc.diagnostics) from None

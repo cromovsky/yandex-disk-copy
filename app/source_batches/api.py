@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from app.migration.api import MigrationRoute, require_access
+from .store import MAX_CSV_BYTES, SourcesCsvError
 
 router = APIRouter(prefix="/api/source-batches", route_class=MigrationRoute)
 
@@ -20,6 +22,8 @@ class StrictModel(BaseModel):
 class Credentials(StrictModel):
     source_client_secret: SecretStr
     destination_token: SecretStr | None = None
+    destination_client_secret: SecretStr | None = None
+    destination_owner_token: SecretStr | None = None
     source_admin_token: SecretStr | None = None
 
     def plain(self):
@@ -28,7 +32,7 @@ class Credentials(StrictModel):
 
 class CreateRequest(StrictModel):
     mode: Literal["local", "onprem"]
-    sources_csv: str = Field(min_length=1, max_length=2 * 1024**2)
+    sources_csv: str
     config: dict
     credentials: Credentials
     idempotency_key: str = Field(min_length=8, max_length=128)
@@ -88,6 +92,8 @@ def invoke(action, *args):
         return action(*args)
     except KeyError:
         raise HTTPException(404, "source_not_found") from None
+    except SourcesCsvError as exc:
+        raise HTTPException(422, {"code": str(exc), "csv_row": exc.csv_row}) from None
     except ValueError as exc:
         code = str(exc)
         if not code.replace("_", "").isalnum() or len(code) > 80:
@@ -99,8 +105,10 @@ def invoke(action, *args):
 async def create(request: Request):
     model = await body(request, CreateRequest)
     access(request, model.mode)
-    return invoke(service(request).create, model.mode, model.sources_csv, model.config,
-                  model.credentials.plain(), model.idempotency_key)
+    if model.config.get("destination_type") != "personal" and not 0 < len(model.sources_csv) <= MAX_CSV_BYTES:
+        raise HTTPException(422, "invalid_request")
+    return await run_in_threadpool(invoke, service(request).create, model.mode, model.sources_csv,
+                                   model.config, model.credentials.plain(), model.idempotency_key)
 
 
 @router.get("")
@@ -132,7 +140,7 @@ def start(request: Request, batch_id: str):
 async def retries(request: Request, batch_id: str):
     value = existing(request, batch_id)
     model = await body(request, RetryPolicyRequest)
-    return invoke(value.set_retry_enabled, batch_id, model.enabled)
+    return await run_in_threadpool(invoke, value.set_retry_enabled, batch_id, model.enabled)
 
 
 @router.post("/{batch_id}/pause")
@@ -155,7 +163,7 @@ def stop(request: Request, batch_id: str):
 async def credentials(request: Request, batch_id: str):
     value = existing(request, batch_id)
     model = await body(request, CredentialsRequest)
-    return invoke(value.attach_credentials, batch_id, model.credentials.plain())
+    return await run_in_threadpool(invoke, value.attach_credentials, batch_id, model.credentials.plain())
 
 
 @router.post("/{batch_id}/selection")
@@ -163,7 +171,7 @@ async def credentials(request: Request, batch_id: str):
 async def selection(request: Request, batch_id: str):
     value = existing(request, batch_id)
     model = await body(request, SelectionRequest)
-    return invoke(value.selection, batch_id, model.source_ids)
+    return await run_in_threadpool(invoke, value.selection, batch_id, model.source_ids)
 
 
 def source_access(request, batch_id, source_id):
@@ -193,7 +201,7 @@ def entries(request: Request, batch_id: str, source_id: str,
 async def entry_selection(request: Request, batch_id: str, source_id: str, entry_id: str):
     value = source_access(request, batch_id, source_id)
     model = await body(request, EntrySelectionRequest)
-    return invoke(value.entry_selection, batch_id, source_id, entry_id, model.selected)
+    return await run_in_threadpool(invoke, value.entry_selection, batch_id, source_id, entry_id, model.selected)
 
 
 def csv_response(value, batch_id, journal):

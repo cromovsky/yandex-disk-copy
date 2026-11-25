@@ -75,7 +75,7 @@ async function setup({mode = "single", state = "ready", editable = true, planCom
   const script = mode === "single" ? "onprem.js" : "source-batches.js";
   vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, "../app/static", script), "utf8"), {
     document: ui.document, window: ui.window, fetch, URL, Blob, crypto, Uint8Array, console,
-    CustomEvent: class {constructor(type, options) {this.type = type; this.detail = options.detail;}},
+    CustomEvent: class {constructor(type, options = {}) {this.type = type; this.detail = options.detail;}},
     Event: class {constructor(type) {this.type = type;}}, setTimeout() {return 1;}, clearTimeout() {},
   });
   await flush();
@@ -170,7 +170,8 @@ for (const mode of ["single", "local", "onprem"]) {
     await ui.toggle(1, false); assert.equal(ui.calls.some((call) => call.method === "POST"), false);
     const field = ui.byId.get(mode === "local" ? "local_orgid" : "onprem-source-org");
     field.value = "other-org"; await field.fire("input");
-    assert.equal(ui.checkbox().disabled, true);
+    if (mode === "onprem") assert.equal(ui.get("details").hidden, true);
+    else assert.equal(ui.checkbox().disabled, true);
     await ui.toggle(0, false); assert.equal(ui.calls.some((call) => call.method === "POST"), false);
   });
   test(`${mode}: all selected entries excluded disables Start after form credentials are restored`, async () => {

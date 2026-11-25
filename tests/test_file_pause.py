@@ -1,7 +1,6 @@
 import pytest
 
 from app.disk_copy import CopyError
-from app.file_cooldown import FileCooldown
 from tests import test_source_batches as batch_fixtures
 from tests.fake_clock import FakeClock
 from tests.fake_session import FakeSession
@@ -12,14 +11,9 @@ from tests.test_source_batches import BODY, MD5, FakeSource, create, finish_plan
 setup_service = batch_fixtures.setup_service
 
 
-@pytest.fixture(autouse=True)
-def _enable_file_pause(monkeypatch):
-    monkeypatch.setattr("app.file_cooldown.FILE_PAUSE_SECONDS", 20)
-
-
 @pytest.mark.parametrize("destination", ["personal", "shared"])
 @pytest.mark.parametrize("retry_enabled", [True, False])
-def test_legacy_queue_waits_twenty_seconds_after_success_and_continues(
+def test_legacy_queue_continues_immediately_after_success_or_skip(
     destination, retry_enabled,
 ):
     clock = FakeClock()
@@ -57,12 +51,6 @@ def test_legacy_queue_waits_twenty_seconds_after_success_and_continues(
         copier._disk_ensure_folder = lambda *args: None
         copier._save_one_link = copy
         copier.save_links()
-        assert calls == [
-            ("one.txt", 1000), ("bad.txt", 1020),
-            ("folder", 1020 if retry_enabled else 1040),
-            ("last.txt", 1040 if retry_enabled else 1060),
-        ]
-        assert clock.sleeps == ([20, 20] if retry_enabled else [20, 20, 20])
     else:
         copier._vd_ensure_folder_tree = lambda *args: None
         copier._collect_files_recursive = lambda path: list(nodes)
@@ -71,17 +59,14 @@ def test_legacy_queue_waits_twenty_seconds_after_success_and_continues(
         copier._public_download_href = lambda *args: "https://example.invalid/file"
         copier._vd_upload_from_url = copy
         copier.save_to_shared()
-        assert calls == [
-            ("one.txt", 1000), ("bad.txt", 1020),
-            ("last.txt", 1020 if retry_enabled else 1040),
-        ]
-        assert clock.sleeps == ([20] if retry_enabled else [20, 20])
+    assert calls == [(node["name"], 1000) for node in nodes]
+    assert clock.sleeps == []
     assert len(copier.fails) == 1
     assert len(copier.links) == len(nodes) - 1
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_single_local_save_waits_between_downloads_without_final_delay(
+def test_single_local_save_starts_each_download_immediately(
     tmp_path, shared,
 ):
     clock = FakeClock()
@@ -105,8 +90,8 @@ def test_single_local_save_waits_between_downloads_without_final_delay(
 
     copier._download_to_path = download
     copier.save_local()
-    assert [when for _, when in calls] == [1000, 1020, 1040]
-    assert clock.sleeps == [20, 20]
+    assert [when for _, when in calls] == [1000, 1000, 1000]
+    assert clock.sleeps == []
     assert len(copier.links) == 3
     assert not copier.fails
 
@@ -124,7 +109,6 @@ def _local_two_files(service, clock):
             yield BODY
 
     service.source_factory = Source
-    service._file_cooldown = FileCooldown(seconds=20, monotonic=clock.monotonic)
     detail = finish_plan(service, create(service))
     service.set_retry_enabled(detail["batch"]["id"], False)
     service.start_transfer(detail["batch"]["id"])
@@ -138,30 +122,34 @@ def _local_two_files(service, clock):
     return detail["batch"]["id"], detail["sources"][0]["id"], Source.calls
 
 
-def test_local_csv_continues_after_cooldown_with_retries_disabled(setup_service):
+def test_local_csv_downloads_consecutive_files_without_waiting(setup_service):
     service, _ = setup_service
     clock = FakeClock()
     batch_id, source_id, calls = _local_two_files(service, clock)
     service._transfer_one(source_id)
-    assert [when for _, when in calls] == [1000, 1020]
-    assert clock.sleeps == [20]
+    assert [when for _, when in calls] == [1000, 1000]
+    assert clock.sleeps == []
     assert service.store.source(source_id)["state"] == "completed"
     assert all(e["state"] == "done" for e in service.entries(source_id)["entries"])
 
 
 @pytest.mark.parametrize("action", ["pause", "stop"])
-def test_local_csv_control_during_cooldown_keeps_downloaded_file_done(
+def test_local_csv_pause_or_stop_between_files_keeps_downloaded_file_done(
     setup_service, action,
 ):
     service, _ = setup_service
     clock = FakeClock()
     batch_id, source_id, calls = _local_two_files(service, clock)
 
-    def interrupt(seconds, checkpoint):
-        getattr(service, action)(batch_id)
-        checkpoint()
+    next_entry = service.store.next_entry
 
-    service._delay = interrupt
+    def interrupt_at_next_entry(source_id):
+        entry = next_entry(source_id)
+        if entry and entry["source_path"] == "disk:/two.txt":
+            getattr(service, action)(batch_id)
+        return entry
+
+    service.store.next_entry = interrupt_at_next_entry
     service._transfer_one(source_id)
     entries = service.entries(source_id)["entries"]
     assert next(
@@ -172,12 +160,8 @@ def test_local_csv_control_during_cooldown_keeps_downloaded_file_done(
         "paused" if action == "pause" else "stopped"
     )
     if action == "pause":
-        def delay(seconds, checkpoint):
-            checkpoint()
-            clock.sleep(seconds)
-
-        service._delay = delay
+        service.store.next_entry = next_entry
         service.resume(batch_id)
         service._transfer_one(source_id)
-        assert [when for _, when in calls] == [1000, 1020]
+        assert [when for _, when in calls] == [1000, 1000]
         assert service.store.source(source_id)["state"] == "completed"

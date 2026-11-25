@@ -168,7 +168,7 @@ def test_schema_six_upgrade_preserves_all_history_paths_and_foreign_keys(tmp_pat
     assert reopened.get(job["id"])["remote_root"] == job["remote_root"]
     assert reopened.attempt(attempt["id"])["remote_path"] == attempt["remote_path"]
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert any(row[2:5] == ("attempts", "attempt_id", "id")
                    for row in connection.execute("PRAGMA foreign_key_list(entries)"))
@@ -205,13 +205,13 @@ def test_future_store_schema_is_rejected_without_mutation(tmp_path):
     store.create(shared_config(), "future-schema")
     store.close()
     with sqlite3.connect(store.path) as connection:
-        connection.execute("PRAGMA user_version=10")
+        connection.execute("PRAGMA user_version=12")
     before = database_rows(store.path)
     with pytest.raises(ValueError, match="^unsupported_store_version$"):
         MigrationStore(tmp_path)
     assert database_rows(store.path) == before
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
 
 
 def direct_unknown_attempt(store, *, phase="unknown_transfer"):
@@ -344,7 +344,8 @@ def test_publications_seed_only_selected_or_top_level_roots(
     assert store.get(job["id"])["config"] == value
 
 
-def test_publication_intent_and_events_survive_recover(tmp_path):
+@pytest.mark.parametrize("previous_version", [False, True])
+def test_publication_intent_and_events_survive_recover(tmp_path, previous_version):
     store = MigrationStore(tmp_path)
     job = store.create(
         shared_config(strategy="staged", source_public=True,
@@ -359,6 +360,10 @@ def test_publication_intent_and_events_survive_recover(tmp_path):
     assert event["type"] == "publication_checkpoint"
     assert event["payload"] == {"entry_id": entry_id, "phase": "intent", "error": None}
     store.close()
+    if previous_version:
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("ALTER TABLE publications DROP COLUMN denial")
+            connection.execute("PRAGMA user_version=10")
     reopened = MigrationStore(tmp_path)
     reopened.recover()
     assert reopened.publications(job["id"]) == before
@@ -494,7 +499,27 @@ def test_schema_four_upgrade_adds_publications_without_history_changes(tmp_path)
     assert reopened.events(job["id"]) == before_events
     assert reopened.publications(job["id"]) == []
     with sqlite3.connect(tmp_path / "jobs.db") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
+
+
+def test_v10_confirmed_publication_denial_counts_as_first_attempt(tmp_path):
+    store = MigrationStore(tmp_path)
+    source_path = file_entry()["source_path"]
+    job = store.create(shared_config(strategy="staged", source_public=True, source_path=source_path),
+                       "denied-v10")
+    entry_id, = store.add_entries(job["id"], [file_entry()])
+    store.update_publication(job["id"], entry_id, state="failed", error="source_publication_denied")
+    events = store.events(job["id"])
+    store.close()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("ALTER TABLE publications DROP COLUMN denial")
+        connection.execute("PRAGMA user_version=10")
+
+    reopened = MigrationStore(tmp_path)
+    root, = reopened.publications(job["id"])
+    assert (root["state"], root["publication_attempts"]) == ("failed", 1)
+    assert reopened.events(job["id"]) == events
+    reopened.close()
 
 
 def test_transfer_stage_context_keeps_historical_attempt_and_shared_paths(tmp_path):
@@ -611,7 +636,7 @@ def test_download_retry_migration_preserves_terminal_history(tmp_path, version):
     assert reopened.attempt(attempt["id"])["phase"] == "done"
     assert reopened.events(job["id"]) == before_events
     with sqlite3.connect(tmp_path / "jobs.db") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
 
 
 def test_download_retry_counter_wait_and_failure_survive_reopen(tmp_path):
@@ -923,7 +948,7 @@ def test_files_are_private_and_database_has_schema_and_integrity_constraints(tmp
     assert root.stat().st_mode & 0o777 == 0o700
     assert (root / "jobs.db").stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(root / "jobs.db") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         names = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'",
@@ -1101,7 +1126,7 @@ def test_stop_schema_migration_preserves_history_and_defaults(tmp_path, version)
     assert recovered["config"] == config()
     assert reopened.entries(job["id"]) == before
     with sqlite3.connect(tmp_path / "jobs.db") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
 
 
 @pytest.mark.parametrize("state", [
@@ -1215,7 +1240,7 @@ def test_schema_seven_upgrade_adds_full_stop_without_rewriting_history(tmp_path)
     assert reopened.get(job["id"])["stop_requested"] is True
     assert reopened.entry(entry["id"])["attempt_id"] == attempt["id"]
     with sqlite3.connect(tmp_path / "jobs.db") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
         assert connection.execute("SELECT id,config,state,revision,stop_requested "
                                   "FROM jobs").fetchall() == job_before
         for table, rows in history_before.items():
@@ -1606,7 +1631,7 @@ def test_schema_five_upgrade_keeps_unknown_history_and_retry_defaults(tmp_path):
     assert reopened.events(job["id"]) == before_events
     assert reopened.attempt(attempt["id"])["phase"] == "unknown_transfer"
     with sqlite3.connect(tmp_path / "jobs.db") as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
 
 
 @pytest.mark.parametrize("fields", [
@@ -1901,3 +1926,42 @@ def test_restart_replay_keeps_existing_historical_child_configuration(tmp_path):
         )
     assert store.restart(parent["id"], original, "historical-child") == child
     assert store.get(child["id"])["config"] == original
+
+
+def test_uid_and_plan_complete_commit_together_and_cannot_rebind(tmp_path):
+    from tests.test_migration_personal_execution import PERSONAL
+    store = MigrationStore(tmp_path)
+    job_id = store.create(PERSONAL, "reviewed-owner")["id"]
+    uid = "11300000000000001"
+    with pytest.raises(ValueError, match="destination_plan_required"):
+        store.add_entries(job_id, [file_entry()], mark_ready=True)
+    assert not store.entries(job_id) and not store.get(job_id)["plan_complete"]
+    store.add_entries(job_id, [file_entry()], mark_ready=True, destination_verified_uid=uid)
+    with pytest.raises(ValueError, match="destination_identity_mismatch"):
+        store.add_entries(job_id, [], mark_ready=True, append=True, destination_verified_uid="12")
+    assert store.get(job_id)["destination_verified_uid"] == uid
+    store.close()
+
+
+@pytest.mark.parametrize("identity", ["old-login", "12345"])
+def test_v9_service_draft_remains_readable_without_execution_proof(tmp_path, identity):
+    from tests.test_migration_personal_execution import PERSONAL
+    from app.migration.runner import MigrationRunner
+    from app.migration.errors import MigrationError
+    config = dict(PERSONAL, destination_identity=identity,
+                  destination_url="https://cloud-api.office.example/v1/disk")
+    del config["destination_oauth_url"]
+    store = MigrationStore(tmp_path)
+    job_id = store.create(config, "legacy-draft")["id"]
+    store.close()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE jobs SET plan_complete=1,state='ready'")
+        connection.execute("ALTER TABLE jobs DROP COLUMN destination_verified_uid")
+        connection.execute("PRAGMA user_version=9")
+    store = MigrationStore(tmp_path)
+    job = store.get(job_id)
+    assert job["destination_verified_uid"] is None and job["state"] == "ready"
+    assert "destination_oauth_url" not in job["config"]
+    with pytest.raises(MigrationError, match="destination_plan_required"):
+        MigrationRunner.plan_uid(job)
+    store.close()
